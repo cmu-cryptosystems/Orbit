@@ -1,6 +1,6 @@
 "builtin.module"() <{sym_name = "traced/AlexNetReLU64k.mlir"}> ({
   "func.func"() <{function_type = (tensor<1x!earth.ci<0 * 0>>) -> tensor<1x!earth.ci<0 * 0>>, sym_name = "_hecate_AlexNetReLU64k"}> ({
-  ^bb0(%arg0: tensor<1x!earth.ci<0 * 0>> loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":40:0)):
+  ^bb0(%arg0: tensor<1x!earth.ci<0 * 0>> loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":39:0)):
     %0 = "earth.rotate"(%arg0) <{offset = array<i64: -33>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn1
     %1 = "earth.rotate"(%arg0) <{offset = array<i64: -32>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn1
     %2 = "earth.rotate"(%arg0) <{offset = array<i64: -31>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn1
@@ -13404,7 +13404,7 @@
     %13400 = "earth.rotate"(%13397) <{offset = array<i64: 16384>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
     %13401 = "earth.add"(%13399, %13400) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
     %13402 = "earth.rotate"(%13401) <{offset = array<i64: -52256>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
-    %13403 = "earth.constant"() <{rms_var = 0.023008220138829451 : f64, value = 3063 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn2
+    %13403 = "earth.constant"() <{rms_var = 0.023008220138829416 : f64, value = 3063 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn2
     %13404 = "earth.mul"(%13402, %13403) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
     %13405 = "earth.add"(%13313, %13404) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
     %13406 = "earth.rotate"(%13401) <{offset = array<i64: -19489>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn2
@@ -20578,7 +20578,7 @@
     %20574 = "earth.rotate"(%20573) <{offset = array<i64: 8192>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
     %20575 = "earth.add"(%20573, %20574) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
     %20576 = "earth.rotate"(%20575) <{offset = array<i64: -13344>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
-    %20577 = "earth.constant"() <{rms_var = 0.025860295425371008 : f64, value = 4548 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn3
+    %20577 = "earth.constant"() <{rms_var = 0.025860295425371004 : f64, value = 4548 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn3
     %20578 = "earth.mul"(%20576, %20577) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
     %20579 = "earth.add"(%20533, %20578) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
     %20580 = "earth.rotate"(%20575) <{offset = array<i64: 3039>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn3
@@ -24709,7 +24709,7 @@
     %24705 = "earth.rotate"(%24702) <{offset = array<i64: 16384>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %24706 = "earth.add"(%24704, %24705) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %24707 = "earth.rotate"(%24706) <{offset = array<i64: -3136>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
-    %24708 = "earth.constant"() <{rms_var = 0.03642947165489064 : f64, value = 5416 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
+    %24708 = "earth.constant"() <{rms_var = 0.036429471654890626 : f64, value = 5416 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %24709 = "earth.mul"(%24707, %24708) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %24710 = "earth.add"(%24662, %24709) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %24711 = "earth.rotate"(%24706) <{offset = array<i64: 29631>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
@@ -28453,7 +28453,7 @@
     %28449 = "earth.rotate"(%28446) <{offset = array<i64: 16384>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %28450 = "earth.add"(%28448, %28449) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %28451 = "earth.rotate"(%28450) <{offset = array<i64: -12352>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
-    %28452 = "earth.constant"() <{rms_var = 0.037686944191387579 : f64, value = 6208 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
+    %28452 = "earth.constant"() <{rms_var = 0.037686944191387572 : f64, value = 6208 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %28453 = "earth.mul"(%28451, %28452) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %28454 = "earth.add"(%28406, %28453) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %28455 = "earth.rotate"(%28450) <{offset = array<i64: 20415>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
@@ -30069,7 +30069,7 @@
     %30065 = "earth.mul"(%30063, %30064) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %30066 = "earth.add"(%30018, %30065) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %30067 = "earth.rotate"(%30062) <{offset = array<i64: 16349>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
-    %30068 = "earth.constant"() <{rms_var = 0.036907126083303571 : f64, value = 6550 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
+    %30068 = "earth.constant"() <{rms_var = 0.036907126083303508 : f64, value = 6550 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %30069 = "earth.mul"(%30067, %30068) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %30070 = "earth.add"(%30066, %30069) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %30071 = "earth.constant"() <{rms_var = 0.0092471497575134179 : f64, value = 6551 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
@@ -31989,7 +31989,7 @@
     %31985 = "earth.rotate"(%31982) <{offset = array<i64: 16384>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %31986 = "earth.add"(%31984, %31985) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %31987 = "earth.rotate"(%31986) <{offset = array<i64: -21504>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
-    %31988 = "earth.constant"() <{rms_var = 0.036653441622251565 : f64, value = 6956 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
+    %31988 = "earth.constant"() <{rms_var = 0.036653441622251558 : f64, value = 6956 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %31989 = "earth.mul"(%31987, %31988) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %31990 = "earth.add"(%31942, %31989) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
     %31991 = "earth.rotate"(%31986) <{offset = array<i64: 11263>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn4
@@ -34044,7 +34044,7 @@
     %34040 = "earth.mul"(%34038, %34039) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %34041 = "earth.add"(%33993, %34040) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %34042 = "earth.rotate"(%34037) <{offset = array<i64: 31679>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
-    %34043 = "earth.constant"() <{rms_var = 0.076504496007464104 : f64, value = 7354 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
+    %34043 = "earth.constant"() <{rms_var = 0.076504496007464117 : f64, value = 7354 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %34044 = "earth.mul"(%34042, %34043) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %34045 = "earth.add"(%34041, %34044) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %34046 = "earth.constant"() <{rms_var = 0.0086463761225019485 : f64, value = 7355 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
@@ -39552,7 +39552,7 @@
     %39548 = "earth.rotate"(%39545) <{offset = array<i64: 16384>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %39549 = "earth.add"(%39547, %39548) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %39550 = "earth.rotate"(%39549) <{offset = array<i64: -14432>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
-    %39551 = "earth.constant"() <{rms_var = 0.069994228523782856 : f64, value = 8519 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
+    %39551 = "earth.constant"() <{rms_var = 0.069994228523782773 : f64, value = 8519 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %39552 = "earth.mul"(%39550, %39551) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %39553 = "earth.add"(%39505, %39552) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %39554 = "earth.rotate"(%39549) <{offset = array<i64: 18335>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
@@ -40031,7 +40031,7 @@
     %40027 = "earth.add"(%40025, %40026) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %40028 = "earth.rotate"(%40027) <{offset = array<i64: -32768>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %40029 = "earth.add"(%40027, %40028) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
-    %40030 = "earth.constant"() <{rms_var = 0.013811609686502888 : f64, value = 8620 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
+    %40030 = "earth.constant"() <{rms_var = 0.01381160968650289 : f64, value = 8620 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %40031 = "earth.add"(%40029, %40030) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]convbn5
     %40032 = "earth.constant"() <{rms_var = 2.000000e+00 : f64, value = 152 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // poly[]act5_ReLU_poly1
     %40033 = "earth.mul"(%40032, %40031) : (tensor<1x!earth.pl<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // poly[]act5_ReLU_poly1
@@ -54212,5 +54212,5 @@
     %54208 = "earth.add"(%54206, %54207) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // linear[]fc_3
     %54209 = "earth.constant"() <{rms_var = 6.5082055414262383E-6 : f64, value = 11780 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // linear[]fc_3
     %54210 = "earth.add"(%54208, %54209) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // linear[]fc_3
-    "func.return"(%54210) : (tensor<1x!earth.ci<0 * 0>>) -> () loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":40:0)  }) : () -> () loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":40:0) // linear[]fc_3
-}) : () -> () loc(unknown) // linear[]fc_3
+    "func.return"(%54210) : (tensor<1x!earth.ci<0 * 0>>) -> () loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":39:0)  }) : () -> () loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/AlexNetReLU64k.py":39:0)  // linear[]fc_3
+}) : () -> () loc(unknown)  // linear[]fc_3

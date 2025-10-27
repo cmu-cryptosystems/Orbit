@@ -1,6 +1,6 @@
 "builtin.module"() <{sym_name = "traced/SqueezeNetReLU64k.mlir"}> ({
   "func.func"() <{function_type = (tensor<1x!earth.ci<0 * 0>>) -> tensor<1x!earth.ci<0 * 0>>, sym_name = "_hecate_SqueezeNetReLU64k"}> ({
-  ^bb0(%arg0: tensor<1x!earth.ci<0 * 0>> loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":41:0)):
+  ^bb0(%arg0: tensor<1x!earth.ci<0 * 0>> loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":40:0)):
     %0 = "earth.rotate"(%arg0) <{offset = array<i64: -33>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]conv1_convbn
     %1 = "earth.rotate"(%arg0) <{offset = array<i64: -32>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]conv1_convbn
     %2 = "earth.rotate"(%arg0) <{offset = array<i64: -31>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]conv1_convbn
@@ -8033,7 +8033,7 @@
     %8029 = "earth.mul"(%8027, %8028) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
     %8030 = "earth.add"(%8026, %8029) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
     %8031 = "earth.rotate"(%8018) <{offset = array<i64: 49053>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
-    %8032 = "earth.constant"() <{rms_var = 0.033865647132978023 : f64, value = 802 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
+    %8032 = "earth.constant"() <{rms_var = 0.033865647132978016 : f64, value = 802 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
     %8033 = "earth.mul"(%8031, %8032) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
     %8034 = "earth.add"(%8030, %8033) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
     %8035 = "earth.constant"() <{rms_var = 0.069103080104954806 : f64, value = 803 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]fire_5_convbn
@@ -21186,7 +21186,7 @@
     %21182 = "earth.mul"(%21180, %21181) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
     %21183 = "earth.add"(%21179, %21182) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
     %21184 = "earth.rotate"(%21175) <{offset = array<i64: 16254>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
-    %21185 = "earth.constant"() <{rms_var = 0.027049934243751912 : f64, value = 1938 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
+    %21185 = "earth.constant"() <{rms_var = 0.027049934243751902 : f64, value = 1938 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
     %21186 = "earth.mul"(%21184, %21185) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
     %21187 = "earth.add"(%21183, %21186) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
     %21188 = "earth.rotate"(%21175) <{offset = array<i64: 24445>}> : (tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // convbn[]fire_9_convbn
@@ -24135,5 +24135,5 @@
     %24131 = "earth.constant"() <{rms_var = 6.9053396600248786E-4 : f64, value = 2292 : i64}> : () -> (tensor<1x!earth.pl<0 * 0>>)  loc(unknown) // avgpool[]avgpool_10
     %24132 = "earth.mul"(%24130, %24131) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.pl<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // avgpool[]avgpool_10
     %24133 = "earth.add"(%24129, %24132) : (tensor<1x!earth.ci<0 * 0>>, tensor<1x!earth.ci<0 * 0>>) -> (tensor<1x!earth.ci<0 * 0>>)  loc(unknown) // avgpool[]avgpool_10
-    "func.return"(%24133) : (tensor<1x!earth.ci<0 * 0>>) -> () loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":41:0)  }) : () -> () loc("/home/zzk/workspace/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":41:0) // avgpool[]avgpool_10
-}) : () -> () loc(unknown) // avgpool[]avgpool_10
+    "func.return"(%24133) : (tensor<1x!earth.ci<0 * 0>>) -> () loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":40:0)  }) : () -> () loc("/home/ubuntu/dacaporion/dacapo/examples/benchmarks/SqueezeNetReLU64k.py":40:0)  // avgpool[]avgpool_10
+}) : () -> () loc(unknown)  // avgpool[]avgpool_10

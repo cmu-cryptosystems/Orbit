@@ -24,7 +24,7 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
         start_time = time.time()
         main_pdag, bypass_pdag = handle_bypass(dag, params.bpsdepth)
         if bypass_pdag is None:
-            print(f"PDAG #{dag.name} Basic-none, DAG size: {len(dag.nodes)} nodes")
+            print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes")
             qbp_manager.add_qbp(dag, prev_cost)
         else:
             # bypass handling
@@ -49,7 +49,6 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
     
     for i in range(len(pdags)):
         pdag = pdags[i]
-        print(f"This prev cost for PDAG #{pdag.name}: {this_prev_cost}")
         solve_partition(pdag, qbp_manager, this_prev_cost, le, params)
         this_io_to_cost = qbp_manager.get_qbp_cost(pdag.name)
         

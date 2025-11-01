@@ -175,9 +175,9 @@ class QBPManager:
         bj_qbp.append_io_results(io_to_cost, qbp_io_to_assign)
         
         this_qbp_cost = bj_qbp.get_all_costs()
-        print(f" ++++ Normal QBP ++++ ")
-        for (in_level, in_scale), out_costs in sorted(this_qbp_cost.items()):
-            print(f"   + Input Level {in_level}, Input Scale {in_scale} output costs: {sorted(out_costs.items())}")
+        # print(f" ++++ Normal QBP ++++ ")
+        # for (in_level, in_scale), out_costs in sorted(this_qbp_cost.items()):
+        #     print(f"   + Input Level {in_level}, Input Scale {in_scale} output costs: {sorted(out_costs.items())}")
 
     
     def add_qbp_bypass(self, pdag: Tdag, main_pdag: Tdag, bypass_pdag: Tdag, in_budgets: dict[int, dict[int, float]]):

@@ -67,6 +67,12 @@ class Tdag(nx.DiGraph):
             double_cnt = 0
         return single_cnt, double_cnt
     
+    def get_full_size(self) -> int:
+        total_size = 0
+        for v in self.nodes:
+            total_size += self.nodes[v]['weight']
+        return total_size
+    
     def get_depth_traversal(self) -> dict[int, list[str]]:
         in_degrees = dict(self.in_degree())
         queue = deque([v for v, d in in_degrees.items() if d == 0])

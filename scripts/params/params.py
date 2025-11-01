@@ -1,7 +1,10 @@
 import json
+import numpy as np
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, bpsdepth=None, threads=None):
+    def __init__(self, le_json, sysname, mode, Sw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
+        if le_json is None:
+            return # should be filled later
         json_parsed = {}
         try:
             with open(le_json, 'r') as file:
@@ -27,6 +30,10 @@ class Params:
         self.Sw = Sw if Sw is not None else self.Sf
         self.bpsdepth = bpsdepth  # possibly None
         self.threads = threads if threads is not None else 16
+        self.comp = comp if comp is not None else True
+        self.part = part if part is not None else True
+        self.reqbp = reqbp if reqbp is not None else False
+        self.netname = netname if netname is not None else ""
         
         self.trunc_val = 1 # truncation value for latency estimation
         self.dacapo_mlir_in = True  # need to revert the input MLIR level

@@ -12,6 +12,27 @@ class Assign:
         self.e_lvl_out = dict()  # edge -> output level, necessary for all edges except from constants
         self.e_scl_out = dict()  # edge -> output scale, necessary for all edges except from constants
 
+    def to_dict(self) -> dict:
+        return {
+            'v_lvl_out': self.v_lvl_out,
+            'v_scl_out': self.v_scl_out,
+            'v_lvl_in': self.v_lvl_in,
+            'v_scl_in': self.v_scl_in,
+            'e_lvl_out': self.e_lvl_out,
+            'e_scl_out': self.e_scl_out
+        }
+    
+    @staticmethod
+    def from_dict(tdag: Tdag, data: dict) -> 'Assign':
+        assign = Assign(tdag)
+        assign.v_lvl_out = data.get('v_lvl_out', dict())
+        assign.v_scl_out = data.get('v_scl_out', dict())
+        assign.v_lvl_in = data.get('v_lvl_in', dict())
+        assign.v_scl_in = data.get('v_scl_in', dict())
+        assign.e_lvl_out = data.get('e_lvl_out', dict())
+        assign.e_scl_out = data.get('e_scl_out', dict())
+        return assign
+    
     def _deduce_in_lvl_scl(self, v: str) -> tuple[int|None, int|None]:
         v_deduced_il = None
         v_deduced_is = None

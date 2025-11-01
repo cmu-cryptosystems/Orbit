@@ -2,6 +2,7 @@ from .tdag import Tdag
 from ..utils.rot_decompose import get_naf_weight
 from ..params.params import Params
 import re
+import os
 
 def _extract_op_descr(raw_line: str, params: Params) -> tuple[str, dict]:
     match = re.findall(r'earth\.(\w+)', raw_line)
@@ -151,7 +152,8 @@ def _add_inputs_from_mlir(tdag: Tdag, raw_line: str):
         raise ValueError("Input line does not match expected format for module inputs.")
 
 def build_from_mlir(mlir_file: str, params: Params) -> Tdag:
-    tdag = Tdag(params, name=mlir_file)
+    tdag_name = os.path.splitext(os.path.basename(mlir_file))[0].split('/')[-1]
+    tdag = Tdag(params, name=tdag_name)
     with open(mlir_file, 'r') as f:
         for line in f:
             if line.strip().startswith('^bb0('):

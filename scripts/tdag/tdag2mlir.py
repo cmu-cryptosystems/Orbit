@@ -8,7 +8,7 @@ def _get_type_string(v: dict, params: Params) -> str:
     if params.dacapo_mlir_out:
         level = params.bts_ub - level
     cipl = 'pl' if v['op'] == 'constant' else 'ci'
-    return f"tensor<{v['weight']}x!earth.{cipl}<{v['scale']}*{level}>>"
+    return f"tensor<{v['weight']}x!earth.{cipl}<{v['scale']} * {level}>>"
 
 def _get_op_descr(v: dict, params: Params) -> str:
     op = v['op']

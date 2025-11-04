@@ -51,7 +51,7 @@ class QBP:
             'nodes': {},
             'edges': {e: self.dag.edges[e]['weight'] for e in self.dag.edges},
             'io_to_cost': self.io_to_cost,
-            'io_to_assign': self.io_to_assign.to_dict()
+            'io_to_assign': {}
         }
         for v in self.dag.nodes:
             out_dict['nodes'][v] = {
@@ -59,6 +59,12 @@ class QBP:
                 'weight': self.dag.nodes[v]['weight'],
                 'op_descr': self.dag.nodes[v]['op_descr']
             }
+        for in_key, out_to_assign in self.io_to_assign.items():
+            for out_key, assign in out_to_assign.items():
+                if in_key not in out_dict['io_to_assign']:
+                    out_dict['io_to_assign'][in_key] = {out_key: assign.to_dict()}
+                else:
+                    out_dict['io_to_assign'][in_key][out_key] = assign.to_dict()
         joblib.dump(out_dict, f"{filepath}.joblib")
         
     @staticmethod

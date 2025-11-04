@@ -4,7 +4,7 @@ import subprocess
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Saturn ILP Solver')
-    parser.add_argument('--model', type=str, required=True, choices=["ResNet", "AlexNet", "SqueezeNet", "MobileNet", "VGG16"], help='Model architecture')
+    parser.add_argument('--model', type=str, required=True, choices=["ResNet", "AlexNet", "SqueezeNet", "MobileNet", "VGG16", "CompPart"], help='Model architecture')
     parser.add_argument('--act', type=str, required=True, choices=["ReLU", "SiLU"], help='Activation function')
     parser.add_argument('--n', type=int, required=True, choices=[16, 64], help='CKKS Vector Size')
     parser.add_argument('--Lm', type=int, required=True, help='Maximum Level Budget')

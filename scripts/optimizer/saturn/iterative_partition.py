@@ -13,7 +13,9 @@ import time
 def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: LatencyEstimator, params: Params):
     if not params.part:
         qbp_manager.add_qbp(dag, prev_cost)
-        return
+        this_io_to_cost = qbp_manager.get_qbp_cost(dag.name)
+        this_io_to_assign = qbp_manager.get_qbp_assign(dag)
+        return this_io_to_assign, this_io_to_cost
     
     # print(f"Enter solve_partition, PDAG #{dag.name}, prev_cost: {prev_cost}")
     

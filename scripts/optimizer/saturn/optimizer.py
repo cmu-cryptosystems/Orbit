@@ -80,6 +80,7 @@ def main():
     parser.add_argument('--btsupperbound', type=int, default=None, help='Maximum Bootstrapping target level (overrides costjson if specified)')
     parser.add_argument('--btslevel', type=int, default=None, help='Bootstrapping level (overrides costjson if specified)')
     parser.add_argument('-Sw', '--waterscale', type=int, default=40, help='Waterline scale')
+    parser.add_argument('-Csw', '--constantscale', type=int, default=None, help='Constant scale (overrides waterline scale if specified)')
     parser.add_argument('-Sf', '--rescale', type=int, default=None, help='Rescaling factor (overrides costjson if specified)')
     parser.add_argument('--nobypass', action='store_true', help='Disable Bypass handling')
     parser.add_argument('--no-compress', action='store_true', help='Disable DAG compression')
@@ -100,7 +101,7 @@ def main():
     else:
         netname = os.path.splitext(os.path.basename(args.inputfile))[0]
     params = Params(args.costjson, "Saturn", mode="compile", 
-                    Sw=args.waterscale, bpsdepth=bypass_dep, threads=args.threads, 
+                    Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
                     netname=netname)
     if args.maxlevel is not None:

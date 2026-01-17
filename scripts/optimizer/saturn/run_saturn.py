@@ -9,6 +9,7 @@ if __name__ == "__main__":
     parser.add_argument('--n', type=int, required=True, choices=[16, 64], help='CKKS Vector Size')
     parser.add_argument('--Lm', type=int, required=True, help='Maximum Level Budget')
     parser.add_argument('--Sw', type=int, required=True, help='Waterline Scale')
+    parser.add_argument('--Csw', type=int, required=False, default=None, help='Constant Scale')
     parser.add_argument('--nobypass', action='store_true', help='Disable Bypass handling')
     parser.add_argument('--qbp', action='store_true', help='Enable QBP cross-bench reusing')
     parser.add_argument('--nocomp', action='store_true', help='Disable Compression')
@@ -26,7 +27,7 @@ if __name__ == "__main__":
         costs = f"cost_models/profiled_LATTIGONEW_CPU{args.n}k_3_{args.Lm}.json"
     
     result_dir = f"mlirs_output/saturn/{args.model}/{args.Sw}/{args.act}/{this_n}/"
-    outname = f"saturn_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
+    outname = f"saturn_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
     
     os.makedirs(result_dir, exist_ok=True)
     
@@ -39,6 +40,8 @@ if __name__ == "__main__":
         "--maxlevel", str(args.Lm),
         "--waterscale", str(args.Sw),
     ]
+    if args.Csw is not None:
+        cmds += ["--constantscale", str(args.Csw)]
     if args.nobypass:
         cmds.append("--nobypass")
     if args.nocomp:

@@ -52,7 +52,7 @@ class VarPool:
             # node variables
             self.vars[f"v_lvl_out_{u}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"v_scl_out_{u}"] = model.addVar(lb=params.Sw, ub=params.Sw, vtype=GRB.INTEGER, name=f"v_scl_out_{u}")
+                self.vars[f"v_scl_out_{u}"] = model.addVar(lb=params.Csw, ub=params.Csw, vtype=GRB.INTEGER, name=f"v_scl_out_{u}")
             else:
                 self.vars[f"v_scl_out_{u}"] = self.vars[f"v_scl_in_{v}"]
             # edge variables
@@ -265,7 +265,8 @@ def decode_ilp_sol(tdag: Tdag, vp: VarPool) -> Assign:
             assert assign.v_scl_in[v] >= params.Sw, f"Node {v} input scale {assign.v_scl_in[v]} below Sw={params.Sw}"
         assign.v_lvl_out[v] = round(vp.var_lvl(v, 'out').X)
         assign.v_scl_out[v] = round(vp.var_scl(v, 'out').X)
-        assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
+        if tdag.nodes[v]['op'] != 'constant':
+            assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
     
     for u, v in tdag.edges:
         if tdag.nodes[u]['op'] == 'constant':

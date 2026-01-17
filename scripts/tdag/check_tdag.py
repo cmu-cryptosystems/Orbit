@@ -15,6 +15,8 @@ def check_tdag(tdag: Tdag):
             raise ValueError(f"Node {v} missing level or scale attribute.")
         # Check scale bounds
         if not tdag.params.Sw <= scale <= tdag.params.Sf + 2 * tdag.params.Sw:
+            if tdag.nodes[v]['op'] == 'constant' and tdag.params.Csw <= scale < tdag.params.Sw:
+                continue
             raise ValueError(f"Node {v} has scale {scale} out of bounds [{tdag.params.Sw}, {tdag.params.Sf + 2 * tdag.params.Sw}].")
         # Check level bounds
         if not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:

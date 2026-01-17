@@ -2,7 +2,7 @@ import json
 import numpy as np
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
+    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -28,6 +28,7 @@ class Params:
         self.mode = mode
         self.sysname = sysname
         self.Sw = Sw if Sw is not None else self.Sf
+        self.Csw = CSw if CSw is not None else self.Sw
         self.bpsdepth = bpsdepth  # possibly None
         self.threads = threads if threads is not None else 16
         self.comp = comp if comp is not None else True

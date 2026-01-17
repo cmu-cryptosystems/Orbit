@@ -503,7 +503,7 @@ func main() {
 	var btsLb int
 	var btsUb int
 
-	flag.IntVar(&n, "n", 64, "The polynomial modulus degree")
+	flag.IntVar(&n, "n", 64, "The number of slots (in 1024s). E.g., n=64 means 65536 slots")
 	flag.IntVar(&btsLb, "btsLb", 3, "The bootstrap level lower bound")
 	flag.IntVar(&btsUb, "btsUb", 16, "The bootstrap level upper bound")
 	flag.Parse()

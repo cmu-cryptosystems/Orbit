@@ -33,26 +33,6 @@ If you're actively developing and want to run without building each time:
 go run ./fhe [options]
 ```
 
-## Testing
-
-### Bootstrap Test
-Test bootstrap accuracy and functionality:
-```bash
-# Run bootstrap test directly
-go run ./tests/bootstrap.go [options]
-
-# Or build and run the test binary
-go build -o tests/bootstrap_test ./tests/bootstrap.go
-./tests/bootstrap_test [options]
-```
-
-### Bootstrap Test Options
-The bootstrap test supports the same basic options as the main program:
-- `-n <number>`: Polynomial modulus degree
-- `-maxLevel <number>`: Maximum FHE level
-- `-bootstrapMinLevel <number>`: Minimum bootstrap level  
-- `-bootstrapMaxLevel <number>`: Maximum bootstrap level
-
 ### Command Line Options
 
 - `-mlir <file>`: Path to MLIR file (required for MLIR mode)
@@ -84,11 +64,6 @@ The bootstrap test supports the same basic options as the main program:
   -getLog debug_output.txt
 ```
 
-#### Running Instruction Files
-```bash
-./fhe_binary -i instructions/example.txt -n 4096
-```
-
 ## Memory Management
 
 For large computations, you may want to limit memory usage:
@@ -111,9 +86,9 @@ ulimit -v 209715200
 ./fhe_binary [options]
 ```
 
-## Monitoring Memory Usage
+### Monitoring Memory Usage
 
-### Check Running Process Memory
+#### Check Running Process Memory
 ```bash
 # Real-time monitoring with htop (shows VIRT, RES, %MEM columns)
 htop
@@ -125,7 +100,7 @@ top
 ps aux | grep fhe_binary
 ```
 
-### Verify systemd Memory Limits
+#### Verify systemd Memory Limits
 ```bash
 # Check if systemd memory limit is active
 systemctl --user status run-r*.scope
@@ -134,7 +109,7 @@ systemctl --user status run-r*.scope
 systemctl --user show run-r*.scope | grep Memory
 ```
 
-### Understanding Memory Columns
+#### Understanding Memory Columns
 - **VIRT**: Virtual memory (total memory space used by process)
 - **RES**: Resident memory (actual physical RAM being used)
 - **%MEM**: Percentage of total system memory being used
@@ -152,7 +127,7 @@ lowering/
 └── README.md              # This file
 ```
 
-## Output
+### Output
 
 - **Console Output**: Progress information and final results
 - **Log Files**: Detailed debug information (when `-getLog` is used)
@@ -202,3 +177,23 @@ To modify the FHE operations, edit files in the `fhe/` directory:
 - `evaluator.go`: FHE operation implementations
 - `auxiliary.go`: Utility functions and precision statistics
 - `encoder.go`: Encoding/decoding operations 
+
+## (Optional) Testing
+
+### Bootstrap Test
+Test bootstrap accuracy and functionality:
+```bash
+# Run bootstrap test directly
+go run ./tests/bootstrap.go [options]
+
+# Or build and run the test binary
+go build -o tests/bootstrap_test ./tests/bootstrap.go
+./tests/bootstrap_test [options]
+```
+
+#### Bootstrap Test Options
+The bootstrap test supports the same basic options as the main program:
+- `-n <number>`: Polynomial modulus degree
+- `-maxLevel <number>`: Maximum FHE level
+- `-bootstrapMinLevel <number>`: Minimum bootstrap level  
+- `-bootstrapMaxLevel <number>`: Maximum bootstrap level

@@ -23,20 +23,21 @@ def worker(queue: Queue, base_cmd: List[str]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="ResNet", choices=["ResNet", "AlexNet", "SqueezeNet", "MobileNet", "VGG16"])
+    parser.add_argument("--model", default="ResNet", choices=["ResNet", "AlexNet", "SqueezeNet", "MobileNet", "VGG16", "CompPart"])
     parser.add_argument("--act", default="SiLU", choices=["ReLU", "SiLU"])
     parser.add_argument("--n", type=int, default=16, choices=[16, 64])
     parser.add_argument("--Lm", type=int, default=16)
     parser.add_argument("--Sw", type=int, default=40)
     parser.add_argument("--Csw", type=int, default=None)
-    parser.add_argument("--plain", action='store_true')
-    parser.add_argument("--maxthread", type=int, default=8)
+    parser.add_argument("--plain", action='store_true', help="Run in plaintext mode")
+    parser.add_argument("--maxthread", type=int, default=8, help="Maximum number of concurrent threads, default is 8 (for plaintext execution)")
+    parser.add_argument("--runs", type=int, default=10, help="Total number of runs/samples to execute")
     
     args = parser.parse_args()
     
     # Build base command
     base_cmd = [
-        "python", "-u", "run_one_test.py",
+        "python", "-u", "run_orbit_one_eval.py",
         "--model", args.model,
         "--act", args.act,
         "--n", str(args.n),
@@ -58,7 +59,7 @@ def main():
         threads.append(t)
     
     # Queue all runs
-    for run_num in range(24):
+    for run_num in range(args.runs):
         queue.put(run_num)
     
     # Wait for completion

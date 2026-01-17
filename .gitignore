@@ -1,4 +1,10 @@
 mlirs_output/
+mlirs_execute/
+input_data/
+input_constants/
 *.log
 __pycache__/
 qbps_cache*/
+frontend/dacapo/
+frontend/log/
+backend/lattigo/

@@ -178,9 +178,8 @@ To modify the FHE operations, edit files in the `fhe/` directory:
 - `auxiliary.go`: Utility functions and precision statistics
 - `encoder.go`: Encoding/decoding operations 
 
-## (Optional) Testing
 
-### Bootstrap Test
+### (Optional) Bootstrap Test
 Test bootstrap accuracy and functionality:
 ```bash
 # Run bootstrap test directly

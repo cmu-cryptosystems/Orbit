@@ -5,7 +5,7 @@ from ...visualize import *
 from ...params.params import Params
 from ...utils.fix_random import set_global_seed
 
-from .saturn_core import saturn_core
+from .orbit_core import orbit_core
 
 import argparse
 import time
@@ -35,7 +35,7 @@ def run(input_file: str, output_file: str, params: Params):
         comp_dag = og_dag.copy_tdag()
         og_to_comp = {node: node for node in og_dag.nodes}
     
-    assign, ilp_times = saturn_core(comp_dag, le, params)
+    assign, ilp_times = orbit_core(comp_dag, le, params)
     for k, v in ilp_times.items():
         timestamps[k] = v
     
@@ -64,7 +64,7 @@ def run(input_file: str, output_file: str, params: Params):
     tdag_to_mlir(fdag, output_file)
     timestamps['DAG Write Time'] = time.time() - start_time
     
-    print(f"Saturn Compilation time: {sum(timestamps.values()):.3f} sec.")
+    print(f"Orbit Compilation time: {sum(timestamps.values()):.3f} sec.")
     print("Timestamps breakdown:")
     for k, v in timestamps.items():
         print(f"  '{k}': {v:.3f} sec.")
@@ -72,7 +72,7 @@ def run(input_file: str, output_file: str, params: Params):
 
 def main():
     set_global_seed(42)
-    parser = argparse.ArgumentParser(description='Saturn Optimizer')
+    parser = argparse.ArgumentParser(description='Orbit Optimizer')
     parser.add_argument('--inputfile', type=str, required=True, help='Input MLIR file')
     parser.add_argument('--outputfile', type=str, required=True, help='Output MLIR file')
     parser.add_argument('--costjson', type=str, required=True, help='Cost model JSON file')
@@ -100,7 +100,7 @@ def main():
         netname = args.netname
     else:
         netname = os.path.splitext(os.path.basename(args.inputfile))[0]
-    params = Params(args.costjson, "Saturn", mode="compile", 
+    params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
                     netname=netname)

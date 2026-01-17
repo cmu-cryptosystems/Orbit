@@ -40,7 +40,7 @@ class Tdag(nx.DiGraph):
         
         # Assumption: all inputs' level/scale are the same
         #            all outputs' level/scale are the same
-        #    Saturn: siso partitions, must be the same
+        #    Orbit: siso partitions, must be the same
         #    ReSBM:  possibly non-siso, still assume the same for the algorithm
         #    Orion:  possibly non-siso, still assume the same for the algorithm
         self.in_level = None # input level

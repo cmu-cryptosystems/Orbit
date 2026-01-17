@@ -58,8 +58,8 @@ class LatencyEstimator:
             for i in range(params.bts_lb+1, params.bts_ub+1):
                 self.op_lmaps['bootstrap_single'][i] = bts_cost
         
-        # generate linear regression models for Saturn
-        if params.sysname == 'Saturn':
+        # generate linear regression models for Orbit
+        if params.sysname == 'Orbit':
             self.lin_op_lmaps = dict()
             for op in ['add_single', 'add_double', 'mul_single', 'mul_double', 'rotate_single', 'negate_single']:
                self.lin_op_lmaps[op] = linear_regression(self.op_lmaps[op], params.lvl_lb, params.lvl_ub, params.trunc_val)
@@ -69,7 +69,7 @@ class LatencyEstimator:
                 self.lin_op_lmaps['bootstrap_single'] = linear_regression_max(self.op_lmaps['bootstrap_single'], params.bts_lb+1, params.bts_ub, params.trunc_val)
             else:
                 self.lin_op_lmaps['bootstrap_single'] = linear_regression(self.op_lmaps['bootstrap_single'], params.bts_lb+1, params.bts_ub, params.trunc_val)
-            # modswitch, upscale : ignored in Saturn
+            # modswitch, upscale : ignored in Orbit
 
     def res_cost(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> float:
         if in_lvl < out_lvl:

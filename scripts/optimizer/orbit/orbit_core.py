@@ -10,7 +10,7 @@ from .qbp_manager import QBPManager
 import time
 import sys
 
-def saturn_core(dag: Tdag, le: LatencyEstimator, params: Params):
+def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
     ilp_times = dict()
     
     qbp_name = "_".join([

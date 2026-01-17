@@ -3,7 +3,7 @@ import os
 import subprocess
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Saturn ILP Solver')
+    parser = argparse.ArgumentParser(description='Orbit ILP Solver')
     parser.add_argument('--model', type=str, required=True, choices=["ResNet", "AlexNet", "SqueezeNet", "MobileNet", "VGG16", "CompPart"], help='Model architecture')
     parser.add_argument('--act', type=str, required=True, choices=["ReLU", "SiLU"], help='Activation function')
     parser.add_argument('--n', type=int, required=True, choices=[16, 64], help='CKKS Vector Size')
@@ -26,14 +26,14 @@ if __name__ == "__main__":
     else:
         costs = f"cost_models/profiled_LATTIGONEW_CPU{args.n}k_3_{args.Lm}.json"
     
-    result_dir = f"mlirs_output/saturn/{args.model}/{args.Sw}/{args.act}/{this_n}/"
-    outname = f"saturn_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
+    result_dir = f"mlirs_output/orbit/{args.model}/{args.Sw}/{args.act}/{this_n}/"
+    outname = f"orbit_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
     
     os.makedirs(result_dir, exist_ok=True)
     
     cmds = [
         "python", "-u", "-m",
-        "scripts.optimizer.saturn.optimizer",
+        "scripts.optimizer.orbit.optimizer",
         "--inputfile", f"mlirs_input/{benchmark}.mlir",
         "--outputfile", f"{result_dir}{outname}.mlir",
         "--costjson", costs,

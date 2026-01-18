@@ -32,7 +32,7 @@ if __name__ == "__main__":
     os.makedirs(result_dir, exist_ok=True)
     
     cmds = [
-        "python", "-u", "-m",
+        "python3", "-u", "-m",
         "scripts.optimizer.orbit.optimizer",
         "--inputfile", f"mlirs_input/{benchmark}.mlir",
         "--outputfile", f"{result_dir}{outname}.mlir",
@@ -58,4 +58,8 @@ if __name__ == "__main__":
             stdout=stdout_file,
             stderr=stderr_file
         )
-        process.wait()
+        exit_code = process.wait()
+        if exit_code != 0:
+            with open(f"{result_dir}{outname}.err", "r") as err_file:
+                error_msg = err_file.read()
+            print(f"Subprocess exited with code {exit_code}.\n    Error message:\n{error_msg}")

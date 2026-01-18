@@ -31,6 +31,14 @@ def main():
     parser.add_argument("--Csw", type=int, default=None)
     parser.add_argument("--plain", action='store_true', help="Run in plaintext mode")
     parser.add_argument("--maxthread", type=int, default=8, help="Maximum number of concurrent threads, default is 8 (for plaintext execution)")
+    # The recommended number of threads (for 256 GB RAM, >=16 cores machine):
+    #     (mainly due to memory consumption considerations)
+    # -- plaintext execution
+    # |---- n=16: maxthread=8
+    # |---- n=64: maxthread=4
+    # -- HE execution
+    # |---- n=16: maxthread=2
+    # |---- n=64: maxthread=1
     parser.add_argument("--runs", type=int, default=10, help="Total number of runs/samples to execute")
     
     args = parser.parse_args()

@@ -9,3 +9,4 @@ qbps_cache*/
 frontend/dacapo/
 frontend/log/
 backend/lattigo/
+.venv/

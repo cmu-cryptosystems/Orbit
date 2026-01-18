@@ -94,9 +94,9 @@ The following script can generate samples for benchmark evaluation from CIFAR-10
 
 ```bash
 # The current directory should be <orbit-repository>/frontend/dacapo/
-python examples/tests/gen_input_data.py <sample-num:integer>
+python3 examples/tests/gen_input_data.py <sample-num:integer>
 # e.g. The following script generates 10 samples for each benchmark. 
-# python examples/tests/gen_input_data.py 10 
+# python3 examples/tests/gen_input_data.py 10 
 ```
 
 The samples can be found at `<orbit-repository>/input_data/<16k|64k>/<model-name>/<relu|silu>/`. For the id-th sample, the input sample file is `inputs/input<id>.txt`, the Pytorch model evaluation result on this sample is `plrefs/plref<id>.txt`, and the true label of this sample can be found in `true_labels.txt`.

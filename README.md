@@ -1,0 +1,126 @@
+# Orbit: Optimizing Rescale and Bootstrap Placement with Integer Linear Programming Techniques
+
+## Installation
+
+### Requirements
+
+The following python modules are needed to run Orbit:
+```
+gurobipy
+joblib
+matplotlib
+more-itertools
+networkx
+numpy
+```
+
+Run the following commands to install them:
+```bash
+pip install -r requirements.txt
+```
+
+For `gurobipy`, you have to apply for a Gurobi license. It is free to apply for an unlimited-use Gurobi Optimizer license for academic use.
+
+### Frontend and Backend
+
+Orbit uses Dacapo's frontend interface and Lattigo as backend. To evaluate the compiled MLIR files, it is necessary to install the *backend*. As the plaintext files for evaluation are too large (in GBs), it is necessary to install the *frontend* to generate such files. **If you are satisfied with estimated evaluation results, it is NOT necessary to install the frontend and backend.**
+
+Check `frontend/README.md` and `backend/README.md` for installation instructions.
+
+## Usage
+
+### Compilation on one benchmark
+
+**Requirements:**
+- Input MLIR file: `mlirs_input/<model-name><activation><16|64>k.mlir`.
+- Cost model: `cost_models/profiled_LATTIGONEW_CPU<16|64>k_3_<maxlevel>.json`.
+
+**Script usage:**
+```bash
+# The current directory should be <orbit-repository>/
+python3 scripts/optimizer/orbit/run_orbit.py [options]
+```
+
+**Options:**
+- `--model <model-name>`: (Required) The model name.
+- `--act <activation>`: (Required) The activation function name.
+- `--n <16|64>`: (Required) The number of slots (in 1024s). 
+- `--Lm <maxlevle>`: (Required) The number of effective levels for computation (i.e. $L_{bts}$ in the paper).
+- `--Sw <waterline>`: (Required) The minimum scale attribute (i.e. $\log S_{min}$ in the paper).
+- `--nobypass`: If enabled, the bypass detection and handling is disabled.
+- `--qbp`: If enabled, Orbit will reuse qbps across different benchmarks.
+- `--nocomp`: If enabled, the compression technique is disabled.
+- `--nopart`: If enabled, the partitioning technique is disabled.
+- `--sim-vari`: If enabled, use the cost model with simulated variadic bootstrapping cost.
+- `--Csw`: Specify the minimum scale attribute for plaintexts. This option is experimental and is not used in Orbit's evaluation.
+
+**Output files:**
+
+You can find the output files in `<orbit-repository>/mlirs_output/orbit/<model-name>/<waterline>/<activation>/<16|64>/`. The filename should be `orbit_<model-name><activation><16|64>k_Lm<maxlevel>_Sw<waterline>_<cmt>.<txt|err|mlir>`.
+- `<cmt>` depends on the enabled/disabled techniques. For the base configuration, `<cmt>` is `bypass_noqbp_comp_part`.
+- The `.txt` file is Orbit's log file. You can see the estimated execution time(`Final tdag latency`) and its breakdown, as well as Orbit's compilation time(`Orbit Compilation time`) and its breakdown at the end of the file.
+- The `.err` file is Orbit's standard error output file. It should be empty.
+- The `.mlir` file is Orbit's compiled MLIR file. This file is necessary for execution.
+
+**Example:**
+
+```bash
+python3 scripts/optimizer/orbit/run_orbit.py --model ResNet --act SiLU --n 64 --Lm 16 --Sw 40
+# This command is for compiling MLIR for ResNet-SiLU under base configuration (n=64k,Lm=16,Sw=40).
+```
+
+The output files can be found in `<orbit-repository>/mlirs_output/orbit/ResNet/40/SiLU/64/`. The filename is `orbit_ResNetSiLU64k_Lm16_Sw40_bypass_noqbp_comp_part`. The log file is `<filename>.txt`, the error output file is `<filename>.err`, and the compiled MLIR file is `<filename>.mlir`.
+
+### Scripts for reproducing compilation results
+
+You can find the scripts for reproducing the compilation results in the paper in `auto_scripts/`. Make sure the input MLIR files exist in `mlirs_input/`.
+- `compile_orbit_eval_base.sh`: This script is for compiling all benchmarks on the base configuration(n=64k,Lm=16,Sw=40).
+- `compile_orbit_eval_16k.sh`: This script is for compiling all benchmarks on the n=16k configuration(n=16k,Lm=16,Sw=40).
+- `compile_orbit_eval_Lm12.sh`: This script is for compiling all benchmarks on the Lm=12 configuration(n=64k,Lm=12,Sw=40).
+- `compile_orbit_eval_Sw51.sh`: This script is for compiling all benchmarks on the Sw=51 configuration(n=64k,Lm=16,Sw=51).
+- `compile_orbit_eval_sim_vari.sh`: This script is for compiling all benchmarks on the base configuration(n=64k,Lm=16,Sw=40) using cost model with simulated variadic bootstrapping cost.
+- `compile_orbit_micro_comppart.sh`: This script is for compiling the specific benchmark on the base configuration(n=64k,Lm=16,Sw=40), enabling/disabling the compression/partitioning techniques.
+- `compile_orbit_micro_bypass.sh`: This script is for compiling ResNet benchmark on both base and n=16k configuration(Lm=16,Sw=40), disabling bypass handling.
+- `compile_orbit_micro_reqbp.sh`: This script is for compiling all benchmarks on the n=16k configuration(n=16k,Lm=16,Sw=40), where Orbit can reuse qbp across different benchmarks.
+
+### (Optional) Compilation on arbitrary MLIR input
+
+If you want to compile arbitrary MLIR input file with Orbit, you need to use the frontend to generate valid MLIR input file. To compile it, use the following script: 
+
+```bash
+# The current directory should be <orbit-repository>/
+python3 -m scripts.optimizer.orbit.optimizer [options]
+```
+
+Check `scripts/optimizer/orbit/optimizer.py` for options and usage.
+
+## Overview
+
+The structure of Orbit repository is as follows:
+- `frontend/`: The frontend. It contains Orbit's patch on Dacapo.
+- `backend/`: The backend. It contains Orbit's patch on Lattigo.
+- `scripts/`: The core scripts of Orbit.
+- `auto_scripts/`: The scripts for reproducing compilation results.
+- `cost_models/`: The cost models.
+- `mlirs_input/`: The MLIR input files, which were generated by Dacapo's frontend interface.
+- `mlirs_output/`: (Created automatically) The compiled MLIR files and Orbit's log files.
+- `mlirs_execute/`: (Created automatically) The evaluation results of MLIR files compiled by Orbit.
+- `input_data/`: (Created automatically) The CIFAR-10 samples, including the input files, correct labels, and the output files generated by PyTorch models.
+- `input_constants/`: (Created automatically) The plaintext files for execution.
+- `qbps_cache_*/`: (Created automatically) The cached qbps for cross-benchmark qbp reusing.
+
+### Orbit scripts
+
+The scripts of Orbit are stored in `scripts/`, which contains the following components:
+- `tdag/`: The dag structure in Orbit.
+  - The automatic compression technique is implemented in `auto_compression.py`.
+- `assignment/`: The assignment structure in Orbit. i.e. How Orbit stores the rescale and bootstrap placement.
+- `latency_estimator/`: The latency estimator in Orbit. It can estimate the latency of a given dag or assignment, based on the parsed cost model.
+- `params/`: The parameters in Orbit.
+- `visualize/`: The visualization scripts for dag. Mainly for debugging.
+- `utils/`: Some auxiliary scripts.
+- `optimizer/orbit/`: The core scripts of Orbit:
+  - The partitioning technique and bypass handling are implemented in `siso_partition.py`.
+  - The iterative partition solving and merging: in `iterative_partition.py`.
+  - The ILP formulation: in `ilp_core.py`
+  - The QBP management: in `qbp_manager.py`.

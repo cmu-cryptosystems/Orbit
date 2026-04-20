@@ -11,17 +11,9 @@ import argparse
 import time
 import os
 
-def run(input_file: str, output_file: str, params: Params):
-    le = LatencyEstimator(params)
-    
-    timestamps = dict()
-    
-    start_time = time.time()
-    og_dag = build_from_mlir(input_file, params)
-    og_dag.squash_ops(['rescale', 'upscale', 'modswitch', 'bootstrap'])
-    print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
-    timestamps['DAG Load Time'] = time.time() - start_time
-    
+
+def _optimize_and_emit_mlir(og_dag, output_file: str, params: Params, le: LatencyEstimator, timestamps: dict) -> None:
+    """Shared Orbit path: compress → ILP → decode → write MLIR (``og_dag`` already loaded and squashed)."""
     if params.comp:
         start_time = time.time()
         addition_squash(og_dag)
@@ -34,18 +26,18 @@ def run(input_file: str, output_file: str, params: Params):
     else:
         comp_dag = og_dag.copy_tdag()
         og_to_comp = {node: node for node in og_dag.nodes}
-    
+
     assign, ilp_times = orbit_core(comp_dag, le, params)
     for k, v in ilp_times.items():
         timestamps[k] = v
-    
+
     assign_lat = estimate_assign(assign, le)
     print(f"Final assignment latency: {assign_lat/1000000:.3f} sec.")
-    
+
     start_time = time.time()
     fdag = decode_assign(assign, og_dag, og_to_comp)
     timestamps['DAG Decode Time'] = time.time() - start_time
-    
+
     final_lat = estimate_tdag_latency(fdag, le)
     print(f"Final tdag latency: {final_lat/1000000:.3f} sec. (accurate estimation)")
     final_lat_bd_num, final_lat_bd_costs = estimate_tdag_latency_breakdown(fdag, le)
@@ -59,16 +51,45 @@ def run(input_file: str, output_file: str, params: Params):
         total_op_cost = sum(stats.values())
         print(f"  {op}: {total_op_cost/1000000:.3f} sec.")
     print("=" * 40)
-    
+
     start_time = time.time()
     tdag_to_mlir(fdag, output_file)
     timestamps['DAG Write Time'] = time.time() - start_time
-    
+
     print(f"Orbit Compilation time: {sum(timestamps.values()):.3f} sec.")
     print("Timestamps breakdown:")
     for k, v in timestamps.items():
         print(f"  '{k}': {v:.3f} sec.")
     print("=" * 40)
+
+
+def run(input_file: str, output_file: str, params: Params):
+    le = LatencyEstimator(params)
+
+    timestamps = dict()
+
+    start_time = time.time()
+    og_dag = build_from_mlir(input_file, params)
+    og_dag.squash_ops(['rescale', 'upscale', 'modswitch', 'bootstrap'])
+    print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
+    timestamps['DAG Load Time'] = time.time() - start_time
+
+    _optimize_and_emit_mlir(og_dag, output_file, params, le, timestamps)
+
+
+def run_from_rotom(manifest_path: str, output_file: str, params: Params) -> None:
+    """Same as :func:`run` but builds the initial Tdag from a Rotom circuit manifest (``build_from_rotom``)."""
+    le = LatencyEstimator(params)
+
+    timestamps = dict()
+
+    start_time = time.time()
+    og_dag = build_from_rotom(manifest_path, params)
+    og_dag.squash_ops(['rescale', 'upscale', 'modswitch', 'bootstrap'])
+    print(f"Built original DAG from Rotom with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
+    timestamps['DAG Load Time'] = time.time() - start_time
+
+    _optimize_and_emit_mlir(og_dag, output_file, params, le, timestamps)
 
 def main():
     set_global_seed(42)
@@ -88,6 +109,8 @@ def main():
     parser.add_argument('--enable-reqbp', action='store_true', help='Enable QBP cross-bench reusing')
     parser.add_argument('--bypass-dep', type=int, default=15, help='Bypass dependency level (default: 15)')
     parser.add_argument('--threads', type=int, default=16, help='Number of threads (default: 16)')
+    parser.add_argument('--ilp-solver', type=str, default=None, choices=['gurobi', 'pulp'],
+                        help='MILP backend: gurobipy (default) or PuLP with CBC (no Gurobi license required)')
     parser.add_argument('--netname', type=str, default="", help='Network name for qbp reusing purposes (default: mlirs_input/<netname>.mlir)')
     
     args = parser.parse_args()
@@ -103,7 +126,7 @@ def main():
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname)
+                    netname=netname, ilp_solver=args.ilp_solver)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

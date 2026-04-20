@@ -39,7 +39,10 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
                 solve_partition(main_pdag, qbp_manager, prev_cost, le, params)
                 qbp_manager.add_qbp_bypass(dag, main_pdag, bypass_pdag, prev_cost)
         print(f"Partition solving time for PDAG #{dag.name}: {time.time() - start_time:.2f} seconds")
-        return
+        # orbit_core unpacks this pair; a bare return here used to yield None and crash.
+        this_io_to_cost = qbp_manager.get_qbp_cost(dag.name)
+        this_io_to_assign = qbp_manager.get_qbp_assign(dag)
+        return this_io_to_assign, this_io_to_cost
     
     # for i in range(len(pdags)):
     #     visualize(pdags[i], f"visualize/debug_ilp_pdag_{pdags[i].name}.svg")

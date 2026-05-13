@@ -1,0 +1,25 @@
+{
+  "schema_version": "orbit-resilience-constraints-v0",
+  "description": "Example local scale waterline constraints derived from noise profiling.",
+  "constraints": [
+    {
+      "target_id": "edge:encoder.layer.0:out",
+      "match": {
+        "comment_contains": "encoder.layer.0"
+      },
+      "min_scale": 28,
+      "tau_abs": 0.024,
+      "fragility_class": "resilient",
+      "ports": ["in", "out"]
+    },
+    {
+      "target_id": "classifier_head",
+      "match": {
+        "comment_regex": "classifier|logit"
+      },
+      "min_scale": 44,
+      "fragility_class": "critical",
+      "ports": ["in", "out"]
+    }
+  ]
+}

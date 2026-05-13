@@ -15,6 +15,12 @@ if __name__ == "__main__":
     parser.add_argument('--nocomp', action='store_true', help='Disable Compression')
     parser.add_argument('--nopart', action='store_true', help='Disable Partitioning')
     parser.add_argument('--sim-vari', action='store_true', help='Use simulated variadic bootstrapping cost model')
+    parser.add_argument(
+        '--resilience-profile',
+        type=str,
+        default=None,
+        help='ckks-robustness-profiler JSON or Orbit resilience constraints JSON',
+    )
     
     args = parser.parse_args()
     benchmark = args.model+args.act+str(args.n)+"k"
@@ -27,7 +33,16 @@ if __name__ == "__main__":
         costs = f"cost_models/profiled_LATTIGONEW_CPU{args.n}k_3_{args.Lm}.json"
     
     result_dir = f"mlirs_output/orbit/{args.model}/{args.Sw}/{args.act}/{this_n}/"
-    outname = f"orbit_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
+    outname = (
+        f"orbit_{benchmark}_Lm{args.Lm}_Sw{args.Sw}"
+        + (f"_Csw{args.Csw}" if args.Csw is not None else "")
+        + ("_nobypass" if args.nobypass else "_bypass")
+        + ("_qbp" if args.qbp else "_noqbp")
+        + ("_nocomp" if args.nocomp else "_comp")
+        + ("_nopart" if args.nopart else "_part")
+        + ("_simvari" if args.sim_vari else "")
+        + ("_resilience" if args.resilience_profile else "")
+    )
     
     os.makedirs(result_dir, exist_ok=True)
     
@@ -50,6 +65,8 @@ if __name__ == "__main__":
         cmds.append("--no-partition")
     if args.qbp:
         cmds.append("--enable-reqbp")
+    if args.resilience_profile:
+        cmds += ["--resilience-profile", args.resilience_profile]
         
     with open(f"{result_dir}{outname}.txt", "w", buffering=1) as stdout_file, \
         open(f"{result_dir}{outname}.err", "w", buffering=1) as stderr_file:

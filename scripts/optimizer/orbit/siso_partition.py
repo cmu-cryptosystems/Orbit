@@ -62,6 +62,12 @@ def _filter_list(lst: list[int], depth_to_vs: dict[int, list[str]], delta: int) 
     return result
 
 def rdag_siso_partition(dag: Tdag, delta: int) -> list[Tdag]:
+    # SISO partitioning requires that depth 0 has exactly one non-constant
+    # node (the single input).  Multi-input DAGs (e.g. from Rotom) cannot
+    # be partitioned this way — return the whole DAG as one unit.
+    if len(dag.inputs) > 1 or len(dag.outputs) > 1:
+        return [dag]
+
     depth_to_vs_with_const = dag.get_depth_traversal()
     depth_to_vs = { d: [ v for v in vs if dag.nodes[v]['op'] != 'constant' ] for d, vs in depth_to_vs_with_const.items() }
     v_to_depth = { v: d for d, vs in depth_to_vs.items() for v in vs }
@@ -138,9 +144,10 @@ def handle_bypass(dag: Tdag, dep_thres: int|None) -> tuple[Tdag, Tdag|None]:
     # bypass not enabled
     if dep_thres is None:
         return dag, None
-    
-    # check output structure: must have 2 inputs for the output node
-    assert len(dag.inputs) == 1 and len(dag.outputs) == 1, "Bypass handling requires single input and single output nodes."
+
+    # bypass requires single input/output; skip for multi-input DAGs
+    if len(dag.inputs) != 1 or len(dag.outputs) != 1:
+        return dag, None
     out_v = list(dag.outputs)[0]
     if dag.in_degree(out_v) != 2:
         return dag, None

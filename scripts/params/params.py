@@ -1,8 +1,23 @@
 import json
 import numpy as np
+from ..resilience import ResilienceProfile
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
+    def __init__(
+        self,
+        le_json,
+        sysname,
+        mode,
+        Sw=None,
+        CSw=None,
+        bpsdepth=None,
+        threads=None,
+        comp=None,
+        part=None,
+        reqbp=None,
+        netname=None,
+        resilience_profile=None,
+    ):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -35,10 +50,28 @@ class Params:
         self.part = part if part is not None else True
         self.reqbp = reqbp if reqbp is not None else False
         self.netname = netname if netname is not None else ""
+        self.resilience_profile_path = resilience_profile
+        self.resilience_profile = ResilienceProfile.load(resilience_profile)
         
         self.trunc_val = 1 # truncation value for latency estimation
         self.dacapo_mlir_in = True  # need to revert the input MLIR level
         self.dacapo_mlir_out = True # need to revert the output MLIR level
+
+    def has_resilience_constraints(self) -> bool:
+        return (
+            self.resilience_profile is not None
+            and len(self.resilience_profile.constraints) > 0
+        )
+
+    def scale_lower_bound(self, node_label: str, node_attrs: dict, port: str) -> int:
+        if self.resilience_profile is None:
+            return self.Sw
+        return self.resilience_profile.scale_lower_bound(
+            node_label,
+            node_attrs,
+            self.Sw,
+            port,
+        )
         
     def check_res(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
         if in_lvl < out_lvl:

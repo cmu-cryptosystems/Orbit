@@ -9,18 +9,18 @@ def _num_unique_vals(D) -> int:
     return len(set(D.values()))
 
 def _initial_grouping(tdag: Tdag, is_ignore_weight: bool, reps=100) -> dict[str, str]:
-    assert len(tdag.inputs) == 1, "Current implementation only supports single input DAG"
-    assert len(tdag.outputs) == 1, "Current implementation only supports single output DAG"
-    
-    # remove the first item of dep_to_vs since it's the input node
-    dep_to_vs = sorted(tdag.get_depth_traversal().items())[1:]
+    depth_traversal = tdag.get_depth_traversal()
+    # depth-0 nodes are inputs and standalone constants; skip them
+    dep_to_vs = sorted((d, vs) for d, vs in depth_traversal.items() if d > 0)
 
     prev_grouping = None
     for r in range(reps):
         grouping = dict()
-        
-        grouping[list(tdag.inputs)[0]] = f"{list(tdag.inputs)[0]}_root"
-        
+
+        # Assign all depth-0 nodes (inputs + standalone constants) to root groups
+        for v in depth_traversal.get(0, []):
+            grouping[v] = f"{v}_root"
+
         for (dep, vs) in dep_to_vs:
             for v in vs:
                 for u in tdag.predecessors(v):
@@ -65,25 +65,22 @@ def _initial_grouping(tdag: Tdag, is_ignore_weight: bool, reps=100) -> dict[str,
     return prev_grouping
 
 def auto_compress(og_dag: Tdag, is_ignore_weight: bool):
-    assert len(og_dag.inputs) == 1, "Current implementation only supports single input DAG"
-    assert len(og_dag.outputs) == 1, "Current implementation only supports single output DAG"
-    
     ini_groups = _initial_grouping(og_dag, is_ignore_weight)
     og_to_comp = dict()
     comp_dag = Tdag(og_dag.params, og_dag.name + "_comp")
 
-    # remove the first item of dep_to_vs since it's the input node
-    dep_to_vs = sorted(og_dag.get_depth_traversal().items())[1:]
+    depth_traversal = og_dag.get_depth_traversal()
+    dep_to_vs = sorted((d, vs) for d, vs in depth_traversal.items() if d > 0)
 
-    # handling input node
-    og_inp = list(og_dag.inputs)[0]
-    comp_inp = f"{og_inp}_comp"
-    comp_dag.add_node(comp_inp, op='input', weight=og_dag.nodes[og_inp]['weight'],
-                      level=og_dag.nodes[og_inp]['level'], scale=og_dag.nodes[og_inp]['scale'],
-                      op_descr=og_dag.nodes[og_inp]['op_descr'],
-                      comment=og_dag.nodes[og_inp]['comment'])
-    comp_dag.inputs.add(comp_inp)
-    og_to_comp[og_inp] = comp_inp
+    # handling input nodes
+    for og_inp in og_dag.inputs:
+        comp_inp = f"{og_inp}_comp"
+        comp_dag.add_node(comp_inp, op='input', weight=og_dag.nodes[og_inp]['weight'],
+                          level=og_dag.nodes[og_inp]['level'], scale=og_dag.nodes[og_inp]['scale'],
+                          op_descr=og_dag.nodes[og_inp]['op_descr'],
+                          comment=og_dag.nodes[og_inp]['comment'])
+        comp_dag.inputs.add(comp_inp)
+        og_to_comp[og_inp] = comp_inp
     
     # handling constant nodes
     const_dep = dict()
@@ -153,7 +150,8 @@ def auto_compress(og_dag: Tdag, is_ignore_weight: bool):
             for v in vlist:
                 og_to_comp[v] = new_v
     
-    comp_dag.outputs.add(og_to_comp[list(og_dag.outputs)[0]])
+    for og_out in og_dag.outputs:
+        comp_dag.outputs.add(og_to_comp[og_out])
 
     _check_valid_compress(og_dag, comp_dag, og_to_comp)
     _split_const_wcomp(og_dag, comp_dag, og_to_comp)

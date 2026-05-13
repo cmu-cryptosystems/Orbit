@@ -38,6 +38,14 @@ class QBPManager:
     def _get_qbp_bj(self, pdag: Tdag) -> tuple[QBP, dict[str, str]]:
         if pdag.name in self.pdag_name_to_qbp:
             return self.pdag_name_to_qbp[pdag.name]
+        if self.params.has_resilience_constraints():
+            qbp = self.qbps.get(pdag.name)
+            if qbp is None:
+                qbp = QBP(pdag)
+                self.qbps[pdag.name] = qbp
+            bj_label = {v: v for v in pdag.nodes}
+            self.pdag_name_to_qbp[pdag.name] = (qbp, bj_label)
+            return qbp, bj_label
         bj_label = None
         bj_qbp = None
         for dag_id, qbp in self.qbps.items():
@@ -237,5 +245,3 @@ class QBPManager:
         rev_qbp = QBP(pdag)
         rev_io_to_assign = self._assign_biject(io_to_assign, rev_qbp, rev_bj_label)
         return rev_io_to_assign
-        
-        

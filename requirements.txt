@@ -1,6 +1,6 @@
-networkx==3.1
-numpy==1.25.2
-matplotlib==3.8.1
-more-itertools==8.10.0
-joblib==1.5.1
-gurobipy==12.0.2
+networkx>=3.1
+numpy>=1.25.2
+matplotlib>=3.8.1
+more-itertools>=8.10.0
+joblib>=1.5.1
+gurobipy>=12.0.2

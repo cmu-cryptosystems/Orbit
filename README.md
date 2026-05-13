@@ -53,6 +53,10 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--nopart`: If enabled, the partitioning technique is disabled.
 - `--sim-vari`: If enabled, use the cost model with simulated variadic bootstrapping cost.
 - `--Csw`: Specify the minimum scale attribute for plaintexts. This option is experimental and is not used in Orbit's evaluation.
+- `--resilience-profile`: Optional `ckks-robustness-profiler` summary JSON
+  or Orbit-native resilience constraints JSON. Matched TDAG nodes use local
+  scale waterlines from learned noise tolerances, allowing the ILP to delay or
+  force bootstrapping relative to the global `Sw`.
 
 **Output files:**
 
@@ -70,6 +74,21 @@ python3 scripts/optimizer/orbit/run_orbit.py --model ResNet --act SiLU --n 64 --
 ```
 
 The output files can be found in `<orbit-repository>/mlirs_output/orbit/ResNet/40/SiLU/64/`. The filename is `orbit_ResNetSiLU64k_Lm16_Sw40_bypass_noqbp_comp_part`. The log file is `<filename>.txt`, the error output file is `<filename>.err`, and the compiled MLIR file is `<filename>.mlir`.
+
+For resilience-guided placement:
+
+```bash
+python3 scripts/optimizer/orbit/run_orbit.py \
+  --model ResNet \
+  --act SiLU \
+  --n 64 \
+  --Lm 16 \
+  --Sw 40 \
+  --resilience-profile examples/resilience_constraints_example.json
+```
+
+See `docs/resilience_orbit_plan.md` for the profile-to-Orbit mapping and the
+gradient-descent noise-profiling loop that should produce these constraints.
 
 ### Scripts for reproducing compilation results
 

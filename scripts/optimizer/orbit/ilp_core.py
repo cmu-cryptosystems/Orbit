@@ -20,10 +20,24 @@ class VarPool:
         for v in tdag.nodes:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
-            self.vars[f"v_lvl_in_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_in_{v}")
-            self.vars[f"v_scl_in_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_in_{v}")
-            self.vars[f"v_lvl_out_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_out_{v}")
-            self.vars[f"v_scl_out_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_out_{v}")
+            self.vars[f"v_lvl_in_{v}"] = model.addVar(
+                lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_in_{v}"
+            )
+            self.vars[f"v_scl_in_{v}"] = model.addVar(
+                lb=self._node_scale_lb(tdag, v, "in"),
+                ub=self.Smax,
+                vtype=GRB.INTEGER,
+                name=f"v_scl_in_{v}",
+            )
+            self.vars[f"v_lvl_out_{v}"] = model.addVar(
+                lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_out_{v}"
+            )
+            self.vars[f"v_scl_out_{v}"] = model.addVar(
+                lb=self._node_scale_lb(tdag, v, "out"),
+                ub=self.Smax,
+                vtype=GRB.INTEGER,
+                name=f"v_scl_out_{v}",
+            )
             self.vars[f"v_use_r_{v}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"v_use_r_{v}")
             self.vars[f"v_use_b_{v}"] = model.addVar(vtype=GRB.BINARY, name=f"v_use_b_{v}")
         
@@ -38,7 +52,12 @@ class VarPool:
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"e_scl_out_{edge_label}")
+                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(
+                    lb=self._edge_scale_lb(tdag, u, v),
+                    ub=self.Smax,
+                    vtype=GRB.INTEGER,
+                    name=f"e_scl_out_{edge_label}",
+                )
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
             self.vars[f"e_use_r_{edge_label}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"e_use_r_{edge_label}")
@@ -59,7 +78,22 @@ class VarPool:
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
-            
+
+    def _node_scale_lb(self, tdag: Tdag, v: str, port: str) -> int:
+        scale_lb = self.params.scale_lower_bound(v, tdag.nodes[v], port)
+        if scale_lb > self.Smax:
+            raise ValueError(
+                f"Node {v} has resilience min_scale={scale_lb}, "
+                f"above Orbit Smax={self.Smax}."
+            )
+        return scale_lb
+
+    def _edge_scale_lb(self, tdag: Tdag, u: str, v: str) -> int:
+        return max(
+            self._node_scale_lb(tdag, u, "out"),
+            self._node_scale_lb(tdag, v, "in"),
+        )
+
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
     
@@ -262,17 +296,32 @@ def decode_ilp_sol(tdag: Tdag, vp: VarPool) -> Assign:
             # input nodes, need to store in-level/scale
             assign.v_lvl_in[v] = round(vp.var_lvl(v, 'in').X)
             assign.v_scl_in[v] = round(vp.var_scl(v, 'in').X)
-            assert assign.v_scl_in[v] >= params.Sw, f"Node {v} input scale {assign.v_scl_in[v]} below Sw={params.Sw}"
+            input_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "in")
+            assert assign.v_scl_in[v] >= input_scale_lb, (
+                f"Node {v} input scale {assign.v_scl_in[v]} below "
+                f"local lower bound {input_scale_lb}"
+            )
         assign.v_lvl_out[v] = round(vp.var_lvl(v, 'out').X)
         assign.v_scl_out[v] = round(vp.var_scl(v, 'out').X)
         if tdag.nodes[v]['op'] != 'constant':
-            assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
+            output_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "out")
+            assert assign.v_scl_out[v] >= output_scale_lb, (
+                f"Node {v} output scale {assign.v_scl_out[v]} below "
+                f"local lower bound {output_scale_lb}"
+            )
     
     for u, v in tdag.edges:
         if tdag.nodes[u]['op'] == 'constant':
             continue
         assign.e_lvl_out[(u,v)] = round(vp.var_lvl((u,v), 'out').X)
         assign.e_scl_out[(u,v)] = round(vp.var_scl((u,v), 'out').X)
-        assert assign.e_scl_out[(u,v)] >= params.Sw, f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below Sw={params.Sw}"
+        edge_scale_lb = max(
+            params.scale_lower_bound(u, tdag.nodes[u], "out"),
+            params.scale_lower_bound(v, tdag.nodes[v], "in"),
+        )
+        assert assign.e_scl_out[(u,v)] >= edge_scale_lb, (
+            f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below "
+            f"local lower bound {edge_scale_lb}"
+        )
     
     return assign

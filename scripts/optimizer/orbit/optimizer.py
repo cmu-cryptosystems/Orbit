@@ -11,15 +11,20 @@ import argparse
 import time
 import os
 
-def run(input_file: str, output_file: str, params: Params):
+def run(input_file: str, output_file: str, params: Params, input_format: str = "mlir"):
     le = LatencyEstimator(params)
-    
+
     timestamps = dict()
-    
+
     start_time = time.time()
-    og_dag = build_from_mlir(input_file, params)
+    if input_format == "rotom":
+        og_dag = build_from_rotom(input_file, params)
+    else:
+        og_dag = build_from_mlir(input_file, params)
     og_dag.squash_ops(['rescale', 'upscale', 'modswitch', 'bootstrap'])
     print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
+    if params.resilience_profile is not None:
+        print(f"Loaded resilience profile: {params.resilience_profile.describe()}")
     timestamps['DAG Load Time'] = time.time() - start_time
     
     if params.comp:
@@ -73,8 +78,12 @@ def run(input_file: str, output_file: str, params: Params):
 def main():
     set_global_seed(42)
     parser = argparse.ArgumentParser(description='Orbit Optimizer')
-    parser.add_argument('--inputfile', type=str, required=True, help='Input MLIR file')
+    parser.add_argument('--inputfile', type=str, required=True,
+                        help='Input file: .mlir file or Rotom manifest .json')
     parser.add_argument('--outputfile', type=str, required=True, help='Output MLIR file')
+    parser.add_argument('--input-format', type=str, default='auto',
+                        choices=['auto', 'mlir', 'rotom'],
+                        help='Input format (default: auto-detect from file extension)')
     parser.add_argument('--costjson', type=str, required=True, help='Cost model JSON file')
     parser.add_argument('--maxlevel', type=int, default=None, help='Maximum level budget (overrides costjson if specified)')
     parser.add_argument('--btsupperbound', type=int, default=None, help='Maximum Bootstrapping target level (overrides costjson if specified)')
@@ -89,6 +98,12 @@ def main():
     parser.add_argument('--bypass-dep', type=int, default=15, help='Bypass dependency level (default: 15)')
     parser.add_argument('--threads', type=int, default=16, help='Number of threads (default: 16)')
     parser.add_argument('--netname', type=str, default="", help='Network name for qbp reusing purposes (default: mlirs_input/<netname>.mlir)')
+    parser.add_argument(
+        '--resilience-profile',
+        type=str,
+        default=None,
+        help='ckks-robustness-profiler JSON or Orbit resilience constraints JSON',
+    )
     
     args = parser.parse_args()
     if args.nobypass:
@@ -103,7 +118,7 @@ def main():
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname)
+                    netname=netname, resilience_profile=args.resilience_profile)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:
@@ -113,10 +128,18 @@ def main():
     if args.rescale is not None:
         params.Sf = args.rescale
     
+    # Auto-detect input format from file extension
+    input_format = args.input_format
+    if input_format == 'auto':
+        if args.inputfile.endswith('.json'):
+            input_format = 'rotom'
+        else:
+            input_format = 'mlir'
+
     # make sure output_file directory exists
     os.makedirs(os.path.dirname(args.outputfile), exist_ok=True)
 
-    run(args.inputfile, args.outputfile, params)
+    run(args.inputfile, args.outputfile, params, input_format=input_format)
 
 if __name__ == "__main__":
     main()

@@ -121,6 +121,9 @@ class VarPool:
 def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     model = vp.model
     params = vp.params
+    def decryptable_scale_bound(level_var):
+        return params.Sf * (level_var - params.lvl_lb + 2) - 7
+
     # add mul scale constraints
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] != 'mul':
@@ -136,6 +139,10 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] == 'constant':
             continue
+        model.addConstr(vp.var_scl(v, 'in') <= decryptable_scale_bound(vp.var_lvl(v, 'in')),
+                        name=f"decryptable_{v}_input_scale")
+        model.addConstr(vp.var_scl(v, 'out') <= decryptable_scale_bound(vp.var_lvl(v, 'out')),
+                        name=f"decryptable_{v}_output_scale")
         model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
                                     vp.var_scl(v,'in') <= params.Sf * (vp.var_lvl(v,'in')-params.bts_lb+1),
                                     name=f"bts_{v}_input_lvl_scl")

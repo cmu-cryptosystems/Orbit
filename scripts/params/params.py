@@ -29,7 +29,7 @@ class Params:
         except json.JSONDecodeError:
             raise Exception(f"Error decoding JSON from the file {le_json}.")
         
-        self.poly_deg = int(json_parsed.get("poly_deg", 32768))
+        self.poly_deg = int(json_parsed.get("poly_deg", json_parsed.get("polynomialDegree", 32768)))
         self.max_slot = self.poly_deg // 2
         self.bts_ub = int(json_parsed.get("bootstrapLevelUpperBound", 14))
         self.bts_lb = int(json_parsed.get("bootstrapLevelLowerBound", 1))

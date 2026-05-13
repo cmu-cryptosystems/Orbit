@@ -37,6 +37,7 @@ def run(input_file: str, output_file: str, params: Params, input_format: str = "
         print(f"After Compression, DAG has {len(comp_dag.nodes)} nodes and {len(comp_dag.edges)} edges.")
         timestamps['DAG Compression Time'] = time.time() - start_time
     else:
+        split_constants(og_dag)
         comp_dag = og_dag.copy_tdag()
         og_to_comp = {node: node for node in og_dag.nodes}
     

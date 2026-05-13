@@ -74,6 +74,44 @@ def test_ckks_profiler_summary_converts_to_comment_matcher():
     ) == 27
 
 
+def test_orbit_constraints_match_rotom_scope_metadata():
+    path = _write_json(
+        {
+            "schema_version": "orbit-resilience-constraints-v0",
+            "constraints": [
+                {
+                    "target_id": "edge:bert.encoder.layer.0.attention.self.query:out",
+                    "match": {
+                        "comment_regex": (
+                            r"(?:^|[;\s])scope="
+                            r"bert\.encoder\.layer\.0\.attention\.self\.query"
+                            r"(?:$|[;\s])"
+                        )
+                    },
+                    "min_scale": 29,
+                    "ports": ["in", "out"],
+                }
+            ],
+        }
+    )
+    profile = ResilienceProfile.load(path)
+
+    assert (
+        profile.scale_lower_bound(
+            "101",
+            {
+                "comment": (
+                    "scope=bert.encoder.layer.0.attention.self.query;"
+                    "op=linear;layer=0"
+                )
+            },
+            40,
+            "out",
+        )
+        == 29
+    )
+
+
 def test_check_tdag_uses_resilience_local_scale_bound():
     path = _write_json(
         {
@@ -101,8 +139,22 @@ def test_check_tdag_uses_resilience_local_scale_bound():
     assert check_tdag(tdag)
 
 
+def test_lattigo_cost_model_uses_polynomial_degree_key():
+    params = Params(
+        "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
+        "Orbit",
+        mode="compile",
+        Sw=40,
+    )
+
+    assert params.poly_deg == 131072
+    assert params.max_slot == 65536
+
+
 if __name__ == "__main__":
     test_orbit_constraints_match_node_and_comment()
     test_ckks_profiler_summary_converts_to_comment_matcher()
+    test_orbit_constraints_match_rotom_scope_metadata()
     test_check_tdag_uses_resilience_local_scale_bound()
+    test_lattigo_cost_model_uses_polynomial_degree_key()
     print("PASS resilience profile tests")

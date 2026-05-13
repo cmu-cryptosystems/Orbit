@@ -1,12 +1,27 @@
 from .tdag import Tdag
 import networkx as nx
 
-def _split_const(tdag: Tdag):
+def split_constants(tdag: Tdag):
+    """Give each plaintext constant consumer its own constant node.
+
+    Orbit's ILP treats a plaintext constant as a value adapted to exactly one
+    consumer's level/scale. Rotom can legitimately reuse a packed plaintext
+    weight or mask across multiple operations, so split those fan-out nodes
+    before assignment.
+    """
     plain_nodes = list(tdag.nodes())
     for v in plain_nodes:
         if tdag.nodes[v]['op'] == 'constant':
             assert tdag.in_degree(v) == 0
-            for i, child in enumerate(tdag.successors(v)):
+            children = list(tdag.successors(v))
+            if not children:
+                tdag.inputs.discard(v)
+                tdag.outputs.discard(v)
+                tdag.remove_node(v)
+                continue
+            if len(children) == 1:
+                continue
+            for i, child in enumerate(children):
                 eweight = tdag.edges[v, child]['weight']
                 new_v = f"{v}_c{i}"
                 vattr = tdag.nodes[v]
@@ -19,7 +34,7 @@ def _split_const(tdag: Tdag):
             
 
 def addition_squash(tdag: Tdag):
-    _split_const(tdag)
+    split_constants(tdag)
     dep_to_vs = tdag.get_depth_traversal()
     squash_ranges = dict()
     squashed_vs = set()

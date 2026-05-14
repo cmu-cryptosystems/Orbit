@@ -11,6 +11,9 @@ class Assign:
         self.v_scl_in = dict()   # node -> input scale, not necessary for all nodes
         self.e_lvl_out = dict()  # edge -> output level, necessary for all edges except from constants
         self.e_scl_out = dict()  # edge -> output scale, necessary for all edges except from constants
+        self.v_err_in = dict()   # optional node -> estimated input error for resilience search
+        self.v_err_out = dict()  # optional node -> estimated output error for resilience search
+        self.e_err_out = dict()  # optional edge -> estimated output error for resilience search
 
     def to_dict(self) -> dict:
         return {
@@ -19,7 +22,10 @@ class Assign:
             'v_lvl_in': self.v_lvl_in,
             'v_scl_in': self.v_scl_in,
             'e_lvl_out': self.e_lvl_out,
-            'e_scl_out': self.e_scl_out
+            'e_scl_out': self.e_scl_out,
+            'v_err_in': self.v_err_in,
+            'v_err_out': self.v_err_out,
+            'e_err_out': self.e_err_out,
         }
     
     @staticmethod
@@ -31,6 +37,9 @@ class Assign:
         assign.v_scl_in = data.get('v_scl_in', dict())
         assign.e_lvl_out = data.get('e_lvl_out', dict())
         assign.e_scl_out = data.get('e_scl_out', dict())
+        assign.v_err_in = data.get('v_err_in', dict())
+        assign.v_err_out = data.get('v_err_out', dict())
+        assign.e_err_out = data.get('e_err_out', dict())
         return assign
     
     def _deduce_in_lvl_scl(self, v: str) -> tuple[int|None, int|None]:

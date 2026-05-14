@@ -432,7 +432,7 @@ def test_pl_pack_is_constant():
 
         assert tdag.nodes['0']['op'] == 'input'
         assert tdag.nodes['1']['op'] == 'constant'
-        assert tdag.nodes['1']['op_descr'] == {'value': 0, 'rms_var': 0.0}
+        assert tdag.nodes['1']['op_descr'] == {'value': 1, 'rms_var': 0.0}
         assert tdag.inputs == {'0'}, \
             f"only ci pack should be input, got {tdag.inputs}"
         assert tdag.nodes['2']['op_descr'] == {'single': 1, 'double': 0}, \

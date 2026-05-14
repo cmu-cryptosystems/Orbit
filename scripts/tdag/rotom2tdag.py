@@ -239,9 +239,10 @@ def build_from_rotom(manifest_path: str, params: Params) -> Tdag:
         tdag_op  = _map_op_to_tdag(op_type, secret)
         op_descr = _build_op_descr(op_type, op_info, operand_secrets, params)
 
-        # Plaintext packs become constants; they need value/rms_var metadata.
+        # Plaintext packs become constants; Lattigo indexes the .cst file by
+        # MLIR constant value, so preserve the Rotom instruction ID here.
         if tdag_op == 'constant' and 'value' not in op_descr:
-            op_descr = {'value': 0, 'rms_var': 0.0}
+            op_descr = {'value': idx, 'rms_var': 0.0}
 
         # In compile mode Orbit sets level/scale to None and solves for them.
         level = None

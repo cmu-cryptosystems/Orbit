@@ -112,6 +112,39 @@ def test_orbit_constraints_match_rotom_scope_metadata():
     )
 
 
+def test_orbit_constraints_match_descendant_rotom_scope_metadata():
+    path = _write_json(
+        {
+            "schema_version": "orbit-resilience-constraints-v0",
+            "constraints": [
+                {
+                    "target_id": "edge:bert.encoder.layer.0:out",
+                    "match": {
+                        "comment_regex": (
+                            r"(?:^|[;\s])scope="
+                            r"bert\.encoder\.layer\.0"
+                            r"(?:\.|$|[;\s])"
+                        )
+                    },
+                    "min_scale": 18,
+                    "tau_abs": 0.001,
+                    "ports": ["in", "out"],
+                }
+            ],
+        }
+    )
+    profile = ResilienceProfile.load(path)
+    attrs = {
+        "comment": (
+            "scope=bert.encoder.layer.0.attention.self.query;"
+            "op=linear;layer=0"
+        )
+    }
+
+    assert profile.scale_lower_bound("101", attrs, 40, "out") == 18
+    assert profile.error_upper_bound("101", attrs, "out") == 0.001
+
+
 def test_check_tdag_uses_resilience_local_scale_bound():
     path = _write_json(
         {
@@ -139,6 +172,127 @@ def test_check_tdag_uses_resilience_local_scale_bound():
     assert check_tdag(tdag)
 
 
+def test_relax_only_policy_does_not_tighten_global_waterline():
+    path = _write_json(
+        {
+            "constraints": [
+                {
+                    "match": {"node": "x"},
+                    "min_scale": 52,
+                    "ports": ["in", "out"],
+                }
+            ]
+        }
+    )
+    params = Params(
+        "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
+        "Orbit",
+        mode="compile",
+        Sw=40,
+        resilience_profile=str(path),
+    )
+
+    assert params.scale_lower_bound("x", {"comment": ""}, "out") == 40
+
+
+def test_relax_only_policy_lowers_guided_global_waterline():
+    path = _write_json(
+        {
+            "constraints": [
+                {
+                    "match": {"node": "x"},
+                    "min_scale": 18,
+                    "ports": ["in", "out"],
+                },
+                {
+                    "match": {"node": "y"},
+                    "min_scale": 24,
+                    "ports": ["in", "out"],
+                },
+            ]
+        }
+    )
+    params = Params(
+        "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
+        "Orbit",
+        mode="compile",
+        Sw=40,
+        resilience_profile=str(path),
+    )
+
+    assert params.Sw == 18
+    assert params.Csw == 18
+
+
+def test_hard_tau_policy_can_tighten_global_waterline():
+    path = _write_json(
+        {
+            "constraints": [
+                {
+                    "match": {"node": "x"},
+                    "min_scale": 52,
+                    "ports": ["in", "out"],
+                }
+            ]
+        }
+    )
+    params = Params(
+        "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
+        "Orbit",
+        mode="compile",
+        Sw=40,
+        resilience_profile=str(path),
+        resilience_constraint_policy="hard-tau",
+    )
+
+    assert params.scale_lower_bound("x", {"comment": ""}, "out") == 52
+
+
+def test_resilience_match_report_counts_matched_and_unmatched_targets():
+    path = _write_json(
+        {
+            "constraints": [
+                {
+                    "target_id": "matched",
+                    "match": {"comment_contains": "encoder.layer.0"},
+                    "min_scale": 28,
+                },
+                {
+                    "target_id": "missing",
+                    "match": {"comment_contains": "encoder.layer.9"},
+                    "min_scale": 28,
+                },
+            ]
+        }
+    )
+    params = Params(
+        "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
+        "Orbit",
+        mode="compile",
+        Sw=40,
+        resilience_profile=str(path),
+    )
+    tdag = Tdag(params, "match_report_test")
+    tdag.add_node(
+        "x",
+        op="input",
+        level=1,
+        scale=28,
+        weight=1,
+        op_descr={},
+        comment="scope=bert.encoder.layer.0.attention",
+    )
+    tdag.inputs.add("x")
+    tdag.outputs.add("x")
+
+    report = params.resilience_profile.match_report(tdag)
+
+    assert report["total_constraints"] == 2
+    assert report["matched_constraints"] == 1
+    assert report["matched_nodes"] == 1
+    assert report["unmatched_targets"] == ["missing"]
+
+
 def test_lattigo_cost_model_uses_polynomial_degree_key():
     params = Params(
         "cost_models/profiled_LATTIGONEW_CPU64k_3_16.json",
@@ -155,6 +309,11 @@ if __name__ == "__main__":
     test_orbit_constraints_match_node_and_comment()
     test_ckks_profiler_summary_converts_to_comment_matcher()
     test_orbit_constraints_match_rotom_scope_metadata()
+    test_orbit_constraints_match_descendant_rotom_scope_metadata()
     test_check_tdag_uses_resilience_local_scale_bound()
+    test_relax_only_policy_does_not_tighten_global_waterline()
+    test_relax_only_policy_lowers_guided_global_waterline()
+    test_hard_tau_policy_can_tighten_global_waterline()
+    test_resilience_match_report_counts_matched_and_unmatched_targets()
     test_lattigo_cost_model_uses_polynomial_degree_key()
     print("PASS resilience profile tests")

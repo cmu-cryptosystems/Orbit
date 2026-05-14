@@ -22,7 +22,13 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
         "16k" if params.netname.endswith("16k") else "64k"
     ])
     if params.resilience_profile is not None:
-        qbp_name += f"_res_{params.resilience_profile.fingerprint}"
+        qbp_name += f"_res_{params.resilience_mode}_{params.resilience_profile.fingerprint}"
+        if params.resilience_decomposition != "off":
+            qbp_name += (
+                f"_{params.resilience_decomposition}"
+                f"_d{params.resilience_decompose_threshold}"
+                f"_k{params.resilience_max_boundary_states}"
+            )
     
     start_time = time.time()
     qbp_manager = QBPManager(params, le)

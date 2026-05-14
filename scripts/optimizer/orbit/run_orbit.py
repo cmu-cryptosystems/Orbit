@@ -21,6 +21,33 @@ if __name__ == "__main__":
         default=None,
         help='ckks-robustness-profiler JSON or Orbit resilience constraints JSON',
     )
+    parser.add_argument(
+        '--resilience-mode',
+        choices=['waterline', 'error-state'],
+        default='waterline',
+        help='How resilience constraints affect placement',
+    )
+    parser.add_argument(
+        '--allow-empty-resilience-match',
+        action='store_true',
+        help='Allow a loaded resilience profile to match zero TDAG nodes',
+    )
+    parser.add_argument(
+        '--resilience-decomposition',
+        choices=['off', 'bounded-dp'],
+        default='off',
+        help='Optional decomposition strategy for resilience error-state search',
+    )
+    parser.add_argument('--resilience-decompose-threshold', type=int, default=32)
+    parser.add_argument('--resilience-max-boundary-states', type=int, default=8)
+    parser.add_argument('--resilience-error-buckets', type=int, default=8)
+    parser.add_argument(
+        '--resilience-constraint-policy',
+        choices=['relax-only', 'hard-tau'],
+        default='relax-only',
+        help='Use relax-only for speedup-guided placement or hard-tau for strict error caps',
+    )
+    parser.add_argument('--ilp-task-time-limit-sec', type=float, default=0.0)
     
     args = parser.parse_args()
     benchmark = args.model+args.act+str(args.n)+"k"
@@ -67,6 +94,15 @@ if __name__ == "__main__":
         cmds.append("--enable-reqbp")
     if args.resilience_profile:
         cmds += ["--resilience-profile", args.resilience_profile]
+        cmds += ["--resilience-mode", args.resilience_mode]
+        cmds += ["--resilience-decomposition", args.resilience_decomposition]
+        cmds += ["--resilience-decompose-threshold", str(args.resilience_decompose_threshold)]
+        cmds += ["--resilience-max-boundary-states", str(args.resilience_max_boundary_states)]
+        cmds += ["--resilience-error-buckets", str(args.resilience_error_buckets)]
+        cmds += ["--resilience-constraint-policy", args.resilience_constraint_policy]
+        cmds += ["--ilp-task-time-limit-sec", str(args.ilp_task_time_limit_sec)]
+    if args.allow_empty_resilience_match:
+        cmds.append("--allow-empty-resilience-match")
         
     with open(f"{result_dir}{outname}.txt", "w", buffering=1) as stdout_file, \
         open(f"{result_dir}{outname}.err", "w", buffering=1) as stderr_file:

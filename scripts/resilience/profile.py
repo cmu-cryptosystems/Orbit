@@ -81,6 +81,18 @@ class ResilienceProfile:
     model_name: str | None = None
     fingerprint: str = ""
 
+    def matching_constraints(
+        self,
+        node_label: str,
+        node_attrs: dict[str, Any],
+        port: str,
+    ) -> list[ResilienceConstraint]:
+        return [
+            constraint
+            for constraint in self.constraints
+            if constraint.matches(node_label, node_attrs, port)
+        ]
+
     @classmethod
     def load(cls, path: str | Path | None) -> "ResilienceProfile | None":
         if path is None:
@@ -179,12 +191,88 @@ class ResilienceProfile:
     ) -> int:
         matches = [
             constraint.min_scale
-            for constraint in self.constraints
-            if constraint.matches(node_label, node_attrs, port)
+            for constraint in self.matching_constraints(node_label, node_attrs, port)
         ]
         if not matches:
             return default_scale
         return max(matches)
+
+    def relaxed_global_scale(self, default_scale: int) -> int:
+        """Return the lowest profiler scale usable as a guided waterline.
+
+        In speedup-oriented runs the profile is a relaxation budget: lower
+        `min_scale` means the compiled model may carry less precision through
+        profiled regions. Orbit still needs a single initial waterline for its
+        dynamic program, so use the most permissive profiled scale and let
+        per-node bounds keep stricter profiled layers higher when needed.
+        """
+        scales = [
+            int(constraint.min_scale)
+            for constraint in self.constraints
+            if constraint.min_scale is not None and int(constraint.min_scale) > 0
+        ]
+        if not scales:
+            return default_scale
+        return min(default_scale, min(scales))
+
+    def error_upper_bound(
+        self,
+        node_label: str,
+        node_attrs: dict[str, Any],
+        port: str,
+    ) -> float | None:
+        matches = [
+            float(constraint.tau_abs)
+            for constraint in self.matching_constraints(node_label, node_attrs, port)
+            if constraint.tau_abs is not None
+        ]
+        if not matches:
+            return None
+        return min(matches)
+
+    def match_report(self, tdag) -> dict[str, Any]:
+        constraint_to_nodes: dict[int, set[str]] = {
+            index: set() for index in range(len(self.constraints))
+        }
+        matched_nodes: set[str] = set()
+        node_port_matches = 0
+
+        for node_label in tdag.nodes:
+            node_attrs = tdag.nodes[node_label]
+            for index, constraint in enumerate(self.constraints):
+                for port in constraint.ports or ("in", "out"):
+                    if constraint.matches(node_label, node_attrs, port):
+                        constraint_to_nodes[index].add(str(node_label))
+                        matched_nodes.add(str(node_label))
+                        node_port_matches += 1
+                        break
+
+        unmatched = [
+            self.constraints[index].target_id or self.constraints[index].node
+            or self.constraints[index].comment_regex
+            or f"constraint:{index}"
+            for index, nodes in constraint_to_nodes.items()
+            if not nodes
+        ]
+        matched_constraints = sum(1 for nodes in constraint_to_nodes.values() if nodes)
+        return {
+            "total_constraints": len(self.constraints),
+            "matched_constraints": matched_constraints,
+            "matched_nodes": len(matched_nodes),
+            "node_port_matches": node_port_matches,
+            "unmatched_targets": unmatched,
+        }
+
+    @staticmethod
+    def format_match_report(report: dict[str, Any]) -> str:
+        return (
+            "Resilience match report: "
+            f"constraints={report['total_constraints']}, "
+            f"matched_constraints={report['matched_constraints']}, "
+            f"matched_nodes={report['matched_nodes']}, "
+            f"node_port_matches={report['node_port_matches']}, "
+            f"unmatched_constraints={len(report['unmatched_targets'])}"
+        )
 
     def describe(self) -> str:
         return (

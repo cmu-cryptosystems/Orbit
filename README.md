@@ -87,6 +87,14 @@ python3 scripts/optimizer/orbit/run_orbit.py \
   --resilience-profile examples/resilience_constraints_example.json
 ```
 
+The default resilience constraint policy is `relax-only`: profiler constraints
+can lower the guided global waterline and local scale requirements, but they do
+not make `tau_abs` a hard error cap. This is the speedup-oriented mode for
+checking whether learned model tolerance lets Orbit use fewer maintenance
+operations. Use
+`--resilience-constraint-policy hard-tau` only when you intentionally want
+profile tolerances to tighten placement feasibility.
+
 See `docs/resilience_orbit_plan.md` for the profile-to-Orbit mapping and the
 gradient-descent noise-profiling loop that should produce these constraints.
 

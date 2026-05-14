@@ -91,8 +91,11 @@ step is to add explicit edge error state:
 ```text
 E_out <= E_in + E_rescale/modswitch/keyswitch/compute
 E_out = E_bootstrap after bootstrap
-E_out <= tau_abs[edge]
+E_out <= tau_abs[edge]  # only with --resilience-constraint-policy hard-tau
 ```
 
-That second step will let Orbit reason directly about "how far apart"
-bootstraps can be, instead of using `min_scale` as the proxy.
+For speedup experiments, the default policy is `relax-only`: learned tolerances
+lower the guided global waterline and local waterlines but do not impose
+stricter `tau_abs` feasibility constraints than the baseline compile. This
+keeps the robustness profile from accidentally adding bootstraps when the
+current CKKS error proxy is conservative.

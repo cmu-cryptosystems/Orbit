@@ -25,6 +25,9 @@ def run(input_file: str, output_file: str, params: Params, input_format: str = "
     print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
     if params.resilience_profile is not None:
         print(f"Loaded resilience profile: {params.resilience_profile.describe()}")
+        print(f"Resilience mode: {params.resilience_mode}")
+        print(f"Resilience constraint policy: {params.resilience_constraint_policy}")
+        print(f"Resilience decomposition: {params.resilience_decomposition}")
     timestamps['DAG Load Time'] = time.time() - start_time
     
     if params.comp:
@@ -40,6 +43,20 @@ def run(input_file: str, output_file: str, params: Params, input_format: str = "
         split_constants(og_dag)
         comp_dag = og_dag.copy_tdag()
         og_to_comp = {node: node for node in og_dag.nodes}
+
+    if params.resilience_profile is not None:
+        report = params.resilience_profile.match_report(comp_dag)
+        params.resilience_match_report = report
+        print(params.resilience_profile.format_match_report(report))
+        if report["unmatched_targets"]:
+            preview = ", ".join(str(target) for target in report["unmatched_targets"][:5])
+            suffix = "..." if len(report["unmatched_targets"]) > 5 else ""
+            print(f"Unmatched resilience targets: {preview}{suffix}")
+        if report["matched_nodes"] == 0 and not params.allow_empty_resilience_match:
+            raise RuntimeError(
+                "Resilience profile matched zero compressed TDAG nodes. "
+                "Use --allow-empty-resilience-match only to debug old profiles."
+            )
     
     assign, ilp_times = orbit_core(comp_dag, le, params)
     for k, v in ilp_times.items():
@@ -105,6 +122,57 @@ def main():
         default=None,
         help='ckks-robustness-profiler JSON or Orbit resilience constraints JSON',
     )
+    parser.add_argument(
+        '--resilience-mode',
+        choices=['waterline', 'error-state'],
+        default='waterline',
+        help='How resilience constraints affect placement (default: waterline)',
+    )
+    parser.add_argument(
+        '--allow-empty-resilience-match',
+        action='store_true',
+        help='Allow a loaded resilience profile to match zero TDAG nodes',
+    )
+    parser.add_argument(
+        '--resilience-decomposition',
+        choices=['off', 'bounded-dp'],
+        default='off',
+        help='Optional decomposition strategy for resilience error-state search',
+    )
+    parser.add_argument(
+        '--resilience-decompose-threshold',
+        type=int,
+        default=32,
+        help='SISO window size threshold for bounded-DP resilience decomposition',
+    )
+    parser.add_argument(
+        '--resilience-max-boundary-states',
+        type=int,
+        default=8,
+        help='Maximum boundary states retained after each bounded-DP window',
+    )
+    parser.add_argument(
+        '--resilience-error-buckets',
+        type=int,
+        default=8,
+        help='Number of error buckets used for bounded-DP boundary pruning',
+    )
+    parser.add_argument(
+        '--ilp-task-time-limit-sec',
+        type=float,
+        default=0.0,
+        help='Per-ILP Gurobi time limit in seconds; 0 means no limit',
+    )
+    parser.add_argument(
+        '--resilience-constraint-policy',
+        choices=['relax-only', 'hard-tau'],
+        default='relax-only',
+        help=(
+            'How profile tolerances constrain placement. relax-only uses the '
+            'profile only to lower local scale requirements; hard-tau also '
+            'enforces tau_abs as an error upper bound.'
+        ),
+    )
     
     args = parser.parse_args()
     if args.nobypass:
@@ -119,7 +187,15 @@ def main():
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname, resilience_profile=args.resilience_profile)
+                    netname=netname, resilience_profile=args.resilience_profile,
+                    resilience_mode=args.resilience_mode,
+                    allow_empty_resilience_match=args.allow_empty_resilience_match,
+                    resilience_decomposition=args.resilience_decomposition,
+                    resilience_decompose_threshold=args.resilience_decompose_threshold,
+                    resilience_max_boundary_states=args.resilience_max_boundary_states,
+                    resilience_error_buckets=args.resilience_error_buckets,
+                    ilp_task_time_limit_sec=args.ilp_task_time_limit_sec,
+                    resilience_constraint_policy=args.resilience_constraint_policy)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

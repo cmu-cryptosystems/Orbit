@@ -15,6 +15,11 @@ class VarPool:
         
         self.vars = dict()
         self.total_cost = []
+        self.error_penalty_terms = []
+        self.error_enabled = (
+            params.resilience_mode == "error-state"
+            and params.resilience_profile is not None
+        )
         
         # Node variables, skip constant nodes
         for v in tdag.nodes:
@@ -40,6 +45,22 @@ class VarPool:
             )
             self.vars[f"v_use_r_{v}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"v_use_r_{v}")
             self.vars[f"v_use_b_{v}"] = model.addVar(vtype=GRB.BINARY, name=f"v_use_b_{v}")
+            if self.error_enabled:
+                max_error = params.resilience_error_model["max_error_abs"]
+                self.vars[f"v_err_in_{v}"] = model.addVar(
+                    lb=0.0,
+                    ub=max_error,
+                    vtype=GRB.CONTINUOUS,
+                    name=f"v_err_in_{v}",
+                )
+                self.vars[f"v_err_out_{v}"] = model.addVar(
+                    lb=0.0,
+                    ub=max_error,
+                    vtype=GRB.CONTINUOUS,
+                    name=f"v_err_out_{v}",
+                )
+                self.error_penalty_terms.append(self.vars[f"v_err_in_{v}"])
+                self.error_penalty_terms.append(self.vars[f"v_err_out_{v}"])
         
         self.rescale_cost = None
         
@@ -51,6 +72,16 @@ class VarPool:
             self.vars[f"e_lvl_in_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
+            if self.error_enabled:
+                max_error = params.resilience_error_model["max_error_abs"]
+                self.vars[f"e_err_in_{edge_label}"] = self.vars[f"v_err_out_{u}"]
+                self.vars[f"e_err_out_{edge_label}"] = model.addVar(
+                    lb=0.0,
+                    ub=max_error,
+                    vtype=GRB.CONTINUOUS,
+                    name=f"e_err_out_{edge_label}",
+                )
+                self.error_penalty_terms.append(self.vars[f"e_err_out_{edge_label}"])
             if tdag.nodes[v]['op'] == 'mul':
                 self.vars[f"e_scl_out_{edge_label}"] = model.addVar(
                     lb=self._edge_scale_lb(tdag, u, v),
@@ -60,6 +91,10 @@ class VarPool:
                 )
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
+                model.addConstr(
+                    self.vars[f"e_scl_out_{edge_label}"] >= self._edge_scale_lb(tdag, u, v),
+                    name=f"edge_scale_lb_{edge_label}",
+                )
             self.vars[f"e_use_r_{edge_label}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"e_use_r_{edge_label}")
             
         # Constant variables
@@ -118,6 +153,12 @@ class VarPool:
             edge_label = self.get_edge_label(v[0], v[1])
             return self.vars[f"e_use_{type}_{edge_label}"]
 
+    def var_err(self, v: str | tuple[str, str], type: str) -> gp.Var:
+        if isinstance(v, str):
+            return self.vars[f"v_err_{type}_{v}"]
+        edge_label = self.get_edge_label(v[0], v[1])
+        return self.vars[f"e_err_{type}_{edge_label}"]
+
 def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     model = vp.model
     params = vp.params
@@ -169,6 +210,103 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
         model.addConstr(vp.var_scl((u,v),'out') >= vp.var_scl((u,v),'in') - params.Sf * vp.var_use((u,v),'r'),
                         name=f"edge_rescale_{edge_label}_scl")
 
+def _node_compute_error(tdag: Tdag, v: str, params: Params) -> float:
+    model = params.resilience_error_model
+    op = tdag.nodes[v]['op']
+    if op == 'input':
+        return model["input_error_abs"]
+    if op == 'add':
+        single, double = tdag.get_v_weights(v)
+        return model["add_error_abs"] * max(1, single + double)
+    if op == 'mul':
+        descr = tdag.nodes[v]['op_descr']
+        if descr.get('double', 0) > 0:
+            return model["mul_cipher_error_abs"]
+        return model["mul_plain_error_abs"]
+    if op == 'rotate':
+        return model["rotate_error_abs"]
+    return model["add_error_abs"]
+
+def add_error_state_constraints(tdag: Tdag, vp: VarPool, io_budgets: dict | None = None):
+    if not vp.error_enabled:
+        return
+
+    model = vp.model
+    params = vp.params
+    error_model = params.resilience_error_model
+    io_budgets = io_budgets or {}
+    external_input_error = io_budgets.get("in_error_abs")
+
+    # Edge maintenance currently has explicit rescale variables. If an edge
+    # later decodes to a bootstrap via level feasibility, this conservative
+    # recurrence overestimates error because it does not model an edge reset.
+    for u, v in tdag.edges:
+        if tdag.nodes[u]['op'] == 'constant':
+            continue
+        model.addConstr(
+            vp.var_err((u, v), 'out')
+            == vp.var_err((u, v), 'in')
+            + error_model["rescale_error_abs"] * vp.var_use((u, v), 'r'),
+            name=f"edge_error_{vp.get_edge_label(u, v)}",
+        )
+
+    for v in tdag.nodes:
+        if tdag.nodes[v]['op'] == 'constant':
+            continue
+
+        pred_errors = [
+            vp.var_err((u, v), 'out')
+            for u in tdag.predecessors(v)
+            if tdag.nodes[u]['op'] != 'constant'
+        ]
+        if tdag.nodes[v]['op'] == 'input':
+            # SISO partitioning turns each window boundary into an input node.
+            # The bounded-DP resilience search passes the previous window's
+            # output error here so tau constraints see cumulative error instead
+            # of restarting at zero for every micro-partition.
+            if external_input_error is not None and v in tdag.inputs:
+                compute_error = float(external_input_error)
+            else:
+                compute_error = error_model["input_error_abs"]
+        else:
+            compute_error = _node_compute_error(tdag, v, params)
+        model.addConstr(
+            vp.var_err(v, 'in') == gp.quicksum(pred_errors) + compute_error,
+            name=f"node_compute_error_{v}",
+        )
+
+        max_error = error_model["max_error_abs"]
+        no_bootstrap_error = (
+            vp.var_err(v, 'in')
+            + error_model["rescale_error_abs"] * vp.var_use(v, 'r')
+        )
+        model.addConstr(
+            vp.var_err(v, 'out')
+            >= error_model["bootstrap_error_abs"] - max_error * (1 - vp.var_use(v, 'b')),
+            name=f"node_bootstrap_error_reset_lb_{v}",
+        )
+        model.addConstr(
+            vp.var_err(v, 'out')
+            <= error_model["bootstrap_error_abs"] + max_error * (1 - vp.var_use(v, 'b')),
+            name=f"node_bootstrap_error_reset_ub_{v}",
+        )
+        model.addConstr(
+            vp.var_err(v, 'out') >= no_bootstrap_error - max_error * vp.var_use(v, 'b'),
+            name=f"node_no_bootstrap_error_lb_{v}",
+        )
+        model.addConstr(
+            vp.var_err(v, 'out') <= no_bootstrap_error + max_error * vp.var_use(v, 'b'),
+            name=f"node_no_bootstrap_error_ub_{v}",
+        )
+
+        if params.resilience_constraint_policy == "hard-tau":
+            tau_in = params.resilience_profile.error_upper_bound(v, tdag.nodes[v], "in")
+            if tau_in is not None:
+                model.addConstr(vp.var_err(v, 'in') <= tau_in, name=f"tau_in_{v}")
+            tau_out = params.resilience_profile.error_upper_bound(v, tdag.nodes[v], "out")
+            if tau_out is not None:
+                model.addConstr(vp.var_err(v, 'out') <= tau_out, name=f"tau_out_{v}")
+
 def add_ilp_linear_cost(tdag: Tdag, vp: VarPool, le: LatencyEstimator):
     cost_rescale_s = le.lin_op_lmaps['rescale_single']
     cost_bts_s = le.lin_op_lmaps['bootstrap_single']
@@ -193,6 +331,10 @@ def add_ilp_linear_cost(tdag: Tdag, vp: VarPool, le: LatencyEstimator):
         if double_cnt > 0:
             this_cost = le.lin_op_lmaps[tdag.nodes[v]['op'] + '_double']
             vp.total_cost.append(double_cnt * (this_cost[0] * vp.var_lvl(v, 'in') + this_cost[1]))
+    if vp.error_enabled:
+        # Tiny tie-breaker: keep unconstrained error variables at their minimum
+        # feasible value without materially changing latency optimization.
+        vp.total_cost.append(1e-6 * gp.quicksum(vp.error_penalty_terms))
 
 def add_ilp_io_budgets(tdag: Tdag, vp: VarPool, io_budgets):
     v_in = list(tdag.inputs)[0]
@@ -221,7 +363,8 @@ def solve_ilp_core(vp: VarPool, num_threads: int):
     model.setParam('Method', 2) 
     model.setParam('Threads', num_threads)
     model.setParam('MIPGap', 0.01)
-    model.setParam('TimeLimit', GRB.INFINITY)
+    time_limit = vp.params.ilp_task_time_limit_sec
+    model.setParam('TimeLimit', time_limit if time_limit and time_limit > 0 else GRB.INFINITY)
     
     model.setObjective(gp.quicksum(vp.total_cost), GRB.MINIMIZE)
     model.optimize()
@@ -234,7 +377,8 @@ def solve_ilp_core_bypass(tdag: Tdag, vp: VarPool, io_budgets, num_threads: int)
     model.setParam('Method', 2) 
     model.setParam('Threads', num_threads)
     model.setParam('MIPGap', 0.01)
-    model.setParam('TimeLimit', GRB.INFINITY)
+    time_limit = params.ilp_task_time_limit_sec
+    model.setParam('TimeLimit', time_limit if time_limit and time_limit > 0 else GRB.INFINITY)
     
     model.setObjective(gp.quicksum(vp.total_cost), GRB.MINIMIZE)
     
@@ -276,6 +420,7 @@ def solve_ilp(tdag: Tdag, io_budgets: dict, le: LatencyEstimator, task_name: str
     vp = VarPool(tdag, params, model)
     
     add_ilp_constraints(tdag, vp)
+    add_error_state_constraints(tdag, vp, io_budgets)
     add_ilp_linear_cost(tdag, vp, le)
     add_ilp_io_budgets(tdag, vp, io_budgets)
     if 'maino_v' in io_budgets:
@@ -308,6 +453,9 @@ def decode_ilp_sol(tdag: Tdag, vp: VarPool) -> Assign:
                 f"Node {v} input scale {assign.v_scl_in[v]} below "
                 f"local lower bound {input_scale_lb}"
             )
+        if vp.error_enabled and tdag.nodes[v]['op'] != 'constant':
+            assign.v_err_in[v] = float(vp.var_err(v, 'in').X)
+            assign.v_err_out[v] = float(vp.var_err(v, 'out').X)
         assign.v_lvl_out[v] = round(vp.var_lvl(v, 'out').X)
         assign.v_scl_out[v] = round(vp.var_scl(v, 'out').X)
         if tdag.nodes[v]['op'] != 'constant':
@@ -322,6 +470,8 @@ def decode_ilp_sol(tdag: Tdag, vp: VarPool) -> Assign:
             continue
         assign.e_lvl_out[(u,v)] = round(vp.var_lvl((u,v), 'out').X)
         assign.e_scl_out[(u,v)] = round(vp.var_scl((u,v), 'out').X)
+        if vp.error_enabled:
+            assign.e_err_out[(u, v)] = float(vp.var_err((u, v), 'out').X)
         edge_scale_lb = max(
             params.scale_lower_bound(u, tdag.nodes[u], "out"),
             params.scale_lower_bound(v, tdag.nodes[v], "in"),

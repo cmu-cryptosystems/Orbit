@@ -255,12 +255,26 @@ func (lattigo *LattigoFHE) generateOutputFileName(inputFile string) string {
 }
 
 func (lattigo *LattigoFHE) writeOutputFile(outputPath string, results []float64) error {
-	content := fmt.Sprintf("%v\n", len(results))
-	for _, v := range results {
-		content += fmt.Sprintf("%v\n", v)
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return err
 	}
+	defer file.Close()
 
-	return os.WriteFile(outputPath, []byte(content), 0644)
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	_, err = fmt.Fprintf(writer, "%v\n", len(results))
+	if err != nil {
+		return err
+	}
+	for _, v := range results {
+		_, err = fmt.Fprintf(writer, "%v\n", v)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (lattigo *LattigoFHE) writeRuntimesFile(outputDir string, runtimeInfos []RuntimeInfo, avgDuration time.Duration) error {

@@ -338,14 +338,13 @@ def place(context):
     final repair into Assign objects.
     """
     builder = PlacementBuilder(context)
-    return builder.depth_fanout_aware(
+    return builder.low_scale_frontier(
         allow_seed_fallback=True,
-        prefer_level_preservation=True,
-        max_scale_candidates=32,
-        bootstrap_penalty=900000000.0,
-        rescale_penalty=250000.0,
-        level_drop_penalty=16000000.0,
-        scale_penalty=1000.0,
+        max_scale_candidates=10,
+        bootstrap_penalty=1000000000.0,
+        rescale_penalty=0.0,
+        level_drop_penalty=20000000.0,
+        scale_penalty=0.0,
     )
 # EVOLVE-BLOCK-END
 '''
@@ -2755,6 +2754,30 @@ class PlacementBuilder:
                 "rescale_penalty": 500_000.0,
                 "level_drop_penalty": 12_000_000.0,
                 "scale_lattice": "waterline_sf",
+            }
+        )
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def low_scale_frontier(self, **overrides: Any) -> dict[str, Any]:
+        """Policy that keeps partition boundary scales low when CKKS permits it."""
+        policy = self.level_preserving()["policy"]
+        policy.update(
+            {
+                "strategy": "level_preserving",
+                "prefer_level_preservation": True,
+                "allow_bootstrap": False,
+                "allow_seed_fallback": True,
+                "refresh_fanout_at_level_floor": True,
+                "max_scale_candidates": 10,
+                "bootstrap_penalty": 1_000_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
+                "min_internal_level": None,
+                "scale_penalty": 0.0,
+                "preferred_node_levels": {},
+                "preferred_node_scales": {},
+                "preferred_edge_scales": {},
             }
         )
         policy.update(overrides)

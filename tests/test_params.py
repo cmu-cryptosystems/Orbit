@@ -69,7 +69,7 @@ def test_params_rejects_bad_openevolve_eval_suite(toy_cost_json: str):
         Params(toy_cost_json, "Orbit", "compile", openevolve_eval_suite="large")
 
 
-def test_relax_only_preserves_default_constant_scale(
+def test_relax_only_lowers_default_constant_scale(
     toy_cost_json: str, tmp_path: Path
 ):
     profile = {
@@ -90,7 +90,7 @@ def test_relax_only_preserves_default_constant_scale(
     )
 
     assert p.Sw == 16
-    assert p.Csw == 40
+    assert p.Csw == 16
 
 
 def test_explicit_constant_scale_is_respected_under_relax_only(

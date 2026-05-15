@@ -393,7 +393,7 @@ def test_level_preserving_scheduler_handles_bypass_budget(toy_cost_json: str):
     assert (assign.v_lvl_in["left"], assign.v_scl_in["left"]) in budget["main_qbp_cost"]
 
 
-def test_relax_only_keeps_additive_constants_at_constant_scale(
+def test_relax_only_respects_explicit_constant_scale_for_additive_constants(
     toy_cost_json: str, tmp_path: Path
 ):
     params = _params(
@@ -569,6 +569,21 @@ def test_builder_depth_fanout_policy_uses_graph_summary(toy_cost_json: str):
     assert policy["refresh_fanout_at_level_floor"] is True
     assert policy["min_internal_level"] == params.bts_lb + 1
     assert policy["preferred_node_levels"]["mul0"] == params.lvl_ub
+
+
+def test_builder_low_scale_frontier_policy_is_compile_seed(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    assert hints["strategy"] == "level_preserving"
+    assert hints["refresh_fanout_at_level_floor"] is True
+    assert hints["max_scale_candidates"] == 10
+    assert hints["scale_penalty"] == 0.0
+    assert not hints.get("portfolio")
 
 
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):

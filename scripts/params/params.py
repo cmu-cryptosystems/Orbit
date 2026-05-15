@@ -91,6 +91,7 @@ class Params:
         self.mode = mode
         self.sysname = sysname
         self.Sw = Sw if Sw is not None else self.Sf
+        self._constant_scale_is_default = CSw is None
         self.Csw = CSw if CSw is not None else self.Sw
         self.bpsdepth = bpsdepth  # possibly None
         self.threads = threads if threads is not None else 16
@@ -255,6 +256,8 @@ class Params:
                     f"from Sw={self.Sw} to Sw={relaxed_sw}."
                 )
                 self.Sw = relaxed_sw
+                if self._constant_scale_is_default:
+                    self.Csw = relaxed_sw
         assert resilience_mode in ["waterline", "error-state"], (
             "resilience_mode must be either 'waterline' or 'error-state'"
         )

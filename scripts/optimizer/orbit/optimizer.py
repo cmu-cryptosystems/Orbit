@@ -194,6 +194,12 @@ def main():
     parser.add_argument('--noise-estimator-timeout-sec', type=int, default=30)
     parser.add_argument('--noise-estimator-min-output-margin-bits', type=float, default=2.0)
     parser.add_argument(
+        '--noise-estimator-alpha',
+        type=float,
+        default=14.0,
+        help='Gaussian tail multiplier for the CKKS noise bound',
+    )
+    parser.add_argument(
         '--resilience-profile',
         type=str,
         default=None,
@@ -275,7 +281,8 @@ def main():
                     noise_estimator=args.noise_estimator,
                     noise_estimator_binary=args.noise_estimator_binary,
                     noise_estimator_timeout_sec=args.noise_estimator_timeout_sec,
-                    noise_estimator_min_output_margin_bits=args.noise_estimator_min_output_margin_bits)
+                    noise_estimator_min_output_margin_bits=args.noise_estimator_min_output_margin_bits,
+                    noise_estimator_alpha=args.noise_estimator_alpha)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

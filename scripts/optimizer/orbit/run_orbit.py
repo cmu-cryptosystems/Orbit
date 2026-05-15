@@ -45,6 +45,7 @@ if __name__ == "__main__":
     parser.add_argument('--noise-estimator-binary', type=str, default=None)
     parser.add_argument('--noise-estimator-timeout-sec', type=int, default=30)
     parser.add_argument('--noise-estimator-min-output-margin-bits', type=float, default=2.0)
+    parser.add_argument('--noise-estimator-alpha', type=float, default=14.0)
     parser.add_argument('--resilience-profile', type=str, default=None)
     parser.add_argument('--resilience-mode', choices=['waterline', 'error-state'], default='waterline')
     parser.add_argument('--allow-empty-resilience-match', action='store_true')
@@ -116,6 +117,7 @@ if __name__ == "__main__":
             "--noise-estimator-min-output-margin-bits",
             str(args.noise_estimator_min_output_margin_bits),
         ]
+        cmds += ["--noise-estimator-alpha", str(args.noise_estimator_alpha)]
         if args.noise_estimator_binary:
             cmds += ["--noise-estimator-binary", args.noise_estimator_binary]
         if args.openevolve_reference_json:

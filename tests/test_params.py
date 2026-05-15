@@ -34,6 +34,7 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.noise_estimator_binary is None
     assert p.noise_estimator_timeout_sec == 30
     assert p.noise_estimator_min_output_margin_bits == 2.0
+    assert p.noise_estimator_alpha == 14.0
     assert p.mode == "compile"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -1275,3 +1276,42 @@ def test_zero_iteration_openevolve_path_does_not_import_gurobipy(
 
     assert io_to_assign
     assert io_to_cost
+
+
+def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
+    toy_cost_json: str,
+):
+    script = f"""
+import sys
+from scripts.latency_estimator.latency_estimator import LatencyEstimator
+from scripts.optimizer.orbit.qbp_manager import QBPManager
+from scripts.params.params import Params
+
+params = Params(
+    {toy_cost_json!r},
+    "Orbit",
+    "compile",
+    Sw=40,
+    CSw=40,
+    threads=1,
+    comp=False,
+    part=False,
+    placement_backend="openevolve",
+    openevolve_iterations=0,
+)
+manager = QBPManager(params, LatencyEstimator(params))
+assert manager.ilp_worker.__class__.__name__ == "OpenEvolvePlacementWorker"
+assert "scripts.optimizer.orbit.ilp_worker" not in sys.modules
+assert "scripts.optimizer.orbit.ilp_core" not in sys.modules
+assert "pulp" not in sys.modules
+assert not any(name == "gurobipy" or name.startswith("gurobipy.") for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

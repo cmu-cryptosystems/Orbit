@@ -4,8 +4,6 @@ from ...latency_estimator import *
 from ...visualize import *
 from ...params.params import Params
 from .qbp import QBP
-from .ilp_worker import ILP_Worker
-from .openevolve_backend import OpenEvolvePlacementWorker
 
 import os
 import sys
@@ -16,11 +14,14 @@ class QBPManager:
         self.le = le
         self.qbps: dict[str, QBP] = dict() # dag name -> QBP
         self.pdag_name_to_qbp = dict()  # pdag name -> (bj_qbp, bj_label)
-        self.ilp_worker = (
-            OpenEvolvePlacementWorker(params, le)
-            if params.placement_backend == "openevolve"
-            else ILP_Worker(params, le)
-        )
+        if params.placement_backend == "openevolve":
+            from .openevolve_backend import OpenEvolvePlacementWorker
+
+            self.ilp_worker = OpenEvolvePlacementWorker(params, le)
+        else:
+            from .ilp_worker import ILP_Worker
+
+            self.ilp_worker = ILP_Worker(params, le)
         self.openevolve_diagnostics = []
     
     def save_qbps(self, dirpath: str):

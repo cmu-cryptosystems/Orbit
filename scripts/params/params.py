@@ -68,6 +68,7 @@ class Params:
         noise_estimator_binary=None,
         noise_estimator_timeout_sec=30,
         noise_estimator_min_output_margin_bits=2.0,
+        noise_estimator_alpha=14.0,
     ):
         if le_json is None:
             return # should be filled later
@@ -267,6 +268,11 @@ class Params:
             noise_estimator_min_output_margin_bits
             if noise_estimator_min_output_margin_bits is not None
             else json_parsed.get("noise_estimator_min_output_margin_bits", 2.0)
+        )
+        self.noise_estimator_alpha = float(
+            noise_estimator_alpha
+            if noise_estimator_alpha is not None
+            else json_parsed.get("noise_estimator_alpha", 14.0)
         )
         self.openevolve_compile_hints = None
         self.openevolve_evaluating_candidate = False

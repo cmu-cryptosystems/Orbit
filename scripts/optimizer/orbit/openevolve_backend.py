@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import networkx as nx
@@ -431,6 +432,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "openevolve_finalists": params.openevolve_finalists,
             "noise_estimator": params.noise_estimator,
             "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
+            "noise_estimator_alpha": params.noise_estimator_alpha,
         },
         "latency_model": {
             "backend": params.backend,
@@ -485,6 +487,7 @@ def tdag_from_context(context: dict[str, Any]) -> Tdag:
             "noise_estimator_min_output_margin_bits",
             2.0,
         ),
+        noise_estimator_alpha=pdata.get("noise_estimator_alpha", 14.0),
     )
     params.Sf = int(pdata["Sf"])
     params.lvl_lb = int(pdata["lvl_lb"])
@@ -514,6 +517,7 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
         "finalists": params.openevolve_finalists,
         "noise_estimator": params.noise_estimator,
         "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
+        "noise_estimator_alpha": params.noise_estimator_alpha,
     }
     return context
 
@@ -620,12 +624,15 @@ def evaluate_compile_candidate_program(
         runtime_score = 1.0 / (1.0 + result["placement_runtime_sec"])
         fallback_score = 1.0 / (1.0 + result["fallback_selected_budgets"])
         boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
+        noise_estimate = _fast_compile_noise_estimate(context, result)
+        noise_score = 1.0 if noise_estimate.get("valid", False) else 0.0
         quality_score = (
-            0.55 * latency_score
+            0.50 * latency_score
             + 0.13 * bootstrap_score
             + 0.07 * rescale_score
             + 0.08 * boundary_score
             + 0.07 * risk_score
+            + 0.05 * noise_score
             + 0.05 * fallback_score
             + 0.05 * runtime_score
         )
@@ -649,6 +656,8 @@ def evaluate_compile_candidate_program(
                 "profile_risk": float(result["profile_risk"]),
                 "placement_runtime_sec": float(result["placement_runtime_sec"]),
                 "fallback_selected_budgets": float(result["fallback_selected_budgets"]),
+                "estimated_precision_bits": float(noise_estimate.get("estimated_precision_bits", 0.0)),
+                "output_margin_bits": float(noise_estimate.get("output_margin_bits", 0.0)),
                 "graph_nodes": float(len(context["tdag"]["nodes"])),
                 "graph_edges": float(len(context["tdag"]["edges"])),
             },
@@ -670,11 +679,13 @@ def evaluate_compile_candidate_program(
                         "rescale_score": rescale_score,
                         "boundary_score": boundary_score,
                         "risk_score": risk_score,
+                        "noise_score": noise_score,
                         "fallback_score": fallback_score,
                         "runtime_score": runtime_score,
                     },
                     sort_keys=True,
                 ),
+                "noise_estimator": json.dumps(noise_estimate, sort_keys=True)[:4000],
                 "bootstrap_locations": json.dumps(result["bootstrap_locations"], sort_keys=True),
                 "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
                 "bottleneck_summary": json.dumps(result.get("bottleneck_summary", []), sort_keys=True),
@@ -773,6 +784,7 @@ def _evaluate_compile_hints(
                 "out_lvl": final_io_choice[2],
                 "out_scl": final_io_choice[3],
             },
+            "assignment": _serialize_assign(assign),
             "bootstrap_locations": locations["bootstrap"],
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
@@ -792,6 +804,7 @@ def _evaluate_compile_hints(
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": 0,
             "selected_output_state": {},
+            "assignment": {},
             "bootstrap_locations": {},
             "rescale_locations": {},
             "diagnostics": {"invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1}},
@@ -919,6 +932,42 @@ def _noise_estimator_for_finalist(
     if params.noise_estimator != "finalists":
         return None
     return estimate_compile_result_noise(context, result, params)
+
+
+def _fast_compile_noise_estimate(
+    context: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    ckks = context.get("ckks", {})
+    params_data = context.get("params", {})
+    params = SimpleNamespace(
+        noise_estimator_binary=None,
+        noise_estimator_timeout_sec=1,
+        noise_estimator_min_output_margin_bits=context.get("harness", {}).get(
+            "noise_estimator_min_output_margin_bits",
+            params_data.get("noise_estimator_min_output_margin_bits", 2.0),
+        ),
+        noise_estimator_alpha=context.get("harness", {}).get(
+            "noise_estimator_alpha",
+            params_data.get("noise_estimator_alpha", 14.0),
+        ),
+        poly_deg=ckks.get("poly_degree", 32768),
+        max_slot=ckks.get("max_slots", 16384),
+        Sf=ckks.get("Sf", params_data.get("Sf", 40)),
+        Sw=ckks.get("Sw", params_data.get("Sw", 40)),
+        lvl_lb=ckks.get("lvl_lb", params_data.get("lvl_lb", 1)),
+        lvl_ub=ckks.get("lvl_ub", params_data.get("lvl_ub", 16)),
+    )
+    try:
+        return estimate_compile_result_noise(context, result, params)
+    except Exception as exc:
+        return {
+            "valid": False,
+            "fallback": True,
+            "estimated_precision_bits": 0.0,
+            "output_margin_bits": float("-inf"),
+            "unsupported_ops": [f"{type(exc).__name__}: {str(exc)[:160]}"],
+        }
 
 
 def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> list[str]:

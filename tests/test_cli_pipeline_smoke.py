@@ -210,6 +210,7 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["noise_estimator"] == "finalists"
     assert init["noise_estimator_timeout_sec"] == 30
     assert init["noise_estimator_min_output_margin_bits"] == 2.0
+    assert init["noise_estimator_alpha"] == 14.0
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

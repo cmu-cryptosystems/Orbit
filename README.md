@@ -84,6 +84,9 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-evaluator-timeout-sec <n>`, `--openevolve-parallel-evaluations <n>`, `--openevolve-checkpoint-interval <n>`: Evaluator and checkpoint controls for positive-iteration searches.
 - `--openevolve-fail-open` / `--no-openevolve-fail-open`: Return the best recovered or initial validated candidate if OpenEvolve runtime fails. Enabled by default.
 - `--openevolve-keep-workdir`: Keep temporary OpenEvolve workspaces.
+- `--noise-estimator <off|finalists>`: Estimator-backed full-bundle finalist gate. Default `finalists` uses a Tune Insight/Lattigo-style CKKS precision estimate before selecting positive-iteration OpenEvolve candidates.
+- `--noise-estimator-binary <path>`: Optional JSON sidecar binary for CKKS noise estimation. If omitted, Orbit uses the built-in deterministic estimator contract.
+- `--noise-estimator-min-output-margin-bits <n>`: Minimum estimated precision margin for a finalist to beat a fully valid candidate. Default `2`.
 - `--resilience-profile <path>`: ckks-robustness-profiler 0.8.0 profile, generated Orbit constraint sidecar, or Orbit-native constraints JSON.
 - `--resilience-constraint-policy <relax-only|hard-tau>`: Use profile constraints as relaxed waterline guidance or hard local scale lower bounds.
 

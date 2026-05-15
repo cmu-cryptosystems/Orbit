@@ -69,6 +69,7 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
     assert "--openevolve-api-key-env" in cmd
     assert "--openevolve-llm-timeout-sec" in cmd
     assert "--openevolve-fail-open" in cmd
+    assert "--noise-estimator" in cmd
     assert "--nobypass" in cmd
     assert "--enable-reqbp" in cmd
     assert "--no-compress" in cmd
@@ -206,6 +207,9 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["openevolve_parallel_evaluations"] == 1
     assert init["openevolve_checkpoint_interval"] == 5
     assert init["openevolve_fail_open"] is True
+    assert init["noise_estimator"] == "finalists"
+    assert init["noise_estimator_timeout_sec"] == 30
+    assert init["noise_estimator_min_output_margin_bits"] == 2.0
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

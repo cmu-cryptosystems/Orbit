@@ -22,6 +22,7 @@ from ...assignment import Assign
 from ...latency_estimator import LatencyEstimator, estimate_assign
 from ...params.params import Params
 from ...tdag import Tdag
+from .noise_estimator import estimate_compile_result_noise, write_noise_summary
 
 
 class PlacementError(Exception):
@@ -200,6 +201,8 @@ class OpenEvolvePlacementWorker:
             "fallback_selected_budgets",
             "profile_risk",
             "placement_runtime_sec",
+            "estimated_precision_bits",
+            "output_margin_bits",
         ]
         if hasattr(config, "checkpoint_interval"):
             config.checkpoint_interval = max(1, int(self.params.openevolve_checkpoint_interval))
@@ -426,6 +429,8 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "openevolve_eval_suite": params.openevolve_eval_suite,
             "openevolve_reference_json": params.openevolve_reference_json,
             "openevolve_finalists": params.openevolve_finalists,
+            "noise_estimator": params.noise_estimator,
+            "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
         },
         "latency_model": {
             "backend": params.backend,
@@ -475,6 +480,11 @@ def tdag_from_context(context: dict[str, Any]) -> Tdag:
         openevolve_eval_suite=pdata.get("openevolve_eval_suite", "polybert-sampled"),
         openevolve_reference_json=pdata.get("openevolve_reference_json"),
         openevolve_finalists=pdata.get("openevolve_finalists", 3),
+        noise_estimator=pdata.get("noise_estimator", "finalists"),
+        noise_estimator_min_output_margin_bits=pdata.get(
+            "noise_estimator_min_output_margin_bits",
+            2.0,
+        ),
     )
     params.Sf = int(pdata["Sf"])
     params.lvl_lb = int(pdata["lvl_lb"])
@@ -502,6 +512,8 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
         "initial_prev_cost": {-1: {params.Sw: 0}},
         "reference_json": _load_reference_json(params.openevolve_reference_json),
         "finalists": params.openevolve_finalists,
+        "noise_estimator": params.noise_estimator,
+        "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
     }
     return context
 
@@ -560,6 +572,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             context,
             result.best_code,
             params,
+            initial_hints,
         )
         if finalist_hints is not None:
             return finalist_hints
@@ -799,6 +812,7 @@ def _run_full_bundle_finalists(
     sampled_context: dict[str, Any],
     best_code: str,
     params: Params,
+    initial_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if (
         params.openevolve_finalists <= 0
@@ -819,6 +833,7 @@ def _run_full_bundle_finalists(
     candidates = _discover_finalist_codes(output_dir, best_code, params.openevolve_finalists)
     summaries = []
     best = None
+    estimator_records = []
     for idx, code in enumerate(candidates):
         program_path = finalist_dir / f"finalist_{idx}.py"
         program_path.write_text(code, encoding="utf-8")
@@ -840,15 +855,21 @@ def _run_full_bundle_finalists(
                 "bootstrap_locations": result.get("bootstrap_locations", {}),
                 "rescale_locations": result.get("rescale_locations", {}),
             }
+            noise = _noise_estimator_for_finalist(full_context, result, params)
+            if noise is not None:
+                summary["noise_estimator"] = noise
+                estimator_records.append({"index": idx, **noise})
             if result["valid"]:
+                noise_reject = int(noise is not None and not noise.get("valid", False))
                 item = (
+                    noise_reject,
                     int(result["fallback_selected_budgets"] > 0),
                     float(result["final_latency_usec"]),
                     idx,
                     hints,
                     summary,
                 )
-                if best is None or item[:3] < best[:3]:
+                if best is None or item[:4] < best[:4]:
                     best = item
         except Exception as exc:
             summary = {
@@ -862,7 +883,12 @@ def _run_full_bundle_finalists(
             {
                 "reference": full_context["reference"],
                 "candidates": summaries,
-                "selected_index": None if best is None else best[2],
+                "selected_index": None if best is None else best[3],
+                "noise_estimator": {
+                    "mode": params.noise_estimator,
+                    "min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
+                    "records": estimator_records,
+                },
             },
             indent=2,
             sort_keys=True,
@@ -870,7 +896,29 @@ def _run_full_bundle_finalists(
         + "\n",
         encoding="utf-8",
     )
-    return None if best is None else best[3]
+    if best is None:
+        return initial_hints
+    if best[0] and params.noise_estimator == "finalists":
+        return initial_hints
+    write_noise_summary(
+        finalist_dir / "noise_estimator_summary.json",
+        {
+            "selected_index": best[3],
+            "selected": best[5],
+            "records": estimator_records,
+        },
+    )
+    return best[4]
+
+
+def _noise_estimator_for_finalist(
+    context: dict[str, Any],
+    result: dict[str, Any],
+    params: Params,
+) -> dict[str, Any] | None:
+    if params.noise_estimator != "finalists":
+        return None
+    return estimate_compile_result_noise(context, result, params)
 
 
 def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> list[str]:
@@ -3278,5 +3326,6 @@ def _resilience_context(pdag: Tdag, params: Params) -> dict[str, Any]:
         "profile": params.resilience_profile.describe(),
         "match_report": params.resilience_profile.match_report(pdag),
         "best_plan": params.resilience_profile.best_plan,
+        "ckks_noise_model": params.resilience_profile.ckks_noise_model,
         "artifacts": params.resilience_profile.artifacts,
     }

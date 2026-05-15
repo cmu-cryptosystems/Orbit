@@ -829,6 +829,8 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
         "fallback_selected_budgets",
         "profile_risk",
         "placement_runtime_sec",
+        "estimated_precision_bits",
+        "output_margin_bits",
     ]
 
 
@@ -1135,6 +1137,122 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
     assert ("polybert-full", None) in eval_suites
     assert ("polybert-full", 123.0) in eval_suites
     assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
+
+
+def test_noise_estimator_invalid_finalist_falls_back_to_initial_seed(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving(level_drop_penalty=123.0)\n"
+        )
+
+    def fake_run_evolution(**_kwargs):
+        return FakeResult()
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if hints.get("level_drop_penalty") == 123.0 else 100.0,
+            "bootstrap_count": 4,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {"out_scl": 40},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    def fake_noise(_context, result, _params):
+        return {
+            "valid": False,
+            "fallback": False,
+            "estimated_precision_bits": 1.0,
+            "output_margin_bits": -1.0,
+            "unsupported_ops": [],
+        }
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    monkeypatch.setattr(oe_backend, "estimate_compile_result_noise", fake_noise)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["strategy"] == "level_preserving"
+    assert hints.get("level_drop_penalty") != 123.0
+    summary = json.loads(
+        (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").read_text()
+    )
+    assert summary["candidates"][0]["noise_estimator"]["valid"] is False
+
+
+def test_noise_estimator_off_allows_fast_finalist(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving(level_drop_penalty=123.0)\n"
+        )
+
+    _install_fake_openevolve(monkeypatch, lambda **_kwargs: FakeResult())
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(
+        oe_backend,
+        "_evaluate_compile_hints",
+        lambda _context, hints, *, suppress_output: {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if hints.get("level_drop_penalty") == 123.0 else 100.0,
+            "bootstrap_count": 4,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {"out_scl": 40},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        },
+    )
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+        noise_estimator="off",
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["level_drop_penalty"] == 123.0
 
 
 def test_zero_iteration_openevolve_path_does_not_import_gurobipy(

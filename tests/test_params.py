@@ -30,6 +30,10 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.openevolve_parallel_evaluations == 1
     assert p.openevolve_checkpoint_interval == 5
     assert p.openevolve_fail_open is True
+    assert p.noise_estimator == "finalists"
+    assert p.noise_estimator_binary is None
+    assert p.noise_estimator_timeout_sec == 30
+    assert p.noise_estimator_min_output_margin_bits == 2.0
     assert p.mode == "compile"
 
 
@@ -67,6 +71,11 @@ def test_params_rejects_bad_openevolve_harness(toy_cost_json: str):
 def test_params_rejects_bad_openevolve_eval_suite(toy_cost_json: str):
     with pytest.raises(ValueError, match="openevolve_eval_suite"):
         Params(toy_cost_json, "Orbit", "compile", openevolve_eval_suite="large")
+
+
+def test_params_rejects_bad_noise_estimator(toy_cost_json: str):
+    with pytest.raises(ValueError, match="noise_estimator"):
+        Params(toy_cost_json, "Orbit", "compile", noise_estimator="always")
 
 
 def test_relax_only_lowers_default_constant_scale(

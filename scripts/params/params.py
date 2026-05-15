@@ -64,6 +64,10 @@ class Params:
         openevolve_parallel_evaluations=1,
         openevolve_checkpoint_interval=5,
         openevolve_fail_open=True,
+        noise_estimator="finalists",
+        noise_estimator_binary=None,
+        noise_estimator_timeout_sec=30,
+        noise_estimator_min_output_margin_bits=2.0,
     ):
         if le_json is None:
             return # should be filled later
@@ -235,6 +239,34 @@ class Params:
             openevolve_fail_open
             if openevolve_fail_open is not None
             else json_parsed.get("openevolve_fail_open", True)
+        )
+        self.noise_estimator = (
+            noise_estimator
+            if noise_estimator is not None
+            else json_parsed.get("noise_estimator", "finalists")
+        )
+        if self.noise_estimator not in ("off", "finalists"):
+            raise ValueError(
+                "noise_estimator must be 'off' or 'finalists', "
+                f"got {self.noise_estimator!r}"
+            )
+        self.noise_estimator_binary = (
+            noise_estimator_binary
+            if noise_estimator_binary is not None
+            else json_parsed.get("noise_estimator_binary")
+        )
+        self.noise_estimator_timeout_sec = max(
+            1,
+            int(
+                noise_estimator_timeout_sec
+                if noise_estimator_timeout_sec is not None
+                else json_parsed.get("noise_estimator_timeout_sec", 30)
+            ),
+        )
+        self.noise_estimator_min_output_margin_bits = float(
+            noise_estimator_min_output_margin_bits
+            if noise_estimator_min_output_margin_bits is not None
+            else json_parsed.get("noise_estimator_min_output_margin_bits", 2.0)
         )
         self.openevolve_compile_hints = None
         self.openevolve_evaluating_candidate = False

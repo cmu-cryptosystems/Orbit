@@ -144,6 +144,7 @@ class ResilienceProfile:
     model_name: str | None = None
     fingerprint: str = ""
     best_plan: dict[str, Any] | None = None
+    ckks_noise_model: dict[str, Any] | None = None
     artifacts: dict[str, Any] = field(default_factory=dict)
 
     def matching_constraints(
@@ -191,6 +192,7 @@ class ResilienceProfile:
             model_name=model.get("name") if isinstance(model, dict) else None,
             fingerprint=fingerprint,
             best_plan=data.get("best_plan"),
+            ckks_noise_model=data.get("ckks_noise_model"),
             artifacts=artifacts,
         )
 

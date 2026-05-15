@@ -180,6 +180,20 @@ def main():
         help='Return the best recovered/initial candidate if OpenEvolve runtime fails',
     )
     parser.add_argument(
+        '--noise-estimator',
+        choices=['off', 'finalists'],
+        default='finalists',
+        help='Estimator-backed OpenEvolve finalist gate; finalists is used for positive OpenEvolve runs',
+    )
+    parser.add_argument(
+        '--noise-estimator-binary',
+        type=str,
+        default=None,
+        help='Optional JSON sidecar binary for CKKS noise estimation',
+    )
+    parser.add_argument('--noise-estimator-timeout-sec', type=int, default=30)
+    parser.add_argument('--noise-estimator-min-output-margin-bits', type=float, default=2.0)
+    parser.add_argument(
         '--resilience-profile',
         type=str,
         default=None,
@@ -257,7 +271,11 @@ def main():
                     openevolve_evaluator_timeout_sec=args.openevolve_evaluator_timeout_sec,
                     openevolve_parallel_evaluations=args.openevolve_parallel_evaluations,
                     openevolve_checkpoint_interval=args.openevolve_checkpoint_interval,
-                    openevolve_fail_open=args.openevolve_fail_open)
+                    openevolve_fail_open=args.openevolve_fail_open,
+                    noise_estimator=args.noise_estimator,
+                    noise_estimator_binary=args.noise_estimator_binary,
+                    noise_estimator_timeout_sec=args.noise_estimator_timeout_sec,
+                    noise_estimator_min_output_margin_bits=args.noise_estimator_min_output_margin_bits)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

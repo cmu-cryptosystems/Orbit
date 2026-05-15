@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import runpy
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,6 +60,13 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
     assert "--costjson" in cmd
     assert "cost_models/profiled_LATTIGONEW_CPU64k_3_16_sim_vari.json" in cmd
     assert "--constantscale" in cmd
+    assert "--placement-backend" in cmd
+    assert "openevolve" in cmd
+    assert "--openevolve-iterations" in cmd
+    assert "--openevolve-provider" in cmd
+    assert "--openevolve-model" in cmd
+    assert "gemini-3.1-pro-preview" in cmd
+    assert "--openevolve-api-key-env" in cmd
     assert "--nobypass" in cmd
     assert "--enable-reqbp" in cmd
     assert "--no-compress" in cmd
@@ -153,6 +162,18 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
             "2",
             "--ilp-solver",
             "pulp",
+            "--placement-backend",
+            "openevolve",
+            "--openevolve-iterations",
+            "0",
+            "--openevolve-seed",
+            "7",
+            "--openevolve-provider",
+            "gemini",
+            "--openevolve-model",
+            "gemini-3.1-pro-preview",
+            "--openevolve-api-key-env",
+            "GEMINI_API_KEY",
         ],
     )
 
@@ -170,6 +191,12 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["reqbp"] is True
     assert init["netname"] == "motivation"
     assert init["ilp_solver"] == "pulp"
+    assert init["placement_backend"] == "openevolve"
+    assert init["openevolve_iterations"] == 0
+    assert init["openevolve_seed"] == 7
+    assert init["openevolve_provider"] == "gemini"
+    assert init["openevolve_model"] == "gemini-3.1-pro-preview"
+    assert init["openevolve_api_key_env"] == "GEMINI_API_KEY"
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"
@@ -183,3 +210,89 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     mkdir_call = captured["makedirs"]
     assert mkdir_call["path"] == str(tmp_path / "out")
     assert mkdir_call["exist_ok"] is True
+
+
+def test_optimizer_cli_openevolve_resilience_smoke(
+    orbit_root: Path,
+    motivation_mlir: str,
+    toy_cost_json: str,
+    tmp_path: Path,
+):
+    output_path = tmp_path / "out.mlir"
+    profile_path = orbit_root / "examples" / "resilience_constraints_example.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.optimizer.orbit.optimizer",
+            "--inputfile",
+            motivation_mlir,
+            "--outputfile",
+            str(output_path),
+            "--costjson",
+            toy_cost_json,
+            "--maxlevel",
+            "6",
+            "--waterscale",
+            "40",
+            "--threads",
+            "2",
+            "--placement-backend",
+            "openevolve",
+            "--openevolve-iterations",
+            "0",
+            "--resilience-profile",
+            str(profile_path),
+            "--no-compress",
+            "--no-partition",
+        ],
+        cwd=orbit_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert output_path.is_file()
+    assert "Placement backend: openevolve" in result.stdout
+    assert "Resilience match report" in result.stdout
+
+    baseline_output_path = tmp_path / "baseline.mlir"
+    baseline_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.optimizer.orbit.optimizer",
+            "--inputfile",
+            motivation_mlir,
+            "--outputfile",
+            str(baseline_output_path),
+            "--costjson",
+            toy_cost_json,
+            "--maxlevel",
+            "6",
+            "--waterscale",
+            "40",
+            "--threads",
+            "2",
+            "--placement-backend",
+            "ilp",
+            "--ilp-solver",
+            "pulp",
+            "--resilience-profile",
+            str(profile_path),
+            "--no-compress",
+            "--no-partition",
+        ],
+        cwd=orbit_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert baseline_result.returncode == 0, baseline_result.stderr + baseline_result.stdout
+    assert baseline_output_path.is_file()
+    openevolve_bootstraps = len(re.findall(r'"earth\.bootstrap"', output_path.read_text()))
+    baseline_bootstraps = len(re.findall(r'"earth\.bootstrap"', baseline_output_path.read_text()))
+    assert openevolve_bootstraps >= baseline_bootstraps

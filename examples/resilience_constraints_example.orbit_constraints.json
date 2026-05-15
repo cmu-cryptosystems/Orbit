@@ -1,0 +1,31 @@
+{
+  "schema_version": "orbit-resilience-constraints-v0",
+  "description": "Small profiler-style Orbit resilience constraint example for smoke tests.",
+  "source": {
+    "tool": "ckks-robustness-profiler",
+    "model_name": "motivation",
+    "profile_path": "examples/resilience_constraints_example.json"
+  },
+  "constraints": [
+    {
+      "target_id": "edge:motivation.square:out",
+      "node": "0",
+      "match": {
+        "comment_regex": "(?:^|[;\\s])scope=motivation\\.square(?:\\.|$|[;\\s])"
+      },
+      "min_scale": 38,
+      "tau_abs": 0.004,
+      "fragility_class": "smoke",
+      "ports": [
+        "in",
+        "out"
+      ],
+      "source_module_names": [
+        "motivation.square"
+      ],
+      "scope_aliases": [
+        "motivation.square"
+      ]
+    }
+  ]
+}

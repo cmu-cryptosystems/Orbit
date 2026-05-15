@@ -13,7 +13,7 @@ from ...params.params import Params
 class VarPool:
     def __init__(self, tdag: Tdag, params: Params, model: gp.Model):
         self.params = params
-        self.Smax = params.Sf + 2 * params.Sw
+        self.Smax = params.max_scale()
         self.model = model
 
         self.vars = dict()
@@ -24,9 +24,9 @@ class VarPool:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
             self.vars[f"v_lvl_in_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_in_{v}")
-            self.vars[f"v_scl_in_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_in_{v}")
+            self.vars[f"v_scl_in_{v}"] = model.addVar(lb=self._node_scale_lb(tdag, v, "in"), ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_in_{v}")
             self.vars[f"v_lvl_out_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_out_{v}")
-            self.vars[f"v_scl_out_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_out_{v}")
+            self.vars[f"v_scl_out_{v}"] = model.addVar(lb=self._node_scale_lb(tdag, v, "out"), ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_out_{v}")
             self.vars[f"v_use_r_{v}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"v_use_r_{v}")
             self.vars[f"v_use_b_{v}"] = model.addVar(vtype=GRB.BINARY, name=f"v_use_b_{v}")
 
@@ -41,7 +41,7 @@ class VarPool:
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"e_scl_out_{edge_label}")
+                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(lb=self._edge_scale_lb(tdag, u, v), ub=self.Smax, vtype=GRB.INTEGER, name=f"e_scl_out_{edge_label}")
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
             self.vars[f"e_use_r_{edge_label}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"e_use_r_{edge_label}")
@@ -62,6 +62,20 @@ class VarPool:
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
+
+    def _node_scale_lb(self, tdag: Tdag, v: str, port: str) -> int:
+        scale_lb = self.params.scale_lower_bound(v, tdag.nodes[v], port)
+        if scale_lb > self.Smax:
+            raise ValueError(
+                f"Node {v} has resilience min_scale={scale_lb}, above Orbit Smax={self.Smax}."
+            )
+        return scale_lb
+
+    def _edge_scale_lb(self, tdag: Tdag, u: str, v: str) -> int:
+        return max(
+            self._node_scale_lb(tdag, u, "out"),
+            self._node_scale_lb(tdag, v, "in"),
+        )
 
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
@@ -91,6 +105,8 @@ class VarPool:
 def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     model = vp.model
     params = vp.params
+    def decryptable_scale_bound(level_var):
+        return params.Sf * (level_var - params.lvl_lb + 2) - 7
     # add mul scale constraints
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] != 'mul':
@@ -106,6 +122,10 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] == 'constant':
             continue
+        model.addConstr(vp.var_scl(v, 'in') <= decryptable_scale_bound(vp.var_lvl(v, 'in')),
+                        name=f"decryptable_{v}_input_scale")
+        model.addConstr(vp.var_scl(v, 'out') <= decryptable_scale_bound(vp.var_lvl(v, 'out')),
+                        name=f"decryptable_{v}_output_scale")
         model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
                                     vp.var_scl(v, 'in') <= params.Sf * (vp.var_lvl(v, 'in') - params.bts_lb + 1),
                                     name=f"bts_{v}_input_lvl_scl")
@@ -131,6 +151,8 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
                         name=f"edge_rescale_{edge_label}_lvl")
         model.addConstr(vp.var_scl((u, v), 'out') >= vp.var_scl((u, v), 'in') - params.Sf * vp.var_use((u, v), 'r'),
                         name=f"edge_rescale_{edge_label}_scl")
+        model.addConstr(vp.var_scl((u, v), 'out') >= vp._edge_scale_lb(tdag, u, v),
+                        name=f"edge_scale_lb_{edge_label}")
 
 
 def add_ilp_io_budgets(tdag: Tdag, vp: VarPool, io_budgets):
@@ -161,7 +183,8 @@ def solve_ilp_core(vp: VarPool, num_threads: int):
     model.setParam('Method', 2)
     model.setParam('Threads', num_threads)
     model.setParam('MIPGap', 0.01)
-    model.setParam('TimeLimit', GRB.INFINITY)
+    time_limit = vp.params.ilp_task_time_limit_sec
+    model.setParam('TimeLimit', time_limit if time_limit and time_limit > 0 else GRB.INFINITY)
 
     model.setObjective(gp.quicksum(vp.total_cost), GRB.MINIMIZE)
     model.optimize()
@@ -174,7 +197,8 @@ def solve_ilp_core_bypass(tdag: Tdag, vp: VarPool, io_budgets, num_threads: int)
     model.setParam('Method', 2)
     model.setParam('Threads', num_threads)
     model.setParam('MIPGap', 0.01)
-    model.setParam('TimeLimit', GRB.INFINITY)
+    time_limit = vp.params.ilp_task_time_limit_sec
+    model.setParam('TimeLimit', time_limit if time_limit and time_limit > 0 else GRB.INFINITY)
 
     model.setObjective(gp.quicksum(vp.total_cost), GRB.MINIMIZE)
 

@@ -35,7 +35,7 @@ class PulpVarPool:
         if pulp is None:
             raise ImportError("PuLP is required for ilp_solver='pulp'. Install with: pip install pulp")
         self.params = params
-        self.Smax = params.Sf + 2 * params.Sw
+        self.Smax = params.max_scale()
         self.model = model
         self.r_ub = _pulp_r_upper(params, self.Smax)
         bts_lb = params.bts_lb
@@ -55,9 +55,9 @@ class PulpVarPool:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
             self.vars[f"v_lvl_in_{v}"] = pulp.LpVariable(f"v_lvl_in_{v}", lowBound=1, upBound=params.lvl_ub, cat=pulp.LpInteger)
-            self.vars[f"v_scl_in_{v}"] = pulp.LpVariable(f"v_scl_in_{v}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger)
+            self.vars[f"v_scl_in_{v}"] = pulp.LpVariable(f"v_scl_in_{v}", lowBound=self._node_scale_lb(tdag, v, "in"), upBound=self.Smax, cat=pulp.LpInteger)
             self.vars[f"v_lvl_out_{v}"] = pulp.LpVariable(f"v_lvl_out_{v}", lowBound=1, upBound=params.lvl_ub, cat=pulp.LpInteger)
-            self.vars[f"v_scl_out_{v}"] = pulp.LpVariable(f"v_scl_out_{v}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger)
+            self.vars[f"v_scl_out_{v}"] = pulp.LpVariable(f"v_scl_out_{v}", lowBound=self._node_scale_lb(tdag, v, "out"), upBound=self.Smax, cat=pulp.LpInteger)
             self.vars[f"v_use_r_{v}"] = pulp.LpVariable(f"v_use_r_{v}", lowBound=0, upBound=self.r_ub, cat=pulp.LpInteger)
             self.vars[f"v_use_b_{v}"] = pulp.LpVariable(f"v_use_b_{v}", cat=pulp.LpBinary)
 
@@ -70,7 +70,7 @@ class PulpVarPool:
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
                 self.vars[f"e_scl_out_{edge_label}"] = pulp.LpVariable(
-                    f"e_scl_out_{edge_label}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger
+                    f"e_scl_out_{edge_label}", lowBound=self._edge_scale_lb(tdag, u, v), upBound=self.Smax, cat=pulp.LpInteger
                 )
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
@@ -93,6 +93,20 @@ class PulpVarPool:
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
+
+    def _node_scale_lb(self, tdag: Tdag, v: str, port: str) -> int:
+        scale_lb = self.params.scale_lower_bound(v, tdag.nodes[v], port)
+        if scale_lb > self.Smax:
+            raise ValueError(
+                f"Node {v} has resilience min_scale={scale_lb}, above Orbit Smax={self.Smax}."
+            )
+        return scale_lb
+
+    def _edge_scale_lb(self, tdag: Tdag, u: str, v: str) -> int:
+        return max(
+            self._node_scale_lb(tdag, u, "out"),
+            self._node_scale_lb(tdag, v, "in"),
+        )
 
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
@@ -123,6 +137,9 @@ def add_ilp_constraints_pulp(tdag: Tdag, vp: PulpVarPool):
     sf = params.Sf
     bts_lb = params.bts_lb
 
+    def decryptable_scale_bound(level_var):
+        return params.Sf * (level_var - params.lvl_lb + 2) - 7
+
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] != 'mul':
             continue
@@ -140,6 +157,8 @@ def add_ilp_constraints_pulp(tdag: Tdag, vp: PulpVarPool):
         s_in, l_in = vp.var_scl(v, 'in'), vp.var_lvl(v, 'in')
         l_out, s_out = vp.var_lvl(v, 'out'), vp.var_scl(v, 'out')
         r = vp.var_use(v, 'r')
+        prob += s_in <= decryptable_scale_bound(l_in), _pulp_safe_name(f"decryptable_{v}_input_scale")
+        prob += s_out <= decryptable_scale_bound(l_out), _pulp_safe_name(f"decryptable_{v}_output_scale")
         prob += s_in - sf * (l_in - bts_lb + 1) <= vp.M1 * (1 - b), _pulp_safe_name(f"bts_scl_in_{v}")
         prob += (bts_lb + 1) - l_out <= vp.M2 * (1 - b), _pulp_safe_name(f"bts_lvl_{v}")
         prob += sf - s_out <= vp.M3 * (1 - b), _pulp_safe_name(f"bts_scl_out_{v}")
@@ -152,6 +171,7 @@ def add_ilp_constraints_pulp(tdag: Tdag, vp: PulpVarPool):
         edge_label = vp.get_edge_label(u, v)
         prob += vp.var_lvl((u, v), 'out') <= vp.var_lvl((u, v), 'in') - vp.var_use((u, v), 'r'), _pulp_safe_name(f"edge_lvl_{edge_label}")
         prob += vp.var_scl((u, v), 'out') >= vp.var_scl((u, v), 'in') - sf * vp.var_use((u, v), 'r'), _pulp_safe_name(f"edge_scl_{edge_label}")
+        prob += vp.var_scl((u, v), 'out') >= vp._edge_scale_lb(tdag, u, v), _pulp_safe_name(f"edge_scale_lb_{edge_label}")
 
 
 def add_ilp_linear_cost(tdag: Tdag, vp: Union[Any, PulpVarPool], le: LatencyEstimator):
@@ -200,14 +220,17 @@ def add_ilp_io_budgets_pulp(tdag: Tdag, vp: PulpVarPool, io_budgets):
     vp.total_cost.append(0.2 * vp.rescale_cost * tdag.get_full_size() * vp.var_scl(v_out, 'out'))
 
 
-def _pulp_cbc_solver(num_threads: int):
-    return pulp.PULP_CBC_CMD(msg=0, threads=num_threads, gapRel=0.01)
+def _pulp_cbc_solver(num_threads: int, time_limit: float = 0.0):
+    kwargs = {"msg": 0, "threads": num_threads, "gapRel": 0.01}
+    if time_limit and time_limit > 0:
+        kwargs["timeLimit"] = time_limit
+    return pulp.PULP_CBC_CMD(**kwargs)
 
 
 def solve_ilp_core_pulp(vp: PulpVarPool, num_threads: int):
     prob = vp.model
     prob += pulp.lpSum(vp.total_cost)
-    prob.solve(_pulp_cbc_solver(num_threads))
+    prob.solve(_pulp_cbc_solver(num_threads, vp.params.ilp_task_time_limit_sec))
 
 
 def solve_ilp_core_bypass_pulp(tdag: Tdag, vp: PulpVarPool, io_budgets, num_threads: int):
@@ -217,7 +240,7 @@ def solve_ilp_core_bypass_pulp(tdag: Tdag, vp: PulpVarPool, io_budgets, num_thre
     main_dag_size = io_budgets['main_dag_size']
     main_qbp_cost = io_budgets['main_qbp_cost']
     all_out = list(tdag.outputs)[0]
-    solver = _pulp_cbc_solver(num_threads)
+    solver = _pulp_cbc_solver(num_threads, vp.params.ilp_task_time_limit_sec)
 
     min_cost = None
     min_cost_ls = None
@@ -267,18 +290,30 @@ def decode_ilp_sol(tdag: Tdag, vp: Any, *, use_pulp: bool = False) -> Assign:
             # input nodes, need to store in-level/scale
             assign.v_lvl_in[v] = round(_var_sol(vp.var_lvl(v, 'in'), use_pulp))
             assign.v_scl_in[v] = round(_var_sol(vp.var_scl(v, 'in'), use_pulp))
-            assert assign.v_scl_in[v] >= params.Sw, f"Node {v} input scale {assign.v_scl_in[v]} below Sw={params.Sw}"
+            input_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "in")
+            assert assign.v_scl_in[v] >= input_scale_lb, (
+                f"Node {v} input scale {assign.v_scl_in[v]} below local lower bound {input_scale_lb}"
+            )
         assign.v_lvl_out[v] = round(_var_sol(vp.var_lvl(v, 'out'), use_pulp))
         assign.v_scl_out[v] = round(_var_sol(vp.var_scl(v, 'out'), use_pulp))
         if tdag.nodes[v]['op'] != 'constant':
-            assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
+            output_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "out")
+            assert assign.v_scl_out[v] >= output_scale_lb, (
+                f"Node {v} output scale {assign.v_scl_out[v]} below local lower bound {output_scale_lb}"
+            )
 
     for u, v in tdag.edges:
         if tdag.nodes[u]['op'] == 'constant':
             continue
         assign.e_lvl_out[(u, v)] = round(_var_sol(vp.var_lvl((u, v), 'out'), use_pulp))
         assign.e_scl_out[(u, v)] = round(_var_sol(vp.var_scl((u, v), 'out'), use_pulp))
-        assert assign.e_scl_out[(u, v)] >= params.Sw, f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below Sw={params.Sw}"
+        edge_scale_lb = max(
+            params.scale_lower_bound(u, tdag.nodes[u], "out"),
+            params.scale_lower_bound(v, tdag.nodes[v], "in"),
+        )
+        assert assign.e_scl_out[(u, v)] >= edge_scale_lb, (
+            f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below local lower bound {edge_scale_lb}"
+        )
 
     return assign
 

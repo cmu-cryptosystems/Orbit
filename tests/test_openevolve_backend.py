@@ -1,0 +1,867 @@
+from __future__ import annotations
+
+import builtins
+import json
+import os
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from scripts.latency_estimator.latency_estimator import LatencyEstimator
+import scripts.optimizer.orbit.openevolve_backend as oe_backend
+from scripts.optimizer.orbit.openevolve_backend import (
+    OpenEvolvePlacementWorker,
+    PlacementBuilder,
+    _aggregate_counts,
+    build_context,
+    build_compile_context,
+    evaluate_compile_candidate_program,
+    evaluate_candidate_program,
+    run_compile_openevolve,
+    serialize_assignment_record,
+    solve_budget_batch,
+    tdag_from_context,
+    valid_transition,
+)
+from scripts.optimizer.orbit.orbit_core import orbit_core
+from scripts.params.params import Params
+from scripts.tdag.tdag import Tdag
+
+
+def _params(toy_cost_json: str, **kwargs) -> Params:
+    return Params(
+        toy_cost_json,
+        "Orbit",
+        "compile",
+        Sw=40,
+        CSw=40,
+        threads=1,
+        comp=False,
+        part=False,
+        placement_backend="openevolve",
+        **kwargs,
+    )
+
+
+def _toy_pdag(params: Params) -> Tdag:
+    graph = Tdag(params, "oe_toy")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    graph.add_node(
+        "0",
+        op="mul",
+        weight=1,
+        level=None,
+        scale=None,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.attention.self.query;op=linear",
+    )
+    graph.add_edge("arg0", "0", weight=1)
+    graph.inputs = {"arg0"}
+    graph.outputs = {"0"}
+    return graph
+
+
+def _mul_chain_pdag(params: Params, length: int = 8) -> Tdag:
+    graph = Tdag(params, "oe_mul_chain")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    prev = "arg0"
+    for idx in range(length):
+        node = f"mul{idx}"
+        graph.add_node(
+            node,
+            op="mul",
+            weight=1,
+            level=None,
+            scale=None,
+            op_descr={"single": 1, "double": 0},
+            comment=f"scope=chain.{idx};op=mul",
+        )
+        graph.add_edge(prev, node, weight=1)
+        prev = node
+    graph.inputs = {"arg0"}
+    graph.outputs = {prev}
+    return graph
+
+
+def _branch_merge_pdag(params: Params) -> Tdag:
+    graph = Tdag(params, "oe_branch_merge")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    for name in ("left", "right"):
+        graph.add_node(
+            name,
+            op="mul",
+            weight=1,
+            level=None,
+            scale=None,
+            op_descr={"single": 1, "double": 0},
+            comment=f"scope={name};op=mul",
+        )
+        graph.add_edge("arg0", name, weight=1)
+    graph.add_node("merge", op="add", weight=1, level=None, scale=None, op_descr={"single": 1}, comment="")
+    graph.add_edge("left", "merge", weight=1)
+    graph.add_edge("right", "merge", weight=1)
+    graph.inputs = {"arg0"}
+    graph.outputs = {"merge"}
+    return graph
+
+
+def _constant_bias_pdag(params: Params) -> Tdag:
+    graph = Tdag(params, "oe_constant_bias")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    graph.add_node(
+        "bias",
+        op="constant",
+        weight=1,
+        level=None,
+        scale=None,
+        op_descr={},
+        comment="scope=classifier.bias;op=bias",
+    )
+    graph.add_node(
+        "add",
+        op="add",
+        weight=1,
+        level=None,
+        scale=None,
+        op_descr={"single": 1},
+        comment="scope=classifier;op=linear_bias",
+    )
+    graph.add_edge("arg0", "add", weight=1)
+    graph.add_edge("bias", "add", weight=1)
+    graph.inputs = {"arg0"}
+    graph.outputs = {"add"}
+    return graph
+
+
+def _constant_mul_pdag(params: Params) -> Tdag:
+    graph = Tdag(params, "oe_constant_mul")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    graph.add_node(
+        "weight",
+        op="constant",
+        weight=1,
+        level=None,
+        scale=None,
+        op_descr={},
+        comment="scope=dense.weight;op=weight",
+    )
+    graph.add_node(
+        "mul",
+        op="mul",
+        weight=1,
+        level=None,
+        scale=None,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=dense;op=linear",
+    )
+    graph.add_edge("arg0", "mul", weight=1)
+    graph.add_edge("weight", "mul", weight=1)
+    graph.inputs = {"arg0"}
+    graph.outputs = {"mul"}
+    return graph
+
+
+def _relaxing_profile_path(tmp_path: Path) -> str:
+    profile = {
+        "schema_version": "orbit-resilience-constraints-v0",
+        "constraints": [{"node": "add", "min_scale": 16, "ports": ["in", "out"]}],
+    }
+    profile_path = tmp_path / "relaxing_constraints.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    return str(profile_path)
+
+
+class FakeLLMModelConfig:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeLLMConfig:
+    def __init__(self):
+        self.api_base = None
+        self.models = []
+        self.evaluator_models = []
+
+    def update_model_params(self, args, overwrite=False):
+        for model in self.models + self.evaluator_models:
+            for key, value in args.items():
+                if overwrite or getattr(model, key, None) is None:
+                    setattr(model, key, value)
+
+
+class FakeDatabaseConfig:
+    def __init__(self):
+        self.random_seed = None
+        self.feature_dimensions = []
+
+
+class FakeConfig:
+    def __init__(self):
+        self.random_seed = None
+        self.llm = FakeLLMConfig()
+        self.database = FakeDatabaseConfig()
+
+
+def _install_fake_openevolve(monkeypatch, fake_run_evolution, loaded_config=None):
+    fake_openevolve = types.ModuleType("openevolve")
+    fake_openevolve.__path__ = []
+    fake_openevolve.run_evolution = fake_run_evolution
+
+    fake_config_mod = types.ModuleType("openevolve.config")
+    fake_config_mod.Config = FakeConfig
+    fake_config_mod.LLMModelConfig = FakeLLMModelConfig
+    fake_config_mod.load_config = lambda _path: loaded_config or FakeConfig()
+    fake_openevolve.config = fake_config_mod
+
+    monkeypatch.setitem(sys.modules, "openevolve", fake_openevolve)
+    monkeypatch.setitem(sys.modules, "openevolve.config", fake_config_mod)
+
+
+def test_context_roundtrip_and_conservative_placement(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    budgets = [{"in_lvl": -1, "in_scl": 40}]
+
+    context = build_context(graph, budgets, params)
+    restored = tdag_from_context(context)
+
+    assert restored.name == graph.name
+    assert restored.nodes["0"]["op"] == "mul"
+    assert context["schema_version"] == "orbit-openevolve-placement-context-v2"
+    assert context["tdag"]["topological_order"]
+    assert context["graph_summary"]["max_scale"] == params.Sf + 2 * params.Sw
+    assert context["budget_summary"]["count"] == 1
+    assert context["constraints"]["local_scale_lower_bounds"]["0"]["in"] == 40
+    assert context["latency_model"]["available_ops"]
+
+    le = LatencyEstimator(params)
+    io_to_assign, io_to_cost = solve_budget_batch(graph, budgets, le, params)
+
+    assert io_to_assign
+    assert io_to_cost
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert assign.check_assign() is True
+
+
+def test_level_preserving_scheduler_limits_mul_chain_bootstraps(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _mul_chain_pdag(params, length=8)
+    le = LatencyEstimator(params)
+
+    io_to_assign, _io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        {"strategy": "level_preserving", "refresh_fanout_at_level_floor": True},
+    )
+
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    counts = _aggregate_counts([assign])
+    assert assign.check_assign() is True
+    assert counts["bootstrap"] < 8
+
+
+def test_level_preserving_fallback_keeps_batch_complete_and_tracks_improvement(
+    toy_cost_json: str,
+):
+    params = _params(toy_cost_json)
+    graph = _mul_chain_pdag(params, length=4)
+    le = LatencyEstimator(params)
+    diagnostics = {}
+
+    _io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        {"strategy": "level_preserving", "allow_seed_fallback": True},
+        diagnostics,
+    )
+
+    _default_assign, default_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+    )
+
+    assert diagnostics["solved_budgets"] == 1
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert diagnostics["fallback_solved_budgets"] == 1
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert diagnostics["candidate_improved_budgets"] == 1
+    assert min(next(iter(io_to_cost.values())).values()) < min(
+        next(iter(default_cost.values())).values()
+    )
+
+
+def test_seed_fallback_does_not_reward_invalid_candidate(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "context.json"
+    seed_program = tmp_path / "seed.py"
+    invalid_program = tmp_path / "invalid.py"
+    context_path.write_text(
+        json.dumps(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)),
+        encoding="utf-8",
+    )
+    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    invalid_program.write_text(
+        "def place(context):\n"
+        "    return {\n"
+        "        'preferred_node_scales': {'0': 9999},\n"
+        "        'allow_seed_fallback': True,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+
+    seed = evaluate_candidate_program(context_path, seed_program)
+    invalid = evaluate_candidate_program(context_path, invalid_program)
+
+    assert invalid["metrics"]["validity"] == 0.0
+    assert invalid["metrics"]["effective_validity"] == 1.0
+    assert invalid["metrics"]["fallback_selected_budgets"] == 1.0
+    assert invalid["metrics"]["combined_score"] < seed["metrics"]["combined_score"]
+
+
+def test_level_preserving_scheduler_handles_branch_merge(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _branch_merge_pdag(params)
+    le = LatencyEstimator(params)
+
+    io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        {"strategy": "level_preserving"},
+    )
+
+    assert io_to_assign
+    assert io_to_cost
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert assign.check_assign() is True
+    assert assign.v_scl_in["merge"] >= params.scale_lower_bound("merge", graph.nodes["merge"], "in")
+
+
+def test_level_preserving_scheduler_handles_bypass_budget(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _branch_merge_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {
+        "in_lvl": -1,
+        "in_scl": 40,
+        "maino_v": "left",
+        "main_dag_size": 3,
+        "main_qbp_cost": {(12, 80): 10.0, (10, 40): 20.0},
+    }
+
+    io_to_assign, io_to_cost = solve_budget_batch(graph, [budget], le, params)
+
+    assert io_to_assign
+    assert io_to_cost
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert assign.check_assign() is True
+    assert (assign.v_lvl_in["left"], assign.v_scl_in["left"]) in budget["main_qbp_cost"]
+
+
+def test_relax_only_keeps_additive_constants_at_constant_scale(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(
+        toy_cost_json,
+        resilience_profile=_relaxing_profile_path(tmp_path),
+        resilience_constraint_policy="relax-only",
+    )
+    graph = _constant_bias_pdag(params)
+    le = LatencyEstimator(params)
+
+    io_to_assign, _io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 16}],
+        le,
+        params,
+    )
+
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert params.Sw == 16
+    assert params.Csw == 40
+    assert assign.check_assign() is True
+    assert assign.v_scl_out["bias"] == params.Csw
+    assert assign.v_scl_in["add"] >= params.Csw
+
+
+def test_level_preserving_allows_relaxed_waterline_constant_mul(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(
+        toy_cost_json,
+        resilience_profile=_relaxing_profile_path(tmp_path),
+        resilience_constraint_policy="relax-only",
+    )
+    graph = _constant_mul_pdag(params)
+    le = LatencyEstimator(params)
+    diagnostics = {}
+
+    io_to_assign, _io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        {"strategy": "level_preserving", "allow_seed_fallback": True},
+        diagnostics,
+    )
+
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert params.Sw == 16
+    assert params.Csw == 40
+    assert build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)["graph_summary"][
+        "max_scale"
+    ] == params.Sf + 2 * params.Csw
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert assign.check_assign() is True
+    assert assign.v_scl_in["mul"] == 80
+
+
+def test_evaluate_candidate_program_returns_metrics_and_artifacts(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "context.json"
+    program_path = tmp_path / "candidate.py"
+    context_path.write_text(
+        json.dumps(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)),
+        encoding="utf-8",
+    )
+    program_path.write_text(
+        "def place(context):\n"
+        "    return {'preferred_node_scales': {'0': 40}}\n",
+        encoding="utf-8",
+    )
+
+    result = evaluate_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["validity"] == 1.0
+    assert result["metrics"]["combined_score"] > 0.0
+    assert result["metrics"]["graph_nodes"] == 2.0
+    assert "invalid_reasons" in result["artifacts"]
+    assert "reference_avg_latency_usec" in result["artifacts"]
+    assert "policy_summary" in result["artifacts"]
+
+
+def test_builder_api_explicit_placement_record(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {"in_lvl": -1, "in_scl": 40}
+    io_to_assign, _io_to_cost = solve_budget_batch(
+        graph,
+        [budget],
+        le,
+        params,
+        {"strategy": "level_preserving"},
+    )
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    record = serialize_assignment_record(graph.name, budget, assign)
+    context_path = tmp_path / "context.json"
+    program_path = tmp_path / "candidate.py"
+    context_path.write_text(json.dumps(build_context(graph, [budget], params)), encoding="utf-8")
+    program_path.write_text(
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+        f"RECORD = {record!r}\n"
+        "def place(context):\n"
+        "    return PlacementBuilder(context).placement_records([RECORD])\n",
+        encoding="utf-8",
+    )
+
+    result = evaluate_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["validity"] == 1.0
+    assert result["metrics"]["fallback_selected_budgets"] == 0.0
+    assert result["metrics"]["combined_score"] > 0.0
+
+
+def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_toy_pdag(params), [{"in_lvl": -1, "in_scl": 40}], params)
+
+    assert valid_transition(context, 16, 40, 15, 40)
+    assert not valid_transition(context, 1, 131, 16, 40)
+    assert PlacementBuilder(context).level_preserving()["policy"]["strategy"] == "level_preserving"
+
+
+def test_evaluator_validity_counts_duplicate_requested_budgets(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "context.json"
+    program_path = tmp_path / "candidate.py"
+    budgets = [{"in_lvl": -1, "in_scl": 40}, {"in_lvl": -1, "in_scl": 40}]
+    context_path.write_text(json.dumps(build_context(graph, budgets, params)), encoding="utf-8")
+    program_path.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+
+    result = evaluate_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["validity"] == 1.0
+    assert result["metrics"]["solved_budgets"] == 2.0
+    assert result["metrics"]["budget_count"] == 2.0
+
+
+def test_evaluator_rejects_invalid_policy_score(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "context.json"
+    good_program = tmp_path / "good.py"
+    bad_program = tmp_path / "bad.py"
+    context_path.write_text(
+        json.dumps(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)),
+        encoding="utf-8",
+    )
+    good_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    bad_program.write_text(
+        "def place(context):\n"
+        "    return {'preferred_node_scales': {'0': 9999}}\n",
+        encoding="utf-8",
+    )
+
+    good = evaluate_candidate_program(context_path, good_program)
+    bad = evaluate_candidate_program(context_path, bad_program)
+
+    assert good["metrics"]["validity"] == 1.0
+    assert bad["metrics"]["validity"] == 0.0
+    assert bad["metrics"]["combined_score"] < good["metrics"]["combined_score"]
+
+
+def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    graph = _mul_chain_pdag(params, length=4)
+    context_path = tmp_path / "context.json"
+    seed_program = tmp_path / "seed.py"
+    evolved_program = tmp_path / "evolved.py"
+    budgets = [
+        {"in_lvl": -1, "in_scl": 40},
+        {"in_lvl": 1, "in_scl": 9999},
+    ]
+    context_path.write_text(json.dumps(build_context(graph, budgets, params)), encoding="utf-8")
+    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    evolved_program.write_text(
+        "def place(context):\n"
+        "    return {'strategy': 'level_preserving', 'refresh_fanout_at_level_floor': True}\n",
+        encoding="utf-8",
+    )
+
+    seed = evaluate_candidate_program(context_path, seed_program)
+    evolved = evaluate_candidate_program(context_path, evolved_program)
+
+    assert seed["metrics"]["validity"] == evolved["metrics"]["validity"] == 0.5
+    assert evolved["metrics"]["avg_latency_usec"] < seed["metrics"]["avg_latency_usec"]
+    assert evolved["metrics"]["combined_score"] > seed["metrics"]["combined_score"]
+    assert evolved["metrics"]["combined_score"] < 1.0
+
+
+def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_path: Path):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="toy",
+    )
+    graph = _branch_merge_pdag(params)
+    context = build_compile_context(graph, params)
+    context_path = tmp_path / "compile_context.json"
+    seed_program = tmp_path / "seed.py"
+    evolved_program = tmp_path / "evolved.py"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    evolved_program.write_text(
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+        "def place(context):\n"
+        "    return PlacementBuilder(context).level_preserving()\n",
+        encoding="utf-8",
+    )
+
+    seed = evaluate_compile_candidate_program(context_path, seed_program)
+    evolved = evaluate_compile_candidate_program(context_path, evolved_program)
+
+    assert seed["metrics"]["validity"] == 1.0
+    assert evolved["metrics"]["validity"] == 1.0
+    assert "candidate_final_latency_usec" in evolved["artifacts"]
+    assert evolved["metrics"]["final_latency_usec"] > 0.0
+
+
+def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
+    _install_fake_openevolve(monkeypatch, lambda **_kwargs: None)
+    params = _params(toy_cost_json, openevolve_iterations=2, openevolve_seed=7)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+
+    config = worker._openevolve_config_arg()
+
+    assert config.random_seed == 7
+    assert config.database.random_seed == 7
+    assert config.llm.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert config.llm.models[0].name == "gemini-3.1-pro-preview"
+    assert config.llm.models[0].api_base == config.llm.api_base
+    assert config.llm.models[0].random_seed == 7
+    assert config.database.feature_dimensions == [
+        "final_latency_usec",
+        "bootstrap_count",
+        "rescale_count",
+        "profile_risk",
+        "placement_runtime_sec",
+    ]
+
+
+def test_explicit_openevolve_config_preserves_model_and_updates_seed(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    loaded = FakeConfig()
+    loaded.llm.models = [FakeLLMModelConfig(name="custom-model", api_base="https://custom.invalid/v1")]
+    loaded.llm.evaluator_models = [
+        FakeLLMModelConfig(name="custom-evaluator", api_base="https://custom.invalid/v1")
+    ]
+    _install_fake_openevolve(monkeypatch, lambda **_kwargs: None, loaded_config=loaded)
+    params = _params(
+        toy_cost_json,
+        openevolve_config=str(tmp_path / "config.yaml"),
+        openevolve_model="gemini-3.1-pro-preview",
+        openevolve_seed=99,
+    )
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+
+    config = worker._openevolve_config_arg()
+
+    assert config is loaded
+    assert config.random_seed == 99
+    assert config.database.random_seed == 99
+    assert config.llm.models[0].name == "custom-model"
+    assert config.llm.evaluator_models[0].name == "custom-evaluator"
+    assert config.llm.models[0].random_seed == 99
+
+
+def test_openevolve_env_uses_openai_key(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json, openevolve_iterations=2)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with worker._openevolve_runtime_env():
+        assert os.environ["OPENAI_API_KEY"] == "test-openai-key"
+
+
+def test_openevolve_env_gemini_fallback_bridges_openai(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json, openevolve_iterations=2)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+
+    with worker._openevolve_runtime_env():
+        assert os.environ["OPENAI_API_KEY"] == "test-gemini-key"
+
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_openevolve_env_missing_key_has_clear_error(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json, openevolve_iterations=2)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError) as excinfo:
+        with worker._openevolve_runtime_env():
+            pass
+
+    msg = str(excinfo.value)
+    assert "OPENAI_API_KEY" in msg
+    assert "GEMINI_API_KEY" in msg
+    assert "AIza" not in msg
+
+
+def test_mocked_openevolve_runtime_runs_once_per_budget_batch(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = []
+
+    class FakeResult:
+        best_code = (
+            "def place(context):\n"
+            "    return {'strategy': 'level_preserving', 'refresh_fanout_at_level_floor': True}\n"
+        )
+
+    def fake_run_evolution(**kwargs):
+        assert os.environ["OPENAI_API_KEY"] == "test-gemini-key"
+        calls.append(kwargs)
+        return FakeResult()
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "gurobipy" or name.startswith("gurobipy.") or name == "pulp":
+            raise AssertionError("OpenEvolve placement imported an ILP solver")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=3,
+        openevolve_output_dir=str(tmp_path),
+    )
+    graph = _toy_pdag(params)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    default_assign, _default_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}, {"in_lvl": -1, "in_scl": 41}],
+        LatencyEstimator(params),
+        params,
+    )
+
+    io_to_assign, io_to_cost = worker.get_qbp(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}, {"in_lvl": -1, "in_scl": 41}],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["iterations"] == 3
+    assert calls[0]["config"].llm.models[0].name == "gemini-3.1-pro-preview"
+    assert calls[0]["config"].llm.models[0].api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert calls[0]["config"].database.random_seed == 42
+    assert Path(calls[0]["initial_program"]).is_file()
+    assert Path(calls[0]["evaluator"]).is_file()
+    assert "OPENAI_API_KEY" not in os.environ
+    assert io_to_assign
+    assert io_to_cost
+    assert io_to_cost != _default_cost
+
+
+def test_mocked_compile_harness_runs_once_for_compile(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    calls = []
+
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving()\n"
+        )
+
+    def fake_run_evolution(**kwargs):
+        calls.append(kwargs)
+        return FakeResult()
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="toy",
+        openevolve_output_dir=str(tmp_path),
+    )
+    graph = _branch_merge_pdag(params)
+
+    assign, timings = orbit_core(graph, LatencyEstimator(params), params)
+
+    assert assign is not None
+    assert assign.check_assign() is True
+    assert len(calls) == 1
+    assert calls[0]["iterations"] == 2
+    assert Path(calls[0]["initial_program"]).is_file()
+    assert Path(calls[0]["evaluator"]).is_file()
+    assert "OpenEvolve Compile Harness Time" in timings
+
+
+def test_compile_harness_reruns_best_candidate_on_full_bundle(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving(level_drop_penalty=123.0)\n"
+        )
+
+    def fake_run_evolution(**_kwargs):
+        return FakeResult()
+
+    eval_suites = []
+
+    def fake_evaluate_compile_hints(context, hints, *, suppress_output):
+        eval_suites.append((context.get("harness", {}).get("eval_suite"), hints.get("level_drop_penalty")))
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 100.0 if hints else 120.0,
+            "bootstrap_count": 4,
+            "rescale_count": 2,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {},
+            "bootstrap_locations": {},
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["strategy"] == "level_preserving"
+    assert hints["level_drop_penalty"] == 123.0
+    assert ("polybert-sampled", None) in eval_suites
+    assert ("polybert-full", None) in eval_suites
+    assert ("polybert-full", 123.0) in eval_suites
+    assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
+
+
+def test_zero_iteration_openevolve_path_does_not_import_gurobipy(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json, openevolve_iterations=0)
+    graph = _toy_pdag(params)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "gurobipy" or name.startswith("gurobipy.") or name == "pulp":
+            raise AssertionError("OpenEvolve placement imported an ILP solver")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    io_to_assign, io_to_cost = worker.get_qbp(graph, [{"in_lvl": -1, "in_scl": 40}])
+
+    assert io_to_assign
+    assert io_to_cost

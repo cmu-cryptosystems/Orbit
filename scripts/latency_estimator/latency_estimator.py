@@ -85,7 +85,7 @@ class LatencyEstimator:
             in_lvl = out_lvl + r
         
         for i in range(r-1, -1, -1):
-            this_target = min(2 * self.params.Sw, out_scl + self.params.Sf * i)
+            this_target = min(self.params.max_scale() - self.params.Sf, out_scl + self.params.Sf * i)
             if in_scl < this_target + self.params.Sf:
                 total_cost += self.op_lmaps['upscale_single'][in_lvl]
                 in_scl = this_target + self.params.Sf

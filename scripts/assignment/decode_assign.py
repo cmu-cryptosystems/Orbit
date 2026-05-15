@@ -12,7 +12,7 @@ def _decode_edge(fdag: Tdag, u: str, v: str, scl: int|None):
     out_scl = fdag.nodes[v]['scale'] if scl is None else scl
     
     Sf = fdag.params.Sf
-    Smax = fdag.params.Sf + 2 * fdag.params.Sw
+    Smax = fdag.params.max_scale()
     
     def _insert_rescale(vc: str, vt: str, c_lvl: int, c_scl: int, t_lvl: int, t_scl: int):
         r = max(0, round(np.ceil((c_scl-t_scl)/Sf)))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.latency_estimator.latency_estimator import LatencyEstimator
 from scripts.optimizer.orbit.orbit_core import orbit_core
 from scripts.params.params import Params
@@ -9,10 +11,12 @@ from scripts.tdag import addition_squash, auto_compress, build_from_mlir
 
 
 def test_orbit_core_motivation_pulp(motivation_mlir: str, toy_cost_json: str):
+    pytest.importorskip("pulp")
     params = Params(
         toy_cost_json,
         "Orbit",
         "compile",
+        placement_backend="ilp",
         ilp_solver="pulp",
         threads=2,
         bpsdepth=15,

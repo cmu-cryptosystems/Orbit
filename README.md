@@ -1,4 +1,4 @@
-# Orbit: Optimizing Rescale and Bootstrap Placement with Integer Linear Programming Techniques
+# Orbit: Optimizing Rescale and Bootstrap Placement with OpenEvolve or ILP
 
 ## Installation
 
@@ -6,12 +6,13 @@
 
 The following python modules are needed to run Orbit:
 ```
-gurobipy
 joblib
 matplotlib
 more-itertools
 networkx
 numpy
+openevolve
+pulp
 ```
 
 Run the following commands to install them:
@@ -19,7 +20,19 @@ Run the following commands to install them:
 pip install -r requirements.txt
 ```
 
-For `gurobipy`, you have to apply for a Gurobi license. It is free to apply for an unlimited-use Gurobi Optimizer license for academic use.
+OpenEvolve is the default placement backend. `--openevolve-iterations 0` uses Orbit's deterministic conservative policy without LLM calls, which is useful for smoke tests and no-Gurobi compilation.
+
+For positive OpenEvolve iterations, Orbit defaults to Gemini through OpenEvolve's OpenAI-compatible API support. Provide the key as an environment variable, not in tracked files:
+
+```bash
+export OPENAI_API_KEY="your-gemini-api-key"
+# or, Orbit will bridge this to OPENAI_API_KEY during OpenEvolve calls:
+export GEMINI_API_KEY="your-gemini-api-key"
+```
+
+Do not commit API keys. Rotate any key that has been pasted into chat, logs, shell history, or tracked files.
+
+Gurobi is optional and only used for comparison runs with `--placement-backend ilp --ilp-solver gurobi`. Install `gurobipy` separately and provide a Gurobi license if you need that backend. The ILP comparison path also supports PuLP/CBC with `--ilp-solver pulp`.
 
 ### Frontend and Backend
 
@@ -53,6 +66,23 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--nopart`: If enabled, the partitioning technique is disabled.
 - `--sim-vari`: If enabled, use the cost model with simulated variadic bootstrapping cost.
 - `--Csw`: Specify the minimum scale attribute for plaintexts. This option is experimental and is not used in Orbit's evaluation.
+- `--placement-backend <openevolve|ilp>`: Placement backend. Default is `openevolve`.
+- `--ilp-solver <pulp|gurobi>`: ILP solver, used only with `--placement-backend ilp`.
+- `--openevolve-config <path>`: Optional OpenEvolve YAML config for runtime evolution.
+- `--openevolve-output-dir <path>`: Directory for generated OpenEvolve workspaces/checkpoints.
+- `--openevolve-iterations <n>`: OpenEvolve iterations. Use `0` for deterministic placement without LLM calls.
+- `--openevolve-harness <compile|partition>`: Harness scope for positive iterations. Default `compile` runs one OpenEvolve search for the compile and replays final placement scoring; `partition` keeps the legacy per-batch behavior.
+- `--openevolve-eval-suite <toy|polybert-sampled|polybert-full>`: Evaluator bundle. Default `polybert-sampled` keeps compile-level scoring fast while preserving all final validation outside the harness.
+- `--openevolve-reference-json <path>`: Optional precomputed reference metrics for reporting only. This never runs PuLP/Gurobi inside OpenEvolve.
+- `--openevolve-finalists <n>`: Number of candidates reserved for full-bundle finalist scoring metadata.
+- `--openevolve-seed <n>`: Seed passed into the generated OpenEvolve context and config override.
+- `--openevolve-provider <gemini|openai|custom>`: Provider for generated OpenEvolve config. Default is `gemini`.
+- `--openevolve-model <name>`: Model for generated OpenEvolve config. Default is `gemini-3.1-pro-preview`.
+- `--openevolve-api-base <url>`: OpenAI-compatible API base. Required for `--openevolve-provider custom`.
+- `--openevolve-api-key-env <name>`: API key environment variable. Default is `OPENAI_API_KEY`; Gemini also falls back to `GEMINI_API_KEY`.
+- `--openevolve-keep-workdir`: Keep temporary OpenEvolve workspaces.
+- `--resilience-profile <path>`: ckks-robustness-profiler 0.8.0 profile, generated Orbit constraint sidecar, or Orbit-native constraints JSON.
+- `--resilience-constraint-policy <relax-only|hard-tau>`: Use profile constraints as relaxed waterline guidance or hard local scale lower bounds.
 
 **Output files:**
 
@@ -94,6 +124,54 @@ python3 -m scripts.optimizer.orbit.optimizer [options]
 
 Check `scripts/optimizer/orbit/optimizer.py` for options and usage.
 
+Minimal no-Gurobi smoke compile:
+
+```bash
+python3 -m scripts.optimizer.orbit.optimizer \
+  --inputfile mlirs_input/motivation.mlir \
+  --outputfile /tmp/orbit_oe_smoke.mlir \
+  --costjson cost_models/toy_backend.json \
+  --maxlevel 6 \
+  --waterscale 40 \
+  --placement-backend openevolve \
+  --openevolve-iterations 0 \
+  --no-compress \
+  --no-partition
+```
+
+Profiler-aware smoke compile:
+
+```bash
+python3 -m scripts.optimizer.orbit.optimizer \
+  --inputfile mlirs_input/motivation.mlir \
+  --outputfile /tmp/orbit_oe_resilience_smoke.mlir \
+  --costjson cost_models/toy_backend.json \
+  --maxlevel 6 \
+  --waterscale 40 \
+  --placement-backend openevolve \
+  --openevolve-iterations 0 \
+  --resilience-profile examples/resilience_constraints_example.json \
+  --no-compress \
+  --no-partition
+```
+
+Gemini-backed OpenEvolve search:
+
+```bash
+export OPENAI_API_KEY="your-gemini-api-key"
+python3 -m scripts.optimizer.orbit.optimizer \
+  --inputfile mlirs_input/motivation.mlir \
+  --outputfile /tmp/orbit_oe_gemini.mlir \
+  --costjson cost_models/toy_backend.json \
+  --maxlevel 6 \
+  --waterscale 40 \
+  --placement-backend openevolve \
+  --openevolve-iterations 10 \
+  --openevolve-model gemini-3.1-pro-preview \
+  --no-compress \
+  --no-partition
+```
+
 ## Overview
 
 The structure of Orbit repository is as follows:
@@ -122,5 +200,7 @@ The scripts of Orbit are stored in `scripts/`, which contains the following comp
 - `optimizer/orbit/`: The core scripts of Orbit:
   - The partitioning technique and bypass handling are implemented in `siso_partition.py`.
   - The iterative partition solving and merging: in `iterative_partition.py`.
-  - The ILP formulation: in `ilp_core.py`
+  - The OpenEvolve placement backend: in `openevolve_backend.py`.
+  - The optional ILP formulation: in `ilp_core.py` and `ilp_gurobi.py`.
   - The QBP management: in `qbp_manager.py`.
+- `resilience/`: Loading profiler 0.8.0 and Orbit-native resilience constraints.

@@ -13,7 +13,16 @@ from scripts.params.params import Params
 def test_params_toy_runtime(toy_cost_json: str):
     p = Params(toy_cost_json, "Orbit", "compile")
     assert p.backend == "Toy"
-    assert p.ilp_solver == "gurobi"
+    assert p.placement_backend == "openevolve"
+    assert p.ilp_solver == "pulp"
+    assert p.openevolve_provider == "gemini"
+    assert p.openevolve_model == "gemini-3.1-pro-preview"
+    assert p.openevolve_api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert p.openevolve_api_key_env == "OPENAI_API_KEY"
+    assert p.openevolve_harness == "compile"
+    assert p.openevolve_eval_suite == "polybert-sampled"
+    assert p.openevolve_reference_json is None
+    assert p.openevolve_finalists == 3
     assert p.mode == "compile"
 
 
@@ -36,3 +45,66 @@ def test_params_ilp_solver_from_json(tmp_path: Path, toy_cost_json: str):
 def test_params_rejects_bad_ilp_solver(toy_cost_json: str):
     with pytest.raises(ValueError, match="ilp_solver"):
         Params(toy_cost_json, "Orbit", "compile", ilp_solver="not_a_solver")
+
+
+def test_params_rejects_bad_openevolve_provider(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_provider"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_provider="not_a_provider")
+
+
+def test_params_rejects_bad_openevolve_harness(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_harness"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_harness="batch")
+
+
+def test_params_rejects_bad_openevolve_eval_suite(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_eval_suite"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_eval_suite="large")
+
+
+def test_relax_only_preserves_default_constant_scale(
+    toy_cost_json: str, tmp_path: Path
+):
+    profile = {
+        "schema_version": "orbit-resilience-constraints-v0",
+        "constraints": [{"node": "0", "min_scale": 16, "ports": ["in", "out"]}],
+    }
+    profile_path = tmp_path / "constraints.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    p = Params(
+        toy_cost_json,
+        "Orbit",
+        "compile",
+        Sw=40,
+        CSw=None,
+        resilience_profile=str(profile_path),
+        resilience_constraint_policy="relax-only",
+    )
+
+    assert p.Sw == 16
+    assert p.Csw == 40
+
+
+def test_explicit_constant_scale_is_respected_under_relax_only(
+    toy_cost_json: str, tmp_path: Path
+):
+    profile = {
+        "schema_version": "orbit-resilience-constraints-v0",
+        "constraints": [{"node": "0", "min_scale": 16, "ports": ["in", "out"]}],
+    }
+    profile_path = tmp_path / "constraints.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    p = Params(
+        toy_cost_json,
+        "Orbit",
+        "compile",
+        Sw=40,
+        CSw=24,
+        resilience_profile=str(profile_path),
+        resilience_constraint_policy="relax-only",
+    )
+
+    assert p.Sw == 16
+    assert p.Csw == 24

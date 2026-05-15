@@ -171,7 +171,10 @@ def _build_op_descr(op_type: str, op_info: dict,
     if op_type in ['pack', 'cs_ref']:
         return {}
 
-    if op_type in ['mask', 'zero_mask']:
+    if op_type == 'mask':
+        return {}
+
+    if op_type == 'zero_mask':
         return {'value': 0, 'rms_var': 0.0}
 
     if op_type == 'poly':
@@ -239,7 +242,7 @@ def build_from_rotom(manifest_path: str, params: Params) -> Tdag:
 
         # Plaintext packs become constants; they need value/rms_var metadata.
         if tdag_op == 'constant' and 'value' not in op_descr:
-            op_descr = {'value': 0, 'rms_var': 0.0}
+            op_descr = {'value': op_info.get('ref_index', idx), 'rms_var': 0.0}
 
         # In compile mode Orbit sets level/scale to None and solves for them.
         level = None

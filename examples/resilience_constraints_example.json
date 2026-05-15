@@ -1,0 +1,59 @@
+{
+  "schema_version": "0.8.0",
+  "model": {
+    "name": "motivation"
+  },
+  "graph": {
+    "mode": "module_fallback",
+    "requested_mode": "auto"
+  },
+  "artifacts": {
+    "orbit_constraints": "resilience_constraints_example.orbit_constraints.json",
+    "state_traces": "resilience_constraints_example.state_traces.jsonl",
+    "optimization_plans": "resilience_constraints_example.optimization_plans.jsonl"
+  },
+  "artifact_counts": {
+    "orbit_constraints": 1,
+    "state_traces": 1,
+    "optimization_plans": 1
+  },
+  "optimizer": {
+    "enabled": true
+  },
+  "best_plan": {
+    "action_counts": {
+      "bootstrap": 1,
+      "rescale": 2
+    },
+    "expected_latency": 377250.0,
+    "risk": 0.0,
+    "objective": 377250.0,
+    "actions": [
+      {
+        "target_id": "edge:motivation.square:out",
+        "action": "refresh"
+      }
+    ]
+  },
+  "layers": [
+    {
+      "target_id": "edge:motivation.square:out",
+      "name": "motivation.square",
+      "module_names": [
+        "motivation.square"
+      ],
+      "tolerance_profile": {
+        "tau_abs": 0.004,
+        "tau_rel": 0.02,
+        "min_bits_abs": 38,
+        "required_precision_bits_q99": 38,
+        "fragility_class": "smoke"
+      },
+      "ckks_hint": {
+        "min_log2_scale": 38,
+        "required_precision_bits_q99": 38,
+        "safety_bits": 8
+      }
+    }
+  ]
+}

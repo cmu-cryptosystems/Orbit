@@ -1,8 +1,62 @@
 import json
 import numpy as np
+from ..resilience import ResilienceProfile
+
+DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_OPENEVOLVE_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+DEFAULT_RESILIENCE_ERROR_MODEL = {
+    "input_error_abs": 0.0,
+    "add_error_abs": 1e-10,
+    "mul_plain_error_abs": 1e-8,
+    "mul_cipher_error_abs": 2e-8,
+    "rotate_error_abs": 1e-9,
+    "rescale_error_abs": 1e-8,
+    "modswitch_error_abs": 1e-9,
+    "upscale_error_abs": 0.0,
+    "bootstrap_error_abs": 1e-6,
+    "max_error_abs": 1.0,
+}
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None, ilp_solver=None):
+    def __init__(
+        self,
+        le_json,
+        sysname,
+        mode,
+        Sw=None,
+        CSw=None,
+        bpsdepth=None,
+        threads=None,
+        comp=None,
+        part=None,
+        reqbp=None,
+        netname=None,
+        ilp_solver=None,
+        placement_backend=None,
+        resilience_profile=None,
+        resilience_mode="waterline",
+        allow_empty_resilience_match=False,
+        resilience_decomposition="off",
+        resilience_decompose_threshold=32,
+        resilience_max_boundary_states=8,
+        resilience_error_buckets=8,
+        ilp_task_time_limit_sec=0.0,
+        resilience_constraint_policy="relax-only",
+        openevolve_config=None,
+        openevolve_output_dir=None,
+        openevolve_iterations=0,
+        openevolve_seed=42,
+        openevolve_keep_workdir=False,
+        openevolve_provider=None,
+        openevolve_model=None,
+        openevolve_api_base=None,
+        openevolve_api_key_env=None,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_reference_json=None,
+        openevolve_finalists=3,
+    ):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -14,7 +68,8 @@ class Params:
         except json.JSONDecodeError:
             raise Exception(f"Error decoding JSON from the file {le_json}.")
         
-        self.poly_deg = int(json_parsed.get("poly_deg", 32768))
+        self.le_json = le_json
+        self.poly_deg = int(json_parsed.get("poly_deg", json_parsed.get("polynomialDegree", 32768)))
         self.max_slot = self.poly_deg // 2
         self.bts_ub = int(json_parsed.get("bootstrapLevelUpperBound", 14))
         self.bts_lb = int(json_parsed.get("bootstrapLevelLowerBound", 1))
@@ -35,13 +90,158 @@ class Params:
         self.part = part if part is not None else True
         self.reqbp = reqbp if reqbp is not None else False
         self.netname = netname if netname is not None else ""
-        self.ilp_solver = ilp_solver if ilp_solver is not None else json_parsed.get("ilp_solver", "gurobi")
+        self.placement_backend = (
+            placement_backend
+            if placement_backend is not None
+            else json_parsed.get("placement_backend", "openevolve")
+        )
+        if self.placement_backend not in ("openevolve", "ilp"):
+            raise ValueError(
+                "placement_backend must be 'openevolve' or 'ilp', "
+                f"got {self.placement_backend!r}"
+            )
+        self.ilp_solver = ilp_solver if ilp_solver is not None else json_parsed.get("ilp_solver", "pulp")
         if self.ilp_solver not in ("gurobi", "pulp"):
             raise ValueError(f"ilp_solver must be 'gurobi' or 'pulp', got {self.ilp_solver!r}")
+        if self.placement_backend == "openevolve" and self.ilp_solver == "gurobi":
+            # The OpenEvolve path must be usable without importing gurobipy.
+            self.ilp_solver = "pulp"
+        self.openevolve_config = openevolve_config
+        self.openevolve_output_dir = openevolve_output_dir
+        self.openevolve_iterations = int(openevolve_iterations or 0)
+        self.openevolve_seed = int(openevolve_seed)
+        self.openevolve_keep_workdir = bool(openevolve_keep_workdir)
+        self.openevolve_provider = (
+            openevolve_provider
+            if openevolve_provider is not None
+            else json_parsed.get("openevolve_provider", "gemini")
+        )
+        if self.openevolve_provider not in ("gemini", "openai", "custom"):
+            raise ValueError(
+                "openevolve_provider must be 'gemini', 'openai', or 'custom', "
+                f"got {self.openevolve_provider!r}"
+            )
+        self.openevolve_model = (
+            openevolve_model
+            if openevolve_model is not None
+            else json_parsed.get("openevolve_model", DEFAULT_OPENEVOLVE_GEMINI_MODEL)
+        )
+        provider_default_api_base = (
+            DEFAULT_OPENEVOLVE_GEMINI_API_BASE
+            if self.openevolve_provider == "gemini"
+            else None
+        )
+        self.openevolve_api_base = (
+            openevolve_api_base
+            if openevolve_api_base is not None
+            else json_parsed.get("openevolve_api_base", provider_default_api_base)
+        )
+        self.openevolve_api_key_env = (
+            openevolve_api_key_env
+            if openevolve_api_key_env is not None
+            else json_parsed.get("openevolve_api_key_env", "OPENAI_API_KEY")
+        )
+        self.openevolve_harness = (
+            openevolve_harness
+            if openevolve_harness is not None
+            else json_parsed.get("openevolve_harness", "compile")
+        )
+        if self.openevolve_harness not in ("compile", "partition"):
+            raise ValueError(
+                "openevolve_harness must be 'compile' or 'partition', "
+                f"got {self.openevolve_harness!r}"
+            )
+        self.openevolve_eval_suite = (
+            openevolve_eval_suite
+            if openevolve_eval_suite is not None
+            else json_parsed.get("openevolve_eval_suite", "polybert-sampled")
+        )
+        if self.openevolve_eval_suite not in ("toy", "polybert-sampled", "polybert-full"):
+            raise ValueError(
+                "openevolve_eval_suite must be 'toy', 'polybert-sampled', or "
+                f"'polybert-full', got {self.openevolve_eval_suite!r}"
+            )
+        self.openevolve_reference_json = (
+            openevolve_reference_json
+            if openevolve_reference_json is not None
+            else json_parsed.get("openevolve_reference_json")
+        )
+        self.openevolve_finalists = int(
+            openevolve_finalists
+            if openevolve_finalists is not None
+            else json_parsed.get("openevolve_finalists", 3)
+        )
+        self.openevolve_compile_hints = None
+        self.openevolve_evaluating_candidate = False
+
+        self.resilience_profile_path = resilience_profile
+        self.resilience_profile = ResilienceProfile.load(resilience_profile)
+        assert resilience_constraint_policy in ["relax-only", "hard-tau"], (
+            "resilience_constraint_policy must be either 'relax-only' or 'hard-tau'"
+        )
+        self.resilience_constraint_policy = resilience_constraint_policy
+        if (
+            self.resilience_constraint_policy == "relax-only"
+            and self.resilience_profile is not None
+        ):
+            relaxed_sw = self.resilience_profile.relaxed_global_scale(self.Sw)
+            if relaxed_sw < self.Sw:
+                print(
+                    "Resilience relax-only policy lowered guided waterline "
+                    f"from Sw={self.Sw} to Sw={relaxed_sw}."
+                )
+                self.Sw = relaxed_sw
+        assert resilience_mode in ["waterline", "error-state"], (
+            "resilience_mode must be either 'waterline' or 'error-state'"
+        )
+        self.resilience_mode = resilience_mode
+        self.allow_empty_resilience_match = allow_empty_resilience_match
+        assert resilience_decomposition in ["off", "bounded-dp"], (
+            "resilience_decomposition must be either 'off' or 'bounded-dp'"
+        )
+        self.resilience_decomposition = resilience_decomposition
+        self.resilience_decompose_threshold = resilience_decompose_threshold
+        self.resilience_max_boundary_states = resilience_max_boundary_states
+        self.resilience_error_buckets = resilience_error_buckets
+        self.ilp_task_time_limit_sec = ilp_task_time_limit_sec
+        self.resilience_match_report = None
+        self.resilience_decomposition_report = None
+        self.resilience_error_model = DEFAULT_RESILIENCE_ERROR_MODEL.copy()
+        self.resilience_error_model.update(json_parsed.get("resilienceErrorModel", {}))
         
         self.trunc_val = 1 # truncation value for latency estimation
         self.dacapo_mlir_in = True  # need to revert the input MLIR level
         self.dacapo_mlir_out = True # need to revert the output MLIR level
+
+    def has_resilience_constraints(self) -> bool:
+        return (
+            self.resilience_profile is not None
+            and len(self.resilience_profile.constraints) > 0
+        )
+
+    def use_bounded_resilience_decomposition(self) -> bool:
+        return (
+            self.resilience_mode == "error-state"
+            and self.resilience_decomposition == "bounded-dp"
+            and self.has_resilience_constraints()
+            and self.part
+        )
+
+    def max_scale(self) -> int:
+        return int(self.Sf + 2 * max(self.Sw, self.Csw))
+
+    def scale_lower_bound(self, node_label: str, node_attrs: dict, port: str) -> int:
+        if self.resilience_profile is None:
+            return self.Sw
+        profile_bound = self.resilience_profile.scale_lower_bound(
+            node_label,
+            node_attrs,
+            self.Sw,
+            port,
+        )
+        if self.resilience_constraint_policy == "relax-only":
+            return min(self.Sw, profile_bound)
+        return profile_bound
         
     def check_res(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
         if in_lvl < out_lvl:

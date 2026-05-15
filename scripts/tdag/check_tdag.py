@@ -13,11 +13,13 @@ def check_tdag(tdag: Tdag):
         scale = tdag.nodes[v].get('scale', None)
         if lvl is None or scale is None:
             raise ValueError(f"Node {v} missing level or scale attribute.")
+        scale_lb = tdag.params.scale_lower_bound(v, tdag.nodes[v], "out")
         # Check scale bounds
-        if not tdag.params.Sw <= scale <= tdag.params.Sf + 2 * tdag.params.Sw:
-            if tdag.nodes[v]['op'] == 'constant' and tdag.params.Csw <= scale < tdag.params.Sw:
+        max_scale = tdag.params.max_scale()
+        if not scale_lb <= scale <= max_scale:
+            if tdag.nodes[v]['op'] == 'constant' and tdag.params.Csw <= scale < scale_lb:
                 continue
-            raise ValueError(f"Node {v} has scale {scale} out of bounds [{tdag.params.Sw}, {tdag.params.Sf + 2 * tdag.params.Sw}].")
+            raise ValueError(f"Node {v} has scale {scale} out of bounds [{scale_lb}, {max_scale}].")
         # Check level bounds
         if not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:
             raise ValueError(f"Node {v} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub}].")
@@ -107,4 +109,3 @@ def check_tdag(tdag: Tdag):
         else:
             raise ValueError(f"Node {v} has unknown operation {op}.")
     return True
-

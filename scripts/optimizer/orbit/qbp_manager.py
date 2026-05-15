@@ -5,6 +5,7 @@ from ...visualize import *
 from ...params.params import Params
 from .qbp import QBP
 from .ilp_worker import ILP_Worker
+from .openevolve_backend import OpenEvolvePlacementWorker
 
 import os
 import sys
@@ -15,7 +16,12 @@ class QBPManager:
         self.le = le
         self.qbps: dict[str, QBP] = dict() # dag name -> QBP
         self.pdag_name_to_qbp = dict()  # pdag name -> (bj_qbp, bj_label)
-        self.ilp_worker = ILP_Worker(params, le)
+        self.ilp_worker = (
+            OpenEvolvePlacementWorker(params, le)
+            if params.placement_backend == "openevolve"
+            else ILP_Worker(params, le)
+        )
+        self.openevolve_diagnostics = []
     
     def save_qbps(self, dirpath: str):
         os.makedirs(dirpath, exist_ok=True)
@@ -38,6 +44,14 @@ class QBPManager:
     def _get_qbp_bj(self, pdag: Tdag) -> tuple[QBP, dict[str, str]]:
         if pdag.name in self.pdag_name_to_qbp:
             return self.pdag_name_to_qbp[pdag.name]
+        if self.params.has_resilience_constraints():
+            qbp = self.qbps.get(pdag.name)
+            if qbp is None:
+                qbp = QBP(pdag)
+                self.qbps[pdag.name] = qbp
+            bj_label = {v: v for v in pdag.nodes}
+            self.pdag_name_to_qbp[pdag.name] = (qbp, bj_label)
+            return qbp, bj_label
         bj_label = None
         bj_qbp = None
         for dag_id, qbp in self.qbps.items():
@@ -80,6 +94,15 @@ class QBPManager:
                 for e in assign.e_scl_out:
                     new_e = (bj_label[e[0]], bj_label[e[1]])
                     new_assign.e_scl_out[new_e] = assign.e_scl_out[e]
+                for v in assign.v_err_in:
+                    new_v = bj_label[v]
+                    new_assign.v_err_in[new_v] = assign.v_err_in[v]
+                for v in assign.v_err_out:
+                    new_v = bj_label[v]
+                    new_assign.v_err_out[new_v] = assign.v_err_out[v]
+                for e in assign.e_err_out:
+                    new_e = (bj_label[e[0]], bj_label[e[1]])
+                    new_assign.e_err_out[new_e] = assign.e_err_out[e]
                 new_out_to_assign[out_key] = new_assign
             new_io_to_assign[in_key] = new_out_to_assign
         return new_io_to_assign
@@ -153,7 +176,7 @@ class QBPManager:
         for in_lvl, in_scl_to_cost in in_budgets.items():
             for in_scl in in_scl_to_cost.keys():
                 if (in_lvl, in_scl) not in bj_qbp.io_to_cost:
-                    # need to solve ILP for this input
+                    # need to solve placement for this input
                     if not self.params.part:
                         io_budgets_list.append({
                             'in_lvl': in_lvl,
@@ -167,10 +190,13 @@ class QBPManager:
                                 'out_lvl': out_lvl
                             })
         num_remaining_tasks = len(io_budgets_list)
-        print(f"  QBP Manager: Reusing Ratio: {1-num_remaining_tasks/num_total_tasks:.3f}.\n    Need to solve {num_remaining_tasks} / {num_total_tasks} ILP tasks for PDAG #{pdag.name}")
+        print(f"  QBP Manager: Reusing Ratio: {1-num_remaining_tasks/num_total_tasks:.3f}.\n    Need to solve {num_remaining_tasks} / {num_total_tasks} placement tasks for PDAG #{pdag.name}")
         if len(io_budgets_list) == 0:
             return
+        io_budgets_list = self._sample_openevolve_eval_budgets(io_budgets_list)
         io_to_assign, io_to_cost = self.ilp_worker.get_qbp(pdag, io_budgets_list)
+        if getattr(self.params, "openevolve_evaluating_candidate", False):
+            self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
         qbp_io_to_assign = self._assign_biject(io_to_assign, bj_qbp, bj_label)
         bj_qbp.append_io_results(io_to_cost, qbp_io_to_assign)
         
@@ -208,12 +234,15 @@ class QBPManager:
                         })
         
         num_remain_tasks = len(io_budgets_list)
-        print(f"  Bypass QBP Manager: Need to solve {num_remain_tasks} bypass ILP tasks for PDAG #{pdag.name}")
+        print(f"  Bypass QBP Manager: Need to solve {num_remain_tasks} bypass placement tasks for PDAG #{pdag.name}")
         
         if len(io_budgets_list) == 0:
             return
+        io_budgets_list = self._sample_openevolve_eval_budgets(io_budgets_list)
         
         bypass_io_to_assign, _ = self.ilp_worker.get_qbp(bypass_pdag, io_budgets_list)
+        if getattr(self.params, "openevolve_evaluating_candidate", False):
+            self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
         main_io_to_assign = self.get_qbp_assign(main_pdag)
         dag_io_to_assign, dag_io_to_cost = self._merge_bypass_results(pdag, fork_v, maino_v, main_io_to_assign, bypass_io_to_assign)
         dag_qbp_io_to_assign = self._assign_biject(dag_io_to_assign, dag_qbp, dag_label)
@@ -223,6 +252,26 @@ class QBPManager:
         bj_qbp, bj_label = self._get_qbp_bj(pdag)
         qbp_io_to_assign = self._assign_biject(io_to_assign, bj_qbp, bj_label)
         bj_qbp.append_io_results(io_to_cost, qbp_io_to_assign)
+
+    def _sample_openevolve_eval_budgets(self, io_budgets_list: list[dict]) -> list[dict]:
+        if not getattr(self.params, "openevolve_evaluating_candidate", False):
+            return io_budgets_list
+        suite = getattr(self.params, "openevolve_eval_suite", "polybert-sampled")
+        if suite == "polybert-full":
+            return io_budgets_list
+        if suite == "toy":
+            return io_budgets_list[: min(len(io_budgets_list), 8)]
+        keep_levels = {
+            1,
+            max(1, self.params.bts_lb + 1),
+            max(1, self.params.lvl_ub // 2),
+            self.params.lvl_ub,
+        }
+        sampled = [
+            budget for budget in io_budgets_list
+            if int(budget.get("out_lvl", -1)) < 0 or int(budget.get("out_lvl", -1)) in keep_levels
+        ]
+        return sampled or io_budgets_list[:1]
     
     def get_qbp_cost(self, pdag_name: str) -> dict:
         assert pdag_name in self.pdag_name_to_qbp, f"QBP for PDAG #{pdag_name} not found in manager."
@@ -237,5 +286,3 @@ class QBPManager:
         rev_qbp = QBP(pdag)
         rev_io_to_assign = self._assign_biject(io_to_assign, rev_qbp, rev_bj_label)
         return rev_io_to_assign
-        
-        

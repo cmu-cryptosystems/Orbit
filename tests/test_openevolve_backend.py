@@ -25,6 +25,7 @@ from scripts.optimizer.orbit.openevolve_backend import (
     tdag_from_context,
     valid_transition,
 )
+from scripts.optimizer.orbit.qbp_manager import QBPManager
 from scripts.optimizer.orbit.orbit_core import orbit_core
 from scripts.params.params import Params
 from scripts.tdag.tdag import Tdag
@@ -688,7 +689,9 @@ def test_partition_fallback_selected_candidate_scores_below_valid(
         diagnostics["fallback_selected_budgets"] = 1
         diagnostics["candidate_improved_budgets"] = 0
         diagnostics["costs"] = [10.0]
+        diagnostics["candidate_costs"] = [30.0]
         diagnostics["assignments"] = []
+        diagnostics["selected_source_counts"] = {"seed_fallback": 1}
         return {(-1, 40): {(16, 40): object()}}, {(-1, 40): {(16, 40): 10.0}}
 
     monkeypatch.setattr(oe_backend, "solve_budget_batch", fake_solve_budget_batch)
@@ -706,8 +709,35 @@ def test_partition_fallback_selected_candidate_scores_below_valid(
     result = evaluate_candidate_program(context_path, program_path)
 
     assert result["metrics"]["fallback_selected_budgets"] == 1.0
+    assert result["metrics"]["candidate_only_avg_latency_usec"] == 30.0
+    assert json.loads(result["artifacts"]["selected_source_counts"]) == {"seed_fallback": 1}
     assert result["metrics"]["combined_score"] < 1.0
     assert result["metrics"]["combined_score"] > 0.0
+
+
+def test_polybert_sampled_budgets_keep_bypass_and_cost_extremes(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    params.openevolve_evaluating_candidate = True
+    params.openevolve_eval_suite = "polybert-sampled"
+    manager = QBPManager(params, None)
+    budgets = []
+    for idx in range(120):
+        budget = {
+            "in_lvl": idx % 4,
+            "in_scl": 20 + idx,
+            "out_lvl": (idx % params.lvl_ub) + 1,
+            "main_dag_size": idx,
+            "main_qbp_cost": {(1, 20): float(idx)},
+        }
+        if idx % 17 == 0:
+            budget["maino_v"] = f"fork_{idx}"
+        budgets.append(budget)
+
+    sampled = manager._sample_openevolve_eval_budgets(budgets)
+
+    assert 0 < len(sampled) <= 48
+    assert any("maino_v" in budget for budget in sampled)
+    assert max(min(budget["main_qbp_cost"].values()) for budget in sampled) == 119.0
 
 
 def test_evaluator_uses_quality_as_partial_validity_tiebreaker(

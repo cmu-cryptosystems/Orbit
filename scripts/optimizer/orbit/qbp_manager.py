@@ -263,6 +263,7 @@ class QBPManager:
             return io_budgets_list[: min(len(io_budgets_list), 8)]
         if len(io_budgets_list) <= 64:
             return io_budgets_list
+        max_sample = 48
         keep_levels = {
             1,
             max(1, self.params.bts_lb + 1),
@@ -273,6 +274,8 @@ class QBPManager:
         seen = set()
 
         def add(budget: dict) -> None:
+            if len(sampled) >= max_sample:
+                return
             key = (
                 int(budget.get("in_lvl", -1)),
                 int(budget.get("in_scl", -1)),
@@ -284,33 +287,66 @@ class QBPManager:
             seen.add(key)
             sampled.append(budget)
 
-        by_level: dict[int, list[dict]] = {}
-        for budget in io_budgets_list:
-            out_lvl = int(budget.get("out_lvl", -1))
-            if out_lvl < 0 or out_lvl in keep_levels or "maino_v" in budget:
-                add(budget)
-            by_level.setdefault(out_lvl, []).append(budget)
+        def budget_cost(budget: dict) -> float:
+            costs = budget.get("main_qbp_cost")
+            if isinstance(costs, dict) and costs:
+                return float(min(costs.values()))
+            return 0.0
 
-        for out_lvl, budgets in sorted(by_level.items()):
-            if out_lvl < 0:
-                continue
+        def budget_size(budget: dict) -> float:
+            try:
+                return float(budget.get("main_dag_size", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def add_quantiles(budgets: list[dict], key_fn, limit: int = 5) -> None:
+            if not budgets:
+                return
             ordered = sorted(
                 budgets,
                 key=lambda item: (
-                    min(item.get("main_qbp_cost", {0: 0}).values())
-                    if isinstance(item.get("main_qbp_cost"), dict) and item.get("main_qbp_cost")
-                    else 0,
+                    key_fn(item),
+                    int(item.get("out_lvl", -1)),
                     int(item.get("in_lvl", -1)),
                     int(item.get("in_scl", -1)),
+                    str(item.get("maino_v", "")),
                 ),
             )
-            for idx in {0, len(ordered) // 2, len(ordered) - 1}:
+            indexes = {0, len(ordered) // 4, len(ordered) // 2, (3 * len(ordered)) // 4, len(ordered) - 1}
+            for idx in sorted(indexes)[:limit]:
                 if 0 <= idx < len(ordered):
                     add(ordered[idx])
-            if len(sampled) >= 32:
+
+        by_level: dict[int, list[dict]] = {}
+        bypass_budgets = []
+        for budget in io_budgets_list:
+            out_lvl = int(budget.get("out_lvl", -1))
+            if out_lvl < 0:
+                add(budget)
+            if "maino_v" in budget:
+                bypass_budgets.append(budget)
+            by_level.setdefault(out_lvl, []).append(budget)
+
+        add_quantiles(bypass_budgets, budget_cost, limit=8)
+        add_quantiles(bypass_budgets, budget_size, limit=8)
+        for out_lvl, budgets in sorted(by_level.items()):
+            if out_lvl < 0:
+                continue
+            if out_lvl in keep_levels:
+                add_quantiles(budgets, budget_cost, limit=5)
+                add_quantiles(budgets, budget_size, limit=3)
+            else:
+                add_quantiles(budgets, budget_cost, limit=3)
+            if len(sampled) >= max_sample:
                 break
-        if len(sampled) > 32:
-            sampled = sampled[:32]
+
+        if len(sampled) < max_sample:
+            add_quantiles(io_budgets_list, budget_cost, limit=8)
+            add_quantiles(io_budgets_list, budget_size, limit=8)
+        if len(sampled) < max_sample:
+            stride = max(1, len(io_budgets_list) // max_sample)
+            for budget in io_budgets_list[::stride]:
+                add(budget)
         return sampled or io_budgets_list[:1]
     
     def get_qbp_cost(self, pdag_name: str) -> dict:

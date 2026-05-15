@@ -670,6 +670,14 @@ def evaluate_compile_candidate_program(
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": result["diagnostics"].get("candidate_invalid_reasons", {})}
                 ),
+                "candidate_only_avg_latency_usec": (
+                    f"{sum(result['diagnostics'].get('candidate_costs', [])) / len(result['diagnostics'].get('candidate_costs', [])):.3f}"
+                    if result["diagnostics"].get("candidate_costs")
+                    else "none"
+                ),
+                "selected_source_counts": json.dumps(
+                    result["diagnostics"].get("selected_source_counts", {}), sort_keys=True
+                ),
                 "policy_summary": _compact_policy_summary(hints),
                 "unmatched_resilience_targets": json.dumps(
                     _profile_unmatched_targets(context), sort_keys=True
@@ -994,10 +1002,17 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         "candidate_solved_budgets": 0,
         "fallback_selected_budgets": 0,
         "candidate_invalid_reasons": {},
+        "candidate_costs": [],
+        "selected_source_counts": {},
     }
     for item in getattr(qbp_manager, "openevolve_diagnostics", []):
         for key in ("requested_budgets", "solved_budgets", "candidate_solved_budgets", "fallback_selected_budgets"):
             totals[key] += int(item.get(key, 0))
+        totals["candidate_costs"].extend(item.get("candidate_costs", []))
+        for source, count in item.get("selected_source_counts", {}).items():
+            totals["selected_source_counts"][source] = (
+                totals["selected_source_counts"].get(source, 0) + int(count)
+            )
         for reason, count in item.get("candidate_invalid_reasons", {}).items():
             totals["candidate_invalid_reasons"][reason] = totals["candidate_invalid_reasons"].get(reason, 0) + int(count)
     return totals
@@ -1267,6 +1282,7 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         )
         assignments = list(diagnostics.get("assignments", []))
         costs = list(diagnostics.get("costs", []))
+        candidate_costs = list(diagnostics.get("candidate_costs", []))
         solved = int(diagnostics.get("solved_budgets", len(costs)))
         candidate_solved = int(diagnostics.get("candidate_solved_budgets", solved))
         fallback_selected = int(diagnostics.get("fallback_selected_budgets", 0))
@@ -1275,6 +1291,9 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         effective_validity = solved / requested
         validity = candidate_solved / requested
         avg_cost = sum(costs) / solved if costs else float("inf")
+        candidate_avg_cost = (
+            sum(candidate_costs) / len(candidate_costs) if candidate_costs else float("inf")
+        )
         counts = _aggregate_counts(assignments)
         profile_risk = _profile_risk(assignments, tdag.params)
         reference = _reference_metrics(tdag, io_budgets, le)
@@ -1320,6 +1339,9 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "effective_validity": float(effective_validity),
                 "latency_score": float(latency_score),
                 "avg_latency_usec": float(avg_cost if costs else 0.0),
+                "candidate_only_avg_latency_usec": float(
+                    candidate_avg_cost if candidate_costs else 0.0
+                ),
                 "bootstrap_count": float(counts["bootstrap"]),
                 "rescale_count": float(counts["rescale"]),
                 "profile_risk": float(profile_risk),
@@ -1344,10 +1366,16 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 ),
                 "best_latency_usec": str(min(costs) if costs else "none"),
                 "avg_latency_usec": f"{avg_cost:.3f}" if costs else "none",
+                "candidate_only_avg_latency_usec": (
+                    f"{candidate_avg_cost:.3f}" if candidate_costs else "none"
+                ),
                 "bootstrap_count": str(counts["bootstrap"]),
                 "rescale_count": str(counts["rescale"]),
                 "bootstrap_delta": str(counts["bootstrap"] - reference["bootstrap_count"]),
                 "rescale_delta": str(counts["rescale"] - reference["rescale_count"]),
+                "selected_source_counts": json.dumps(
+                    diagnostics.get("selected_source_counts", {}), sort_keys=True
+                ),
                 "invalid_reasons": _compact_invalid_reasons(diagnostics),
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": diagnostics.get("candidate_invalid_reasons", {})}
@@ -1400,7 +1428,9 @@ def solve_budget_batch(
         diagnostics["fallback_selected_budgets"] = 0
         diagnostics["candidate_improved_budgets"] = 0
         diagnostics["costs"] = []
+        diagnostics["candidate_costs"] = []
         diagnostics["assignments"] = []
+        diagnostics["selected_source_counts"] = {}
     for io_budget in io_budgets_list:
         attempts: list[_BudgetAttempt] = []
         last_error = None
@@ -1445,10 +1475,13 @@ def solve_budget_batch(
             diagnostics["assignments"].append(best_attempt.assign)
             if candidate_attempt is not None:
                 diagnostics["candidate_solved_budgets"] += 1
+                diagnostics["candidate_costs"].append(candidate_attempt.cost)
             if fallback_attempt is not None:
                 diagnostics["fallback_solved_budgets"] += 1
             if best_attempt.source.startswith("seed_fallback"):
                 diagnostics["fallback_selected_budgets"] += 1
+            source_counts = diagnostics["selected_source_counts"]
+            source_counts[best_attempt.source] = source_counts.get(best_attempt.source, 0) + 1
             if (
                 candidate_attempt is not None
                 and fallback_attempt is not None

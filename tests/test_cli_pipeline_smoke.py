@@ -304,4 +304,4 @@ def test_optimizer_cli_openevolve_resilience_smoke(
     assert baseline_output_path.is_file()
     openevolve_bootstraps = len(re.findall(r'"earth\.bootstrap"', output_path.read_text()))
     baseline_bootstraps = len(re.findall(r'"earth\.bootstrap"', baseline_output_path.read_text()))
-    assert openevolve_bootstraps >= baseline_bootstraps
+    assert openevolve_bootstraps <= baseline_bootstraps

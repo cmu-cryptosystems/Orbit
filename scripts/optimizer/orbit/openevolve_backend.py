@@ -339,7 +339,7 @@ def place(context):
     """
     builder = PlacementBuilder(context)
     return builder.low_scale_frontier(
-        allow_seed_fallback=True,
+        allow_seed_fallback=False,
         max_scale_candidates=10,
         bootstrap_penalty=1000000000.0,
         rescale_penalty=0.0,
@@ -1834,6 +1834,10 @@ def _max_scale(params: Params) -> int:
 
 
 def _default_policy_hints() -> dict[str, Any]:
+    return _low_scale_frontier_policy()
+
+
+def _waterline_seed_policy() -> dict[str, Any]:
     return {
         "strategy": "waterline_seed",
         "prefer_level_preservation": True,
@@ -1841,6 +1845,25 @@ def _default_policy_hints() -> dict[str, Any]:
         "allow_seed_fallback": None,
         "refresh_fanout_at_level_floor": False,
         "max_scale_candidates": 32,
+        "bootstrap_penalty": 1_000_000_000.0,
+        "rescale_penalty": 0.0,
+        "level_drop_penalty": 20_000_000.0,
+        "min_internal_level": None,
+        "scale_penalty": 0.0,
+        "preferred_node_levels": {},
+        "preferred_node_scales": {},
+        "preferred_edge_scales": {},
+    }
+
+
+def _low_scale_frontier_policy() -> dict[str, Any]:
+    return {
+        "strategy": "level_preserving",
+        "prefer_level_preservation": True,
+        "allow_bootstrap": False,
+        "allow_seed_fallback": False,
+        "refresh_fanout_at_level_floor": True,
+        "max_scale_candidates": 10,
         "bootstrap_penalty": 1_000_000_000.0,
         "rescale_penalty": 0.0,
         "level_drop_penalty": 20_000_000.0,
@@ -2022,6 +2045,8 @@ def _incoming_scale_options(
     node_input_lb = max(params.scale_lower_bound(v, tdag.nodes[v], "in"), preferred_scale or 0)
     max_scale = int(policy["max_scale"])
     if tdag.nodes[v]["op"] != "mul":
+        if any(tdag.nodes[u]["op"] == "constant" for u in preds):
+            node_input_lb = max(node_input_lb, params.Csw)
         bases = [node_input_lb, preferred_scale, params.Sw, params.Csw, params.Sf]
         for u in preds:
             bases.append(edge_scale_hints.get(_edge_key(u, v)))
@@ -2684,7 +2709,7 @@ class PlacementBuilder:
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 
     def waterline_seed(self, **overrides: Any) -> dict[str, Any]:
-        policy = _default_policy_hints()
+        policy = _waterline_seed_policy()
         policy.update(overrides)
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 
@@ -2761,25 +2786,7 @@ class PlacementBuilder:
 
     def low_scale_frontier(self, **overrides: Any) -> dict[str, Any]:
         """Policy that keeps partition boundary scales low when CKKS permits it."""
-        policy = self.level_preserving()["policy"]
-        policy.update(
-            {
-                "strategy": "level_preserving",
-                "prefer_level_preservation": True,
-                "allow_bootstrap": False,
-                "allow_seed_fallback": True,
-                "refresh_fanout_at_level_floor": True,
-                "max_scale_candidates": 10,
-                "bootstrap_penalty": 1_000_000_000.0,
-                "rescale_penalty": 0.0,
-                "level_drop_penalty": 20_000_000.0,
-                "min_internal_level": None,
-                "scale_penalty": 0.0,
-                "preferred_node_levels": {},
-                "preferred_node_scales": {},
-                "preferred_edge_scales": {},
-            }
-        )
+        policy = _low_scale_frontier_policy()
         policy.update(overrides)
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 

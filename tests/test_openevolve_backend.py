@@ -314,8 +314,8 @@ def test_level_preserving_fallback_keeps_batch_complete_and_tracks_improvement(
     assert diagnostics["candidate_solved_budgets"] == 1
     assert diagnostics["fallback_solved_budgets"] == 1
     assert diagnostics["fallback_selected_budgets"] == 0
-    assert diagnostics["candidate_improved_budgets"] == 1
-    assert min(next(iter(io_to_cost.values())).values()) < min(
+    assert diagnostics["candidate_improved_budgets"] == 0
+    assert min(next(iter(io_to_cost.values())).values()) == min(
         next(iter(default_cost.values())).values()
     )
 
@@ -332,7 +332,10 @@ def test_seed_fallback_does_not_reward_invalid_candidate(
         json.dumps(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)),
         encoding="utf-8",
     )
-    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    seed_program.write_text(
+        "def place(context):\n    return {'strategy': 'waterline_seed'}\n",
+        encoding="utf-8",
+    )
     invalid_program.write_text(
         "def place(context):\n"
         "    return {\n"
@@ -583,6 +586,7 @@ def test_builder_low_scale_frontier_policy_is_compile_seed(toy_cost_json: str, t
     assert hints["refresh_fanout_at_level_floor"] is True
     assert hints["max_scale_candidates"] == 10
     assert hints["scale_penalty"] == 0.0
+    assert hints["allow_seed_fallback"] is False
     assert not hints.get("portfolio")
 
 
@@ -719,7 +723,10 @@ def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
         {"in_lvl": 1, "in_scl": 9999},
     ]
     context_path.write_text(json.dumps(build_context(graph, budgets, params)), encoding="utf-8")
-    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    seed_program.write_text(
+        "def place(context):\n    return {'strategy': 'waterline_seed'}\n",
+        encoding="utf-8",
+    )
     evolved_program.write_text(
         "def place(context):\n"
         "    return {'strategy': 'level_preserving', 'refresh_fanout_at_level_floor': True}\n",
@@ -872,7 +879,7 @@ def test_mocked_openevolve_runtime_runs_once_per_budget_batch(
     class FakeResult:
         best_code = (
             "def place(context):\n"
-            "    return {'strategy': 'level_preserving', 'refresh_fanout_at_level_floor': True}\n"
+            "    return {'strategy': 'waterline_seed'}\n"
         )
 
     def fake_run_evolution(**kwargs):

@@ -261,16 +261,56 @@ class QBPManager:
             return io_budgets_list
         if suite == "toy":
             return io_budgets_list[: min(len(io_budgets_list), 8)]
+        if len(io_budgets_list) <= 64:
+            return io_budgets_list
         keep_levels = {
             1,
             max(1, self.params.bts_lb + 1),
             max(1, self.params.lvl_ub // 2),
             self.params.lvl_ub,
         }
-        sampled = [
-            budget for budget in io_budgets_list
-            if int(budget.get("out_lvl", -1)) < 0 or int(budget.get("out_lvl", -1)) in keep_levels
-        ]
+        sampled = []
+        seen = set()
+
+        def add(budget: dict) -> None:
+            key = (
+                int(budget.get("in_lvl", -1)),
+                int(budget.get("in_scl", -1)),
+                int(budget.get("out_lvl", -1)),
+                str(budget.get("maino_v", "")),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            sampled.append(budget)
+
+        by_level: dict[int, list[dict]] = {}
+        for budget in io_budgets_list:
+            out_lvl = int(budget.get("out_lvl", -1))
+            if out_lvl < 0 or out_lvl in keep_levels or "maino_v" in budget:
+                add(budget)
+            by_level.setdefault(out_lvl, []).append(budget)
+
+        for out_lvl, budgets in sorted(by_level.items()):
+            if out_lvl < 0:
+                continue
+            ordered = sorted(
+                budgets,
+                key=lambda item: (
+                    min(item.get("main_qbp_cost", {0: 0}).values())
+                    if isinstance(item.get("main_qbp_cost"), dict) and item.get("main_qbp_cost")
+                    else 0,
+                    int(item.get("in_lvl", -1)),
+                    int(item.get("in_scl", -1)),
+                ),
+            )
+            for idx in {0, len(ordered) // 2, len(ordered) - 1}:
+                if 0 <= idx < len(ordered):
+                    add(ordered[idx])
+            if len(sampled) >= 32:
+                break
+        if len(sampled) > 32:
+            sampled = sampled[:32]
         return sampled or io_budgets_list[:1]
     
     def get_qbp_cost(self, pdag_name: str) -> dict:

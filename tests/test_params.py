@@ -16,13 +16,20 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.placement_backend == "openevolve"
     assert p.ilp_solver == "pulp"
     assert p.openevolve_provider == "gemini"
-    assert p.openevolve_model == "gemini-3.1-pro-preview"
+    assert p.openevolve_model == "gemini-3.1-flash-lite"
     assert p.openevolve_api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert p.openevolve_api_key_env == "OPENAI_API_KEY"
     assert p.openevolve_harness == "compile"
     assert p.openevolve_eval_suite == "polybert-sampled"
     assert p.openevolve_reference_json is None
     assert p.openevolve_finalists == 3
+    assert p.openevolve_llm_timeout_sec == 180
+    assert p.openevolve_llm_retries == 1
+    assert p.openevolve_llm_retry_delay_sec == 2
+    assert p.openevolve_evaluator_timeout_sec == 180
+    assert p.openevolve_parallel_evaluations == 1
+    assert p.openevolve_checkpoint_interval == 5
+    assert p.openevolve_fail_open is True
     assert p.mode == "compile"
 
 

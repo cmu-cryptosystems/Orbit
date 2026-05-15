@@ -2,8 +2,9 @@ import json
 import numpy as np
 from ..resilience import ResilienceProfile
 
-DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_OPENEVOLVE_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS = 2048
 
 DEFAULT_RESILIENCE_ERROR_MODEL = {
     "input_error_abs": 0.0,
@@ -56,6 +57,13 @@ class Params:
         openevolve_eval_suite="polybert-sampled",
         openevolve_reference_json=None,
         openevolve_finalists=3,
+        openevolve_llm_timeout_sec=180,
+        openevolve_llm_retries=1,
+        openevolve_llm_retry_delay_sec=2,
+        openevolve_evaluator_timeout_sec=180,
+        openevolve_parallel_evaluations=1,
+        openevolve_checkpoint_interval=5,
+        openevolve_fail_open=True,
     ):
         if le_json is None:
             return # should be filled later
@@ -170,6 +178,62 @@ class Params:
             openevolve_finalists
             if openevolve_finalists is not None
             else json_parsed.get("openevolve_finalists", 3)
+        )
+        self.openevolve_llm_timeout_sec = max(
+            1,
+            int(
+                openevolve_llm_timeout_sec
+                if openevolve_llm_timeout_sec is not None
+                else json_parsed.get("openevolve_llm_timeout_sec", 180)
+            ),
+        )
+        self.openevolve_llm_retries = max(
+            0,
+            int(
+                openevolve_llm_retries
+                if openevolve_llm_retries is not None
+                else json_parsed.get("openevolve_llm_retries", 1)
+            ),
+        )
+        self.openevolve_llm_retry_delay_sec = max(
+            0,
+            int(
+                openevolve_llm_retry_delay_sec
+                if openevolve_llm_retry_delay_sec is not None
+                else json_parsed.get("openevolve_llm_retry_delay_sec", 2)
+            ),
+        )
+        self.openevolve_evaluator_timeout_sec = max(
+            1,
+            int(
+                openevolve_evaluator_timeout_sec
+                if openevolve_evaluator_timeout_sec is not None
+                else json_parsed.get("openevolve_evaluator_timeout_sec", 180)
+            ),
+        )
+        self.openevolve_parallel_evaluations = max(
+            1,
+            int(
+                openevolve_parallel_evaluations
+                if openevolve_parallel_evaluations is not None
+                else json_parsed.get("openevolve_parallel_evaluations", 1)
+            ),
+        )
+        self.openevolve_checkpoint_interval = max(
+            1,
+            int(
+                openevolve_checkpoint_interval
+                if openevolve_checkpoint_interval is not None
+                else json_parsed.get("openevolve_checkpoint_interval", 5)
+            ),
+        )
+        self.openevolve_llm_max_tokens = int(json_parsed.get(
+            "openevolve_llm_max_tokens", DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS
+        ))
+        self.openevolve_fail_open = bool(
+            openevolve_fail_open
+            if openevolve_fail_open is not None
+            else json_parsed.get("openevolve_fail_open", True)
         )
         self.openevolve_compile_hints = None
         self.openevolve_evaluating_candidate = False

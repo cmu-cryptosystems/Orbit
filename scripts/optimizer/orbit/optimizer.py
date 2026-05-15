@@ -151,7 +151,7 @@ def main():
     parser.add_argument('--openevolve-provider', type=str, default='gemini',
                         choices=['gemini', 'openai', 'custom'],
                         help='OpenEvolve LLM provider used when --openevolve-config is not supplied')
-    parser.add_argument('--openevolve-model', type=str, default='gemini-3.1-pro-preview',
+    parser.add_argument('--openevolve-model', type=str, default='gemini-3.1-flash-lite',
                         help='OpenEvolve LLM model used for generated config')
     parser.add_argument('--openevolve-api-base', type=str, default=None,
                         help='OpenAI-compatible API base for OpenEvolve generated config')
@@ -167,6 +167,18 @@ def main():
                         help='Optional precomputed reference metrics; never triggers an ILP solve')
     parser.add_argument('--openevolve-finalists', type=int, default=3,
                         help='Number of top candidates to rerun on full OpenEvolve bundle')
+    parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
+    parser.add_argument('--openevolve-llm-retries', type=int, default=1)
+    parser.add_argument('--openevolve-llm-retry-delay-sec', type=int, default=2)
+    parser.add_argument('--openevolve-evaluator-timeout-sec', type=int, default=180)
+    parser.add_argument('--openevolve-parallel-evaluations', type=int, default=1)
+    parser.add_argument('--openevolve-checkpoint-interval', type=int, default=5)
+    parser.add_argument(
+        '--openevolve-fail-open',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Return the best recovered/initial candidate if OpenEvolve runtime fails',
+    )
     parser.add_argument(
         '--resilience-profile',
         type=str,
@@ -238,7 +250,14 @@ def main():
                     openevolve_harness=args.openevolve_harness,
                     openevolve_eval_suite=args.openevolve_eval_suite,
                     openevolve_reference_json=args.openevolve_reference_json,
-                    openevolve_finalists=args.openevolve_finalists)
+                    openevolve_finalists=args.openevolve_finalists,
+                    openevolve_llm_timeout_sec=args.openevolve_llm_timeout_sec,
+                    openevolve_llm_retries=args.openevolve_llm_retries,
+                    openevolve_llm_retry_delay_sec=args.openevolve_llm_retry_delay_sec,
+                    openevolve_evaluator_timeout_sec=args.openevolve_evaluator_timeout_sec,
+                    openevolve_parallel_evaluations=args.openevolve_parallel_evaluations,
+                    openevolve_checkpoint_interval=args.openevolve_checkpoint_interval,
+                    openevolve_fail_open=args.openevolve_fail_open)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

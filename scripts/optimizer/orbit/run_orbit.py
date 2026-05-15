@@ -23,7 +23,7 @@ if __name__ == "__main__":
     parser.add_argument('--openevolve-seed', type=int, default=42)
     parser.add_argument('--openevolve-keep-workdir', action='store_true')
     parser.add_argument('--openevolve-provider', choices=['gemini', 'openai', 'custom'], default='gemini')
-    parser.add_argument('--openevolve-model', type=str, default='gemini-3.1-pro-preview')
+    parser.add_argument('--openevolve-model', type=str, default='gemini-3.1-flash-lite')
     parser.add_argument('--openevolve-api-base', type=str, default=None)
     parser.add_argument('--openevolve-api-key-env', type=str, default='OPENAI_API_KEY')
     parser.add_argument('--openevolve-harness', choices=['compile', 'partition'], default='compile')
@@ -34,6 +34,13 @@ if __name__ == "__main__":
     )
     parser.add_argument('--openevolve-reference-json', type=str, default=None)
     parser.add_argument('--openevolve-finalists', type=int, default=3)
+    parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
+    parser.add_argument('--openevolve-llm-retries', type=int, default=1)
+    parser.add_argument('--openevolve-llm-retry-delay-sec', type=int, default=2)
+    parser.add_argument('--openevolve-evaluator-timeout-sec', type=int, default=180)
+    parser.add_argument('--openevolve-parallel-evaluations', type=int, default=1)
+    parser.add_argument('--openevolve-checkpoint-interval', type=int, default=5)
+    parser.add_argument('--openevolve-fail-open', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--resilience-profile', type=str, default=None)
     parser.add_argument('--resilience-mode', choices=['waterline', 'error-state'], default='waterline')
     parser.add_argument('--allow-empty-resilience-match', action='store_true')
@@ -92,6 +99,13 @@ if __name__ == "__main__":
         cmds += ["--openevolve-harness", args.openevolve_harness]
         cmds += ["--openevolve-eval-suite", args.openevolve_eval_suite]
         cmds += ["--openevolve-finalists", str(args.openevolve_finalists)]
+        cmds += ["--openevolve-llm-timeout-sec", str(args.openevolve_llm_timeout_sec)]
+        cmds += ["--openevolve-llm-retries", str(args.openevolve_llm_retries)]
+        cmds += ["--openevolve-llm-retry-delay-sec", str(args.openevolve_llm_retry_delay_sec)]
+        cmds += ["--openevolve-evaluator-timeout-sec", str(args.openevolve_evaluator_timeout_sec)]
+        cmds += ["--openevolve-parallel-evaluations", str(args.openevolve_parallel_evaluations)]
+        cmds += ["--openevolve-checkpoint-interval", str(args.openevolve_checkpoint_interval)]
+        cmds.append("--openevolve-fail-open" if args.openevolve_fail_open else "--no-openevolve-fail-open")
         if args.openevolve_reference_json:
             cmds += ["--openevolve-reference-json", args.openevolve_reference_json]
         if args.openevolve_api_base:

@@ -77,9 +77,12 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-finalists <n>`: Number of candidates reserved for full-bundle finalist scoring metadata.
 - `--openevolve-seed <n>`: Seed passed into the generated OpenEvolve context and config override.
 - `--openevolve-provider <gemini|openai|custom>`: Provider for generated OpenEvolve config. Default is `gemini`.
-- `--openevolve-model <name>`: Model for generated OpenEvolve config. Default is `gemini-3.1-pro-preview`.
+- `--openevolve-model <name>`: Model for generated OpenEvolve config. Default is `gemini-3.1-flash-lite`.
 - `--openevolve-api-base <url>`: OpenAI-compatible API base. Required for `--openevolve-provider custom`.
 - `--openevolve-api-key-env <name>`: API key environment variable. Default is `OPENAI_API_KEY`; Gemini also falls back to `GEMINI_API_KEY`.
+- `--openevolve-llm-timeout-sec <n>`, `--openevolve-llm-retries <n>`, `--openevolve-llm-retry-delay-sec <n>`: Runtime retry controls for generated OpenEvolve configs.
+- `--openevolve-evaluator-timeout-sec <n>`, `--openevolve-parallel-evaluations <n>`, `--openevolve-checkpoint-interval <n>`: Evaluator and checkpoint controls for positive-iteration searches.
+- `--openevolve-fail-open` / `--no-openevolve-fail-open`: Return the best recovered or initial validated candidate if OpenEvolve runtime fails. Enabled by default.
 - `--openevolve-keep-workdir`: Keep temporary OpenEvolve workspaces.
 - `--resilience-profile <path>`: ckks-robustness-profiler 0.8.0 profile, generated Orbit constraint sidecar, or Orbit-native constraints JSON.
 - `--resilience-constraint-policy <relax-only|hard-tau>`: Use profile constraints as relaxed waterline guidance or hard local scale lower bounds.
@@ -167,7 +170,7 @@ python3 -m scripts.optimizer.orbit.optimizer \
   --waterscale 40 \
   --placement-backend openevolve \
   --openevolve-iterations 10 \
-  --openevolve-model gemini-3.1-pro-preview \
+  --openevolve-model gemini-3.1-flash-lite \
   --no-compress \
   --no-partition
 ```

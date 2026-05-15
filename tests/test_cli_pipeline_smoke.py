@@ -65,8 +65,10 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
     assert "--openevolve-iterations" in cmd
     assert "--openevolve-provider" in cmd
     assert "--openevolve-model" in cmd
-    assert "gemini-3.1-pro-preview" in cmd
+    assert "gemini-3.1-flash-lite" in cmd
     assert "--openevolve-api-key-env" in cmd
+    assert "--openevolve-llm-timeout-sec" in cmd
+    assert "--openevolve-fail-open" in cmd
     assert "--nobypass" in cmd
     assert "--enable-reqbp" in cmd
     assert "--no-compress" in cmd
@@ -197,6 +199,13 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["openevolve_provider"] == "gemini"
     assert init["openevolve_model"] == "gemini-3.1-pro-preview"
     assert init["openevolve_api_key_env"] == "GEMINI_API_KEY"
+    assert init["openevolve_llm_timeout_sec"] == 180
+    assert init["openevolve_llm_retries"] == 1
+    assert init["openevolve_llm_retry_delay_sec"] == 2
+    assert init["openevolve_evaluator_timeout_sec"] == 180
+    assert init["openevolve_parallel_evaluations"] == 1
+    assert init["openevolve_checkpoint_interval"] == 5
+    assert init["openevolve_fail_open"] is True
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

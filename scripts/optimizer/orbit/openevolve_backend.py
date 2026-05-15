@@ -106,30 +106,36 @@ class OpenEvolvePlacementWorker:
         context_path = root / "context.json"
         initial_path = root / "initial_program.py"
         evaluator_path = root / "evaluator.py"
-        context_path.write_text(
-            json.dumps(build_context(pdag, io_budgets_list, self.params), indent=2, sort_keys=True)
-            + "\n",
-            encoding="utf-8",
-        )
+        context = build_context(pdag, io_budgets_list, self.params)
+        context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         initial_path.write_text(_initial_program_source(), encoding="utf-8")
         evaluator_path.write_text(_evaluator_source(context_path), encoding="utf-8")
+        initial_hints = _load_candidate_hints(initial_path, context)
 
         output_dir = root / "openevolve_output"
-        with self._openevolve_runtime_env():
-            result = run_evolution(
-                initial_program=initial_path,
-                evaluator=evaluator_path,
-                config=self._openevolve_config_arg(),
-                iterations=self.params.openevolve_iterations,
-                output_dir=str(output_dir),
-                cleanup=False,
-            )
+        try:
+            with self._openevolve_runtime_env():
+                result = run_evolution(
+                    initial_program=initial_path,
+                    evaluator=evaluator_path,
+                    config=self._openevolve_config_arg(),
+                    iterations=self.params.openevolve_iterations,
+                    output_dir=str(output_dir),
+                    cleanup=False,
+                )
+        except Exception as exc:
+            if not self.params.openevolve_fail_open:
+                raise
+            _write_recovery_summary(root, exc)
+            return _recover_candidate_hints(output_dir, context, initial_hints)
         best_program = root / "best_program.py"
         best_program.write_text(result.best_code, encoding="utf-8")
         try:
-            return _load_candidate_hints(best_program, build_context(pdag, io_budgets_list, self.params))
+            return _load_candidate_hints(best_program, context)
         except Exception:
-            return {}
+            if not self.params.openevolve_fail_open:
+                return {}
+            return _recover_candidate_hints(output_dir, context, initial_hints, result.best_code)
         finally:
             if not self.params.openevolve_keep_workdir and self.params.openevolve_output_dir is None:
                 shutil.rmtree(root, ignore_errors=True)
@@ -157,10 +163,20 @@ class OpenEvolvePlacementWorker:
         model = self.params.openevolve_model
         config.random_seed = self.params.openevolve_seed
         config.llm.api_base = api_base
+        config.llm.timeout = self.params.openevolve_llm_timeout_sec
+        config.llm.retries = self.params.openevolve_llm_retries
+        config.llm.retry_delay = self.params.openevolve_llm_retry_delay_sec
+        config.llm.max_tokens = max(256, min(4096, int(self.params.openevolve_llm_max_tokens)))
+        config.llm.temperature = 0.3
         config.llm.models = [
             LLMModelConfig(
                 name=model,
                 api_base=api_base,
+                timeout=config.llm.timeout,
+                retries=config.llm.retries,
+                retry_delay=config.llm.retry_delay,
+                max_tokens=config.llm.max_tokens,
+                temperature=config.llm.temperature,
                 random_seed=self.params.openevolve_seed,
             )
         ]
@@ -168,6 +184,11 @@ class OpenEvolvePlacementWorker:
             LLMModelConfig(
                 name=model,
                 api_base=api_base,
+                timeout=config.llm.timeout,
+                retries=config.llm.retries,
+                retry_delay=config.llm.retry_delay,
+                max_tokens=config.llm.max_tokens,
+                temperature=config.llm.temperature,
                 random_seed=self.params.openevolve_seed,
             )
         ]
@@ -181,7 +202,31 @@ class OpenEvolvePlacementWorker:
             "placement_runtime_sec",
         ]
         if hasattr(config, "checkpoint_interval"):
-            config.checkpoint_interval = max(1, min(10, int(self.params.openevolve_iterations)))
+            config.checkpoint_interval = max(1, int(self.params.openevolve_checkpoint_interval))
+        if hasattr(config, "evaluator"):
+            config.evaluator.timeout = self.params.openevolve_evaluator_timeout_sec
+            config.evaluator.parallel_evaluations = self.params.openevolve_parallel_evaluations
+            config.evaluator.max_retries = 0
+        if hasattr(config, "prompt"):
+            config.prompt.max_artifact_bytes = min(
+                int(getattr(config.prompt, "max_artifact_bytes", 20 * 1024)),
+                12 * 1024,
+            )
+        if hasattr(config, "database"):
+            config.database.log_prompts = True
+            config.database.num_islands = min(int(getattr(config.database, "num_islands", 5)), 3)
+        config.llm.update_model_params(
+            {
+                "api_base": api_base,
+                "timeout": config.llm.timeout,
+                "retries": config.llm.retries,
+                "retry_delay": config.llm.retry_delay,
+                "max_tokens": config.llm.max_tokens,
+                "temperature": config.llm.temperature,
+                "random_seed": self.params.openevolve_seed,
+            },
+            overwrite=True,
+        )
         self._normalize_openevolve_seed(config)
         return config
 
@@ -267,6 +312,9 @@ def place(context):
         "level_drop_penalty": 20000000.0,
         "min_internal_level": None,
         "scale_penalty": 0.0,
+        "beam_width": 4,
+        "state_cap_per_node": 8,
+        "scale_lattice": "default",
         "preferred_node_levels": {},
         "preferred_node_scales": {},
         "preferred_edge_scales": {},
@@ -293,7 +341,7 @@ def place(context):
     return builder.depth_fanout_aware(
         allow_seed_fallback=True,
         prefer_level_preservation=True,
-        max_scale_candidates=40,
+        max_scale_candidates=32,
         bootstrap_penalty=900000000.0,
         rescale_penalty=250000.0,
         level_drop_penalty=16000000.0,
@@ -477,24 +525,33 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         "rescale_count": reference.get("rescale_count"),
         "valid": reference.get("valid", False),
     }
+    context["placement_profile"] = reference.get("bottleneck_summary", [])
     context_path = root / "compile_context.json"
     initial_path = root / "initial_program.py"
     evaluator_path = root / "evaluator.py"
+    output_dir = root / "openevolve_output"
+    context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initial_path.write_text(_initial_compile_program_source(), encoding="utf-8")
     evaluator_path.write_text(_compile_evaluator_source(context_path), encoding="utf-8")
+    initial_hints = _load_candidate_hints(initial_path, context)
 
-    output_dir = root / "openevolve_output"
     worker = OpenEvolvePlacementWorker(params, le)
-    with worker._openevolve_runtime_env():
-        result = run_evolution(
-            initial_program=initial_path,
-            evaluator=evaluator_path,
-            config=worker._openevolve_config_arg(),
-            iterations=params.openevolve_iterations,
-            output_dir=str(output_dir),
-            cleanup=False,
-        )
+    try:
+        with worker._openevolve_runtime_env():
+            result = run_evolution(
+                initial_program=initial_path,
+                evaluator=evaluator_path,
+                config=worker._openevolve_config_arg(),
+                iterations=params.openevolve_iterations,
+                output_dir=str(output_dir),
+                cleanup=False,
+            )
+    except Exception as exc:
+        if not params.openevolve_fail_open:
+            raise
+        _write_recovery_summary(root, exc)
+        return _recover_compile_hints(output_dir, context, initial_hints, params)
     best_program = root / "best_program.py"
     best_program.write_text(result.best_code, encoding="utf-8")
     try:
@@ -508,6 +565,11 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         if finalist_hints is not None:
             return finalist_hints
         return _load_candidate_hints(best_program, context)
+    except Exception as exc:
+        if not params.openevolve_fail_open:
+            raise
+        _write_recovery_summary(root, exc)
+        return _recover_compile_hints(output_dir, context, initial_hints, params, result.best_code)
     finally:
         if not params.openevolve_keep_workdir and params.openevolve_output_dir is None:
             shutil.rmtree(root, ignore_errors=True)
@@ -519,7 +581,13 @@ def evaluate_compile_candidate_program(
     context = json.loads(Path(context_path).read_text(encoding="utf-8"))
     try:
         hints = _load_candidate_hints(Path(program_path), context)
+        static = _static_validate_hints(context, hints)
+        if not static["valid"]:
+            result = _invalid_compile_result("compile_static_gate", static["reasons"])
+            _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
+            return result
         result = _evaluate_compile_hints(context, hints, suppress_output=True)
+        result["static"] = static
         reference = context.get("reference", {})
         ref_latency = _finite_float(reference.get("final_latency_usec"), result["final_latency_usec"])
         latency_ratio = (
@@ -553,7 +621,7 @@ def evaluate_compile_candidate_program(
             combined_score = min(0.999, 0.40 * result["validity"] + 0.30 * quality_score)
         else:
             combined_score = 1.0 + quality_score
-        return {
+        evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
                 "validity": float(result["validity"]),
@@ -597,6 +665,7 @@ def evaluate_compile_candidate_program(
                 ),
                 "bootstrap_locations": json.dumps(result["bootstrap_locations"], sort_keys=True),
                 "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
+                "bottleneck_summary": json.dumps(result.get("bottleneck_summary", []), sort_keys=True),
                 "selected_output_state": json.dumps(result["selected_output_state"], sort_keys=True),
                 "invalid_reasons": _compact_invalid_reasons(result["diagnostics"]),
                 "candidate_invalid_reasons": _compact_invalid_reasons(
@@ -608,12 +677,15 @@ def evaluate_compile_candidate_program(
                 ),
                 "reference_json": json.dumps(context.get("harness", {}).get("reference_json", {}), sort_keys=True)[:4000],
                 "replay_log_tail": result["log_tail"],
+                "patchgate": json.dumps(static, sort_keys=True),
             },
         }
+        _record_compile_trace(context, Path(program_path), hints, evaluation, "CLEAR_ONLY")
+        return evaluation
     except Exception as exc:
         return {
             "metrics": {
-                "combined_score": 0.0,
+                "combined_score": 1e-6,
                 "validity": 0.0,
                 "latency_score": 0.0,
                 "final_latency_usec": 0.0,
@@ -683,6 +755,7 @@ def _evaluate_compile_hints(
             },
             "bootstrap_locations": locations["bootstrap"],
             "rescale_locations": locations["rescale"],
+            "bottleneck_summary": _bottleneck_summary(locations),
             "diagnostics": diagnostics,
             "log_tail": log_buffer.getvalue()[-3000:],
         }
@@ -744,6 +817,9 @@ def _run_full_bundle_finalists(
         program_path.write_text(code, encoding="utf-8")
         try:
             hints = _load_candidate_hints(program_path, full_context)
+            static = _static_validate_hints(full_context, hints)
+            if not static["valid"]:
+                raise PlacementError("; ".join(static["reasons"][:4]))
             result = _evaluate_compile_hints(full_context, hints, suppress_output=True)
             summary = {
                 "index": idx,
@@ -937,6 +1013,80 @@ def _load_reference_json(path: str | None) -> dict[str, Any]:
         return {"load_error": f"{type(exc).__name__}: {str(exc)[:240]}", "path": path}
 
 
+def _write_recovery_summary(root: Path, exc: Exception) -> None:
+    try:
+        (root / "openevolve_recovery.json").write_text(
+            json.dumps(
+                {
+                    "failure_stage": "openevolve_runtime",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1000],
+                    "fail_open": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _recover_candidate_hints(
+    output_dir: Path,
+    context: dict[str, Any],
+    initial_hints: dict[str, Any],
+    best_code: str = "",
+) -> dict[str, Any]:
+    for code in _discover_finalist_codes(output_dir, best_code, 8):
+        hints = _hints_from_code(code, context)
+        if hints is not None and _static_validate_hints(context, hints)["valid"]:
+            return hints
+    return initial_hints
+
+
+def _recover_compile_hints(
+    output_dir: Path,
+    context: dict[str, Any],
+    initial_hints: dict[str, Any],
+    params: Params,
+    best_code: str = "",
+) -> dict[str, Any]:
+    best = None
+    for idx, code in enumerate(_discover_finalist_codes(output_dir, best_code, max(8, params.openevolve_finalists))):
+        hints = _hints_from_code(code, context)
+        if hints is None:
+            continue
+        static = _static_validate_hints(context, hints)
+        if not static["valid"]:
+            continue
+        result = _evaluate_compile_hints(context, hints, suppress_output=True)
+        if not result.get("valid"):
+            continue
+        item = (
+            int(result.get("fallback_selected_budgets", 0) > 0),
+            float(result.get("final_latency_usec", float("inf"))),
+            idx,
+            hints,
+        )
+        if best is None or item[:3] < best[:3]:
+            best = item
+    return initial_hints if best is None else best[3]
+
+
+def _hints_from_code(code: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(code, str) or not code.strip():
+        return None
+    with tempfile.TemporaryDirectory(prefix="orbit_openevolve_recover_") as tmp:
+        path = Path(tmp) / "candidate.py"
+        path.write_text(code, encoding="utf-8")
+        try:
+            return _load_candidate_hints(path, context)
+        except Exception:
+            return None
+
+
 def _finite_float(value: Any, default: float) -> float:
     try:
         result = float(value)
@@ -945,12 +1095,172 @@ def _finite_float(value: Any, default: float) -> float:
     return result if math.isfinite(result) else default
 
 
+def _invalid_candidate_result(stage: str, reasons: list[str]) -> dict[str, Any]:
+    reason_counts = {reason: 1 for reason in reasons[:8]}
+    return {
+        "metrics": {
+            "combined_score": 1e-6,
+            "validity": 0.0,
+            "effective_validity": 0.0,
+            "latency_score": 0.0,
+            "avg_latency_usec": 0.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "profile_risk": 1.0,
+            "solved_budgets": 0.0,
+            "candidate_solved_budgets": 0.0,
+            "fallback_selected_budgets": 0.0,
+        },
+        "artifacts": {
+            "failure_stage": stage,
+            "invalid_reasons": json.dumps(reason_counts, sort_keys=True),
+        },
+    }
+
+
+def _invalid_compile_result(stage: str, reasons: list[str]) -> dict[str, Any]:
+    reason_counts = {reason: 1 for reason in reasons[:8]}
+    return {
+        "metrics": {
+            "combined_score": 1e-6,
+            "validity": 0.0,
+            "latency_score": 0.0,
+            "final_latency_usec": 0.0,
+            "boundary_quality": 0.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "profile_risk": 1.0,
+            "fallback_selected_budgets": 0.0,
+        },
+        "artifacts": {
+            "failure_stage": stage,
+            "invalid_reasons": json.dumps(reason_counts, sort_keys=True),
+        },
+    }
+
+
+def run_trial(
+    context: dict[str, Any],
+    program_path: str | Path,
+    eval_mode: str = "CLEAR_ONLY",
+) -> dict[str, Any]:
+    hints = _load_candidate_hints(Path(program_path), context)
+    static = _static_validate_hints(context, hints)
+    if eval_mode == "STATIC_ONLY":
+        return {
+            "mode": "STATIC_ONLY",
+            "valid": static["valid"],
+            "hints": hints,
+            "static": static,
+        }
+    if eval_mode != "CLEAR_ONLY":
+        return {
+            "mode": eval_mode,
+            "valid": False,
+            "hints": hints,
+            "static": static,
+            "error": "FHE_LIGHT/FHE_FULL are external verification modes in this harness",
+        }
+    if not static["valid"]:
+        return {"mode": "CLEAR_ONLY", "valid": False, "hints": hints, "static": static}
+    result = _evaluate_compile_hints(context, hints, suppress_output=True)
+    result["mode"] = "CLEAR_ONLY"
+    result["static"] = static
+    result["hints"] = hints
+    return result
+
+
+def _static_validate_hints(context: dict[str, Any], hints: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    nodes = context.get("tdag", {}).get("nodes", {})
+    edges = {
+        _edge_key(str(edge.get("u")), str(edge.get("v")))
+        for edge in context.get("tdag", {}).get("edges", [])
+        if isinstance(edge, dict)
+    }
+    ckks = _ckks_dict(context)
+    local_bounds = context.get("constraints", {}).get("local_scale_lower_bounds", {})
+    for node, level in _int_map(hints.get("preferred_node_levels", {})).items():
+        if node not in nodes:
+            reasons.append(f"unknown node level target {node}")
+            continue
+        if not int(ckks["lvl_lb"]) <= level <= int(ckks["lvl_ub"]):
+            reasons.append(f"node {node} preferred level {level} outside CKKS bounds")
+    for node, scale in _int_map(hints.get("preferred_node_scales", {})).items():
+        if node not in nodes:
+            reasons.append(f"unknown node scale target {node}")
+            continue
+        lb_info = local_bounds.get(node, {})
+        lb = _safe_int(lb_info.get("out"), int(ckks["Sw"])) if isinstance(lb_info, dict) else int(ckks["Sw"])
+        if not lb <= scale <= int(ckks["max_scale"]):
+            reasons.append(f"node {node} preferred scale {scale} outside [{lb}, {ckks['max_scale']}]")
+    for edge, scale in _int_map(hints.get("preferred_edge_scales", {})).items():
+        if edge not in edges:
+            reasons.append(f"unknown edge scale target {edge}")
+            continue
+        if not 0 <= scale <= int(ckks["max_scale"]):
+            reasons.append(f"edge {edge} preferred scale {scale} outside CKKS max scale")
+    for item in hints.get("portfolio", []):
+        if isinstance(item, dict):
+            child = _static_validate_hints({**context, "_portfolio_child": True}, item)
+            reasons.extend(f"portfolio: {reason}" for reason in child["reasons"])
+    return {"valid": not reasons, "reasons": reasons[:16]}
+
+
+def _record_compile_trace(
+    context: dict[str, Any],
+    program_path: Path,
+    hints: dict[str, Any],
+    evaluation: dict[str, Any],
+    eval_mode: str,
+) -> None:
+    trace_dir = context.get("harness", {}).get("trace_dir")
+    if not trace_dir:
+        return
+    try:
+        source = program_path.read_text(encoding="utf-8")
+    except Exception:
+        source = ""
+    record = {
+        "context_schema": context.get("schema_version"),
+        "model": context.get("model", {}),
+        "candidate_digest": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "policy_summary": _compact_policy_summary(hints),
+        "eval_mode": eval_mode,
+        "metrics": evaluation.get("metrics", {}),
+        "artifacts": {
+            key: value
+            for key, value in evaluation.get("artifacts", {}).items()
+            if key
+            in {
+                "invalid_reasons",
+                "candidate_invalid_reasons",
+                "selected_output_state",
+                "bootstrap_locations",
+                "rescale_locations",
+                "bottleneck_summary",
+                "boundary_quality",
+            }
+        },
+    }
+    try:
+        path = Path(trace_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        with (path / "trials.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def evaluate_candidate_program(context_path: str | Path, program_path: str | Path) -> dict[str, Any]:
     context = json.loads(Path(context_path).read_text(encoding="utf-8"))
     tdag = tdag_from_context(context)
     le = LatencyEstimator(tdag.params)
     try:
         hints = _load_candidate_hints(Path(program_path), context)
+        static = _static_validate_hints(context, hints)
+        if not static["valid"]:
+            return _invalid_candidate_result("placement_static_gate", static["reasons"])
         io_budgets = [_io_budget_from_json(item) for item in context["io_budgets"]]
         diagnostics: dict[str, Any] = {}
         io_to_assign, io_to_cost = solve_budget_batch(
@@ -994,17 +1304,15 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 + 0.05 * validity
                 + 0.099 * quality_score
             )
-        elif candidate_solved == 0:
-            combined_score = 0.99
+        elif candidate_solved == 0 or fallback_selected > 0:
+            combined_score = min(0.999, 0.40 * validity + 0.30 * quality_score)
         else:
             improvement_fraction = candidate_improved / requested
-            fallback_fraction = fallback_selected / requested
             combined_score = (
                 1.0
                 + quality_score
                 + 0.05 * improvement_fraction
                 + 0.02 * validity
-                - 0.03 * fallback_fraction
             )
         return {
             "metrics": {
@@ -1050,12 +1358,13 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                     _profile_unmatched_targets(context), sort_keys=True
                 ),
                 "profiler_plan_hints": _compact_profile_plan(context),
+                "patchgate": json.dumps(static, sort_keys=True),
             },
         }
     except Exception as exc:
         return {
             "metrics": {
-                "combined_score": 0.0,
+                "combined_score": 1e-6,
                 "validity": 0.0,
                 "latency_score": 0.0,
                 "bootstrap_count": 0.0,
@@ -1158,10 +1467,11 @@ def solve_budget_batch(
 def _budget_policy_attempts(
     hints: dict[str, Any], params: Params
 ) -> list[tuple[str, dict[str, Any]]]:
-    attempts = [
-        ("candidate", hints),
-        ("candidate_relaxed", _relaxed_scheduler_policy(hints, params)),
-    ]
+    attempts = []
+    for idx, policy_hints in enumerate(_portfolio_policies(hints)):
+        label = "candidate" if idx == 0 else f"candidate:{idx}"
+        attempts.append((label, policy_hints))
+        attempts.append((f"{label}:relaxed", _relaxed_scheduler_policy(policy_hints, params)))
     if _should_use_seed_fallback(hints):
         seed = _default_policy_hints()
         attempts.extend(
@@ -1171,6 +1481,30 @@ def _budget_policy_attempts(
             ]
         )
     return attempts
+
+
+def _portfolio_policies(hints: dict[str, Any]) -> list[dict[str, Any]]:
+    portfolio = hints.get("portfolio")
+    if not isinstance(portfolio, list) or not portfolio:
+        return [hints]
+    policies = []
+    seen = set()
+    for item in [hints] + [policy for policy in portfolio if isinstance(policy, dict)]:
+        policy = _with_default_policy(item)
+        digest = json.dumps(
+            {
+                key: value
+                for key, value in policy.items()
+                if key not in {"portfolio", "placement_records", "api_version"}
+            },
+            sort_keys=True,
+            default=str,
+        )
+        if digest in seen:
+            continue
+        seen.add(digest)
+        policies.append(policy)
+    return policies
 
 
 def _should_use_seed_fallback(hints: dict[str, Any]) -> bool:
@@ -1301,6 +1635,8 @@ def build_conservative_assign(
     le: LatencyEstimator | None = None,
 ) -> Assign:
     hints = _with_default_policy(hints)
+    if str(hints.get("strategy")) == "latency_beam":
+        return _build_best_assign_from_variants(tdag, params, io_budget, hints, le)
     if "maino_v" in io_budget:
         best = None
         main_qbp_cost = io_budget.get("main_qbp_cost", {})
@@ -1317,6 +1653,77 @@ def build_conservative_assign(
             raise PlacementError("no feasible main-output choice for bypass placement")
         return best[1]
     return _build_assign_once(tdag, params, io_budget, hints, {}, le)
+
+
+def _build_best_assign_from_variants(
+    tdag: Tdag,
+    params: Params,
+    io_budget: dict,
+    hints: dict[str, Any],
+    le: LatencyEstimator | None,
+) -> Assign:
+    best = None
+    for variant in _latency_beam_variants(hints, params):
+        try:
+            if "maino_v" in io_budget:
+                main_qbp_cost = io_budget.get("main_qbp_cost", {})
+                for main_key, main_cost in sorted(main_qbp_cost.items(), key=lambda item: item[1]):
+                    assign = _build_assign_once(
+                        tdag,
+                        params,
+                        io_budget,
+                        variant,
+                        {io_budget["maino_v"]: main_key},
+                        le,
+                    )
+                    assign.check_assign()
+                    cost = _assignment_score(assign, le) + float(main_cost)
+                    item = (cost, assign)
+                    if best is None or item[0] < best[0]:
+                        best = item
+            else:
+                assign = _build_assign_once(tdag, params, io_budget, variant, {}, le)
+                assign.check_assign()
+                item = (_assignment_score(assign, le), assign)
+                if best is None or item[0] < best[0]:
+                    best = item
+        except Exception:
+            continue
+    if best is None:
+        raise PlacementError("latency_beam found no feasible policy variant")
+    return best[1]
+
+
+def _latency_beam_variants(hints: dict[str, Any], params: Params) -> list[dict[str, Any]]:
+    width = max(1, min(8, _int_hint(hints.get("beam_width"), 4)))
+    base = dict(hints)
+    base["strategy"] = "level_preserving"
+    variants = [
+        base,
+        {
+            **base,
+            "refresh_fanout_at_level_floor": True,
+            "allow_bootstrap": False,
+            "min_internal_level": max(params.lvl_lb, params.bts_lb + 1),
+        },
+        {
+            **base,
+            "allow_bootstrap": True,
+            "bootstrap_penalty": max(1.0, _float_hint(base.get("bootstrap_penalty"), 1_000_000_000.0) * 0.25),
+            "level_drop_penalty": max(0.0, _float_hint(base.get("level_drop_penalty"), 20_000_000.0) * 0.5),
+        },
+        {
+            **base,
+            "rescale_penalty": max(250_000.0, _float_hint(base.get("rescale_penalty"), 0.0)),
+            "scale_penalty": max(100.0, _float_hint(base.get("scale_penalty"), 0.0)),
+        },
+        {
+            **base,
+            "min_internal_level": params.lvl_lb,
+            "level_drop_penalty": 0.0,
+        },
+    ]
+    return [_with_default_policy(variant) for variant in variants[:width]]
 
 
 def _relaxed_scheduler_policy(hints: dict[str, Any], params: Params) -> dict[str, Any]:
@@ -1478,6 +1885,9 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             min(params.lvl_ub, _int_hint(hints.get("min_internal_level"), params.bts_lb + 1)),
         ),
         "scale_penalty": max(0.0, _float_hint(hints.get("scale_penalty"), 0.0)),
+        "beam_width": max(1, min(8, _int_hint(hints.get("beam_width"), 4))),
+        "state_cap_per_node": max(1, min(32, _int_hint(hints.get("state_cap_per_node"), 8))),
+        "scale_lattice": str(hints.get("scale_lattice", "default")),
         "max_scale": _max_scale(params),
     }
 
@@ -2112,6 +2522,9 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
         "level_drop_penalty",
         "min_internal_level",
         "scale_penalty",
+        "beam_width",
+        "state_cap_per_node",
+        "scale_lattice",
     ]
     summary = {key: hints.get(key) for key in keys if key in hints}
     for key in ("preferred_node_levels", "preferred_node_scales", "preferred_edge_scales"):
@@ -2249,6 +2662,7 @@ class PlacementBuilder:
 
     def __init__(self, context: dict[str, Any]):
         self.context = context
+        self._patches: list[dict[str, Any]] = []
 
     def level_preserving(self, **overrides: Any) -> dict[str, Any]:
         policy = {
@@ -2328,6 +2742,73 @@ class PlacementBuilder:
         policy.update(overrides)
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 
+    def latency_beam(self, **overrides: Any) -> dict[str, Any]:
+        policy = self.depth_fanout_aware()["policy"]
+        policy.update(
+            {
+                "strategy": "latency_beam",
+                "beam_width": 4,
+                "state_cap_per_node": 8,
+                "allow_seed_fallback": True,
+                "refresh_fanout_at_level_floor": True,
+                "bootstrap_penalty": 750_000_000.0,
+                "rescale_penalty": 500_000.0,
+                "level_drop_penalty": 12_000_000.0,
+                "scale_lattice": "waterline_sf",
+            }
+        )
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def portfolio(self, *policies: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+        normalized = [_with_default_policy(policy) for policy in policies if isinstance(policy, dict)]
+        if not normalized:
+            normalized = [self.depth_fanout_aware()["policy"]]
+        base = dict(normalized[0])
+        base.update(overrides)
+        return {
+            "api_version": "placement-builder-v1",
+            "policy": base,
+            "portfolio": normalized,
+            "placement_records": [],
+            "patches": list(self._patches),
+        }
+
+    def set_policy(self, key: str, value: Any) -> "PlacementBuilder":
+        self._patches.append({"op": "set_policy", "key": str(key), "value": value})
+        return self
+
+    def prefer_node_level(self, node: str, level: int) -> "PlacementBuilder":
+        self._patches.append({"op": "prefer_node_level", "node": str(node), "level": int(level)})
+        return self
+
+    def prefer_node_scale(self, node: str, scale: int) -> "PlacementBuilder":
+        self._patches.append({"op": "prefer_node_scale", "node": str(node), "scale": int(scale)})
+        return self
+
+    def prefer_edge_scale(self, u: str, v: str, scale: int) -> "PlacementBuilder":
+        self._patches.append(
+            {"op": "prefer_edge_scale", "u": str(u), "v": str(v), "scale": int(scale)}
+        )
+        return self
+
+    def target_layer(self, layer: str, operation: str = "prefer_high_level") -> "PlacementBuilder":
+        self._patches.append({"op": "target_layer", "layer": str(layer), "operation": str(operation)})
+        return self
+
+    def disable_seed_fallback(self) -> "PlacementBuilder":
+        self._patches.append({"op": "disable_seed_fallback"})
+        return self
+
+    def build(self, fallback_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+        policy = fallback_policy or self.depth_fanout_aware()["policy"]
+        return {
+            "api_version": "placement-builder-v1",
+            "policy": policy,
+            "placement_records": [],
+            "patches": list(self._patches),
+        }
+
     def placement_records(
         self, records: list[dict[str, Any]], fallback_policy: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -2335,6 +2816,7 @@ class PlacementBuilder:
             "api_version": "placement-builder-v1",
             "policy": fallback_policy or self.level_preserving()["policy"],
             "placement_records": records,
+            "patches": list(self._patches),
         }
 
 
@@ -2445,7 +2927,7 @@ def _load_candidate_hints(program_path: Path, context: dict[str, Any]) -> dict[s
     if not hasattr(module, "place"):
         return {}
     hints = module.place(context)
-    return _normalize_candidate_hints(hints)
+    return _normalize_candidate_hints(hints, context)
 
 
 def _validate_candidate_source(program_path: Path) -> None:
@@ -2455,18 +2937,103 @@ def _validate_candidate_source(program_path: Path) -> None:
             raise PlacementError(f"candidate program uses banned token {token!r}")
 
 
-def _normalize_candidate_hints(value: Any) -> dict[str, Any]:
+def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    if "policy" not in value and "placement_records" not in value:
-        return value
+    if "policy" not in value and "placement_records" not in value and "portfolio" not in value and "patches" not in value:
+        return _apply_patch_vocabulary(_with_default_policy(value), value.get("patches", []), context)
     policy = value.get("policy") if isinstance(value.get("policy"), dict) else {}
     result = _with_default_policy(policy)
     records = value.get("placement_records", [])
     if isinstance(records, list):
         result["placement_records"] = records
+    portfolio = value.get("portfolio", [])
+    if isinstance(portfolio, list):
+        result["portfolio"] = [
+            _apply_patch_vocabulary(_with_default_policy(item), value.get("patches", []), context)
+            for item in portfolio
+            if isinstance(item, dict)
+        ]
+    result = _apply_patch_vocabulary(result, value.get("patches", []), context)
     result["api_version"] = value.get("api_version", "placement-builder-v1")
     return result
+
+
+def _apply_patch_vocabulary(
+    hints: dict[str, Any],
+    patches: Any,
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(patches, list):
+        return hints
+    result = dict(hints)
+    result.setdefault("preferred_node_levels", {})
+    result.setdefault("preferred_node_scales", {})
+    result.setdefault("preferred_edge_scales", {})
+    for patch in patches:
+        if not isinstance(patch, dict):
+            continue
+        op = str(patch.get("op", ""))
+        if op == "set_policy":
+            key = str(patch.get("key", ""))
+            if key in _PATCHABLE_POLICY_KEYS:
+                result[key] = patch.get("value")
+        elif op == "prefer_node_level":
+            node = str(patch.get("node", ""))
+            if node:
+                result["preferred_node_levels"][node] = patch.get("level")
+        elif op == "prefer_node_scale":
+            node = str(patch.get("node", ""))
+            if node:
+                result["preferred_node_scales"][node] = patch.get("scale")
+        elif op == "prefer_edge_scale":
+            edge = str(patch.get("edge") or _edge_key(str(patch.get("u", "")), str(patch.get("v", ""))))
+            if "->" in edge:
+                result["preferred_edge_scales"][edge] = patch.get("scale")
+        elif op == "disable_seed_fallback":
+            result["allow_seed_fallback"] = False
+        elif op == "target_layer":
+            _apply_layer_patch(result, patch, context)
+    return result
+
+
+_PATCHABLE_POLICY_KEYS = {
+    "strategy",
+    "prefer_level_preservation",
+    "allow_bootstrap",
+    "allow_seed_fallback",
+    "refresh_fanout_at_level_floor",
+    "max_scale_candidates",
+    "bootstrap_penalty",
+    "rescale_penalty",
+    "level_drop_penalty",
+    "min_internal_level",
+    "scale_penalty",
+    "beam_width",
+    "state_cap_per_node",
+    "scale_lattice",
+}
+
+
+def _apply_layer_patch(
+    hints: dict[str, Any],
+    patch: dict[str, Any],
+    context: dict[str, Any] | None,
+) -> None:
+    if not context:
+        return
+    layer = str(patch.get("layer", ""))
+    operation = str(patch.get("operation", "prefer_high_level"))
+    ckks = _ckks_dict(context)
+    for node, attrs in context.get("tdag", {}).get("nodes", {}).items():
+        if layer and layer not in _node_location(attrs):
+            continue
+        if str(attrs.get("op", "")) in {"input", "constant"}:
+            continue
+        if operation in {"prefer_high_level", "avoid_bootstrap", "protect"}:
+            hints["preferred_node_levels"][str(node)] = int(ckks["lvl_ub"])
+        if operation in {"prefer_waterline_scale", "protect"}:
+            hints["preferred_node_scales"][str(node)] = int(ckks["Sw"])
 
 
 def _serialize_assign(assign: Assign) -> dict[str, Any]:
@@ -2553,6 +3120,23 @@ def _maintenance_locations(assign: Assign) -> dict[str, dict[str, int]]:
         "bootstrap": {key: value for key, value in locations["bootstrap"].items() if value},
         "rescale": {key: value for key, value in locations["rescale"].items() if value},
     }
+
+
+def _bottleneck_summary(locations: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
+    combined: Counter[str] = Counter()
+    for key, count in locations.get("bootstrap", {}).items():
+        combined[key] += 4 * int(count)
+    for key, count in locations.get("rescale", {}).items():
+        combined[key] += int(count)
+    return [
+        {
+            "location": key,
+            "score": score,
+            "bootstraps": int(locations.get("bootstrap", {}).get(key, 0)),
+            "rescales": int(locations.get("rescale", {}).get(key, 0)),
+        }
+        for key, score in combined.most_common(10)
+    ]
 
 
 def _bootstrap_locations(assign: Assign) -> dict[str, int]:

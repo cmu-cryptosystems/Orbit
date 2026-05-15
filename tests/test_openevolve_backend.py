@@ -183,6 +183,11 @@ class FakeLLMConfig:
         self.api_base = None
         self.models = []
         self.evaluator_models = []
+        self.timeout = None
+        self.retries = None
+        self.retry_delay = None
+        self.max_tokens = None
+        self.temperature = None
 
     def update_model_params(self, args, overwrite=False):
         for model in self.models + self.evaluator_models:
@@ -195,6 +200,20 @@ class FakeDatabaseConfig:
     def __init__(self):
         self.random_seed = None
         self.feature_dimensions = []
+        self.log_prompts = None
+        self.num_islands = 5
+
+
+class FakeEvaluatorConfig:
+    def __init__(self):
+        self.timeout = None
+        self.parallel_evaluations = None
+        self.max_retries = None
+
+
+class FakePromptConfig:
+    def __init__(self):
+        self.max_artifact_bytes = 20 * 1024
 
 
 class FakeConfig:
@@ -203,6 +222,8 @@ class FakeConfig:
         self.checkpoint_interval = None
         self.llm = FakeLLMConfig()
         self.database = FakeDatabaseConfig()
+        self.evaluator = FakeEvaluatorConfig()
+        self.prompt = FakePromptConfig()
 
 
 def _install_fake_openevolve(monkeypatch, fake_run_evolution, loaded_config=None):
@@ -325,8 +346,9 @@ def test_seed_fallback_does_not_reward_invalid_candidate(
     invalid = evaluate_candidate_program(context_path, invalid_program)
 
     assert invalid["metrics"]["validity"] == 0.0
-    assert invalid["metrics"]["effective_validity"] == 1.0
-    assert invalid["metrics"]["fallback_selected_budgets"] == 1.0
+    assert invalid["metrics"]["effective_validity"] == 0.0
+    assert invalid["metrics"]["fallback_selected_budgets"] == 0.0
+    assert invalid["metrics"]["combined_score"] > 0.0
     assert invalid["metrics"]["combined_score"] < seed["metrics"]["combined_score"]
 
 
@@ -497,6 +519,46 @@ def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
     assert PlacementBuilder(context).level_preserving()["policy"]["strategy"] == "level_preserving"
 
 
+def test_patch_vocabulary_and_portfolio_normalize(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    context = build_context(_toy_pdag(params), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "candidate.py"
+    program_path.write_text(
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+        "def place(context):\n"
+        "    builder = PlacementBuilder(context)\n"
+        "    builder.set_policy('strategy', 'latency_beam').prefer_node_level('0', 16).disable_seed_fallback()\n"
+        "    return builder.portfolio(builder.latency_beam()['policy'], builder.level_preserving()['policy'])\n",
+        encoding="utf-8",
+    )
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    assert hints["strategy"] == "latency_beam"
+    assert hints["allow_seed_fallback"] is False
+    assert hints["preferred_node_levels"]["0"] == 16
+    assert len(hints["portfolio"]) == 2
+    assert oe_backend._static_validate_hints(context, hints)["valid"] is True
+
+
+def test_latency_beam_policy_produces_valid_assignment(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _mul_chain_pdag(params, length=4)
+    le = LatencyEstimator(params)
+
+    io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        {"strategy": "latency_beam", "beam_width": 4},
+    )
+
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    assert assign.check_assign() is True
+    assert io_to_cost
+
+
 def test_builder_depth_fanout_policy_uses_graph_summary(toy_cost_json: str):
     params = _params(toy_cost_json)
     context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
@@ -585,6 +647,50 @@ def test_evaluator_rejects_invalid_policy_score(
     assert bad["metrics"]["combined_score"] < good["metrics"]["combined_score"]
 
 
+def test_partition_fallback_selected_candidate_scores_below_valid(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "context.json"
+    program_path = tmp_path / "fallback.py"
+    context_path.write_text(
+        json.dumps(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)),
+        encoding="utf-8",
+    )
+    program_path.write_text(
+        "def place(context):\n    return {'strategy': 'level_preserving', 'allow_seed_fallback': True}\n",
+        encoding="utf-8",
+    )
+
+    def fake_solve_budget_batch(_tdag, _budgets, _le, _params, _hints, diagnostics):
+        diagnostics["solved_budgets"] = 1
+        diagnostics["candidate_solved_budgets"] = 1
+        diagnostics["fallback_selected_budgets"] = 1
+        diagnostics["candidate_improved_budgets"] = 0
+        diagnostics["costs"] = [10.0]
+        diagnostics["assignments"] = []
+        return {(-1, 40): {(16, 40): object()}}, {(-1, 40): {(16, 40): 10.0}}
+
+    monkeypatch.setattr(oe_backend, "solve_budget_batch", fake_solve_budget_batch)
+    monkeypatch.setattr(
+        oe_backend,
+        "_reference_metrics",
+        lambda *_args, **_kwargs: {
+            "avg_latency_usec": 10.0,
+            "bootstrap_count": 1,
+            "rescale_count": 1,
+            "solved_budgets": 1,
+        },
+    )
+
+    result = evaluate_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["fallback_selected_budgets"] == 1.0
+    assert result["metrics"]["combined_score"] < 1.0
+    assert result["metrics"]["combined_score"] > 0.0
+
+
 def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
     toy_cost_json: str, tmp_path: Path
 ):
@@ -652,10 +758,17 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     assert config.random_seed == 7
     assert config.database.random_seed == 7
     assert config.llm.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
-    assert config.llm.models[0].name == "gemini-3.1-pro-preview"
+    assert config.llm.models[0].name == "gemini-3.1-flash-lite"
     assert config.llm.models[0].api_base == config.llm.api_base
     assert config.llm.models[0].random_seed == 7
-    assert config.checkpoint_interval == 10
+    assert config.llm.timeout == 180
+    assert config.llm.retries == 1
+    assert config.llm.retry_delay == 2
+    assert config.llm.max_tokens == 2048
+    assert config.llm.models[0].timeout == 180
+    assert config.evaluator.timeout == 180
+    assert config.evaluator.parallel_evaluations == 1
+    assert config.checkpoint_interval == 5
     assert config.database.feature_dimensions == [
         "final_latency_usec",
         "boundary_quality",
@@ -785,7 +898,7 @@ def test_mocked_openevolve_runtime_runs_once_per_budget_batch(
 
     assert len(calls) == 1
     assert calls[0]["iterations"] == 3
-    assert calls[0]["config"].llm.models[0].name == "gemini-3.1-pro-preview"
+    assert calls[0]["config"].llm.models[0].name == "gemini-3.1-flash-lite"
     assert calls[0]["config"].llm.models[0].api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert calls[0]["config"].database.random_seed == 42
     assert Path(calls[0]["initial_program"]).is_file()
@@ -834,6 +947,86 @@ def test_mocked_compile_harness_runs_once_for_compile(
     assert Path(calls[0]["initial_program"]).is_file()
     assert Path(calls[0]["evaluator"]).is_file()
     assert "OpenEvolve Compile Harness Time" in timings
+
+
+def test_compile_harness_fail_open_returns_initial_seed(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    def fake_run_evolution(**_kwargs):
+        raise TimeoutError("llm timed out")
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="toy",
+        openevolve_output_dir=str(tmp_path),
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["strategy"] == "level_preserving"
+    assert hints["refresh_fanout_at_level_floor"] is True
+    assert (tmp_path / "compile_oe_toy" / "openevolve_recovery.json").is_file()
+
+
+def test_compile_harness_fail_open_recovers_checkpoint_candidate(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    code = (
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+        "def place(context):\n"
+        "    return PlacementBuilder(context).level_preserving(level_drop_penalty=321.0)\n"
+    )
+
+    def fake_run_evolution(**kwargs):
+        program_dir = Path(kwargs["output_dir"]) / "checkpoints" / "checkpoint_1" / "programs"
+        program_dir.mkdir(parents=True)
+        (program_dir / "candidate.json").write_text(
+            json.dumps({"code": code, "metrics": {"combined_score": 2.0}}),
+            encoding="utf-8",
+        )
+        raise TimeoutError("llm timed out")
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if hints.get("level_drop_penalty") == 321.0 else 100.0,
+            "bootstrap_count": 1,
+            "rescale_count": 1,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="toy",
+        openevolve_output_dir=str(tmp_path),
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["level_drop_penalty"] == 321.0
 
 
 def test_compile_harness_reruns_best_candidate_on_full_bundle(

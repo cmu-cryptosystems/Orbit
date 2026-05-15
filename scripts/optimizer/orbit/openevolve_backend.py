@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import hashlib
 import shutil
 import tempfile
 import time
@@ -172,11 +173,15 @@ class OpenEvolvePlacementWorker:
         ]
         config.database.feature_dimensions = [
             "final_latency_usec",
+            "boundary_quality",
             "bootstrap_count",
             "rescale_count",
+            "fallback_selected_budgets",
             "profile_risk",
             "placement_runtime_sec",
         ]
+        if hasattr(config, "checkpoint_interval"):
+            config.checkpoint_interval = max(1, min(10, int(self.params.openevolve_iterations)))
         self._normalize_openevolve_seed(config)
         return config
 
@@ -285,12 +290,14 @@ def place(context):
     final repair into Assign objects.
     """
     builder = PlacementBuilder(context)
-    return builder.level_preserving(
+    return builder.depth_fanout_aware(
         allow_seed_fallback=True,
         prefer_level_preservation=True,
-        max_scale_candidates=32,
-        bootstrap_penalty=1000000000.0,
-        level_drop_penalty=20000000.0,
+        max_scale_candidates=40,
+        bootstrap_penalty=900000000.0,
+        rescale_penalty=250000.0,
+        level_drop_penalty=16000000.0,
+        scale_penalty=1000.0,
     )
 # EVOLVE-BLOCK-END
 '''
@@ -531,12 +538,16 @@ def evaluate_compile_candidate_program(
         )
         risk_score = 1.0 / (1.0 + result["profile_risk"])
         runtime_score = 1.0 / (1.0 + result["placement_runtime_sec"])
+        fallback_score = 1.0 / (1.0 + result["fallback_selected_budgets"])
+        boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
         quality_score = (
-            0.58 * latency_score
-            + 0.18 * bootstrap_score
-            + 0.08 * rescale_score
-            + 0.10 * risk_score
-            + 0.06 * runtime_score
+            0.55 * latency_score
+            + 0.13 * bootstrap_score
+            + 0.07 * rescale_score
+            + 0.08 * boundary_score
+            + 0.07 * risk_score
+            + 0.05 * fallback_score
+            + 0.05 * runtime_score
         )
         if not result["valid"] or result["fallback_selected_budgets"] > 0:
             combined_score = min(0.999, 0.40 * result["validity"] + 0.30 * quality_score)
@@ -547,7 +558,12 @@ def evaluate_compile_candidate_program(
                 "combined_score": float(combined_score),
                 "validity": float(result["validity"]),
                 "latency_score": float(latency_score),
+                "boundary_score": float(boundary_score),
+                "fallback_score": float(fallback_score),
+                "bootstrap_score": float(bootstrap_score),
+                "rescale_score": float(rescale_score),
                 "final_latency_usec": float(result["final_latency_usec"] if result["valid"] else 0.0),
+                "boundary_quality": float(boundary_score),
                 "bootstrap_count": float(result["bootstrap_count"]),
                 "rescale_count": float(result["rescale_count"]),
                 "profile_risk": float(result["profile_risk"]),
@@ -566,7 +582,21 @@ def evaluate_compile_candidate_program(
                 ),
                 "bootstrap_count": str(result["bootstrap_count"]),
                 "rescale_count": str(result["rescale_count"]),
+                "boundary_quality": f"{boundary_score:.6f}",
+                "score_breakdown": json.dumps(
+                    {
+                        "latency_score": latency_score,
+                        "bootstrap_score": bootstrap_score,
+                        "rescale_score": rescale_score,
+                        "boundary_score": boundary_score,
+                        "risk_score": risk_score,
+                        "fallback_score": fallback_score,
+                        "runtime_score": runtime_score,
+                    },
+                    sort_keys=True,
+                ),
                 "bootstrap_locations": json.dumps(result["bootstrap_locations"], sort_keys=True),
+                "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
                 "selected_output_state": json.dumps(result["selected_output_state"], sort_keys=True),
                 "invalid_reasons": _compact_invalid_reasons(result["diagnostics"]),
                 "candidate_invalid_reasons": _compact_invalid_reasons(
@@ -587,6 +617,7 @@ def evaluate_compile_candidate_program(
                 "validity": 0.0,
                 "latency_score": 0.0,
                 "final_latency_usec": 0.0,
+                "boundary_quality": 0.0,
                 "bootstrap_count": 0.0,
                 "rescale_count": 0.0,
                 "profile_risk": 1.0,
@@ -631,6 +662,7 @@ def _evaluate_compile_hints(
         assign = io_to_assign[final_io_choice[:2]][final_io_choice[2:]]
         assign.check_assign()
         counts = _maintenance_counts(assign)
+        locations = _maintenance_locations(assign)
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
         return {
             "valid": True,
@@ -639,6 +671,7 @@ def _evaluate_compile_hints(
             "aggregated_partition_cost_usec": float(final_cost),
             "bootstrap_count": int(counts["bootstrap"]),
             "rescale_count": int(counts["rescale"]),
+            "boundary_quality": float(_boundary_quality(params, final_io_choice)),
             "profile_risk": float(_profile_risk([assign], params)),
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": int(diagnostics.get("fallback_selected_budgets", 0)),
@@ -648,7 +681,8 @@ def _evaluate_compile_hints(
                 "out_lvl": final_io_choice[2],
                 "out_scl": final_io_choice[3],
             },
-            "bootstrap_locations": _bootstrap_locations(assign),
+            "bootstrap_locations": locations["bootstrap"],
+            "rescale_locations": locations["rescale"],
             "diagnostics": diagnostics,
             "log_tail": log_buffer.getvalue()[-3000:],
         }
@@ -660,11 +694,13 @@ def _evaluate_compile_hints(
             "aggregated_partition_cost_usec": float("inf"),
             "bootstrap_count": 0,
             "rescale_count": 0,
+            "boundary_quality": 0.0,
             "profile_risk": 1.0,
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": 0,
             "selected_output_state": {},
             "bootstrap_locations": {},
+            "rescale_locations": {},
             "diagnostics": {"invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1}},
             "log_tail": log_buffer.getvalue()[-3000:],
         }
@@ -713,14 +749,23 @@ def _run_full_bundle_finalists(
                 "index": idx,
                 "valid": result["valid"],
                 "final_latency_usec": result["final_latency_usec"],
+                "boundary_quality": result.get("boundary_quality", 0.0),
                 "bootstrap_count": result["bootstrap_count"],
                 "rescale_count": result["rescale_count"],
                 "fallback_selected_budgets": result["fallback_selected_budgets"],
                 "selected_output_state": result["selected_output_state"],
+                "bootstrap_locations": result.get("bootstrap_locations", {}),
+                "rescale_locations": result.get("rescale_locations", {}),
             }
             if result["valid"]:
-                item = (float(result["final_latency_usec"]), idx, hints, summary)
-                if best is None or item[0] < best[0]:
+                item = (
+                    int(result["fallback_selected_budgets"] > 0),
+                    float(result["final_latency_usec"]),
+                    idx,
+                    hints,
+                    summary,
+                )
+                if best is None or item[:3] < best[:3]:
                     best = item
         except Exception as exc:
             summary = {
@@ -734,7 +779,7 @@ def _run_full_bundle_finalists(
             {
                 "reference": full_context["reference"],
                 "candidates": summaries,
-                "selected_index": None if best is None else best[1],
+                "selected_index": None if best is None else best[2],
             },
             indent=2,
             sort_keys=True,
@@ -742,11 +787,37 @@ def _run_full_bundle_finalists(
         + "\n",
         encoding="utf-8",
     )
-    return None if best is None else best[2]
+    return None if best is None else best[3]
 
 
 def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> list[str]:
-    scored: list[tuple[float, str]] = []
+    if limit <= 0:
+        return []
+    scored: list[tuple[float, int, int, str]] = []
+    order = 0
+
+    def add_code(code: Any, score: float, iteration: int = -1) -> None:
+        nonlocal order
+        if not isinstance(code, str) or not code.strip():
+            return
+        scored.append((float(score), int(iteration), order, code))
+        order += 1
+
+    add_code(best_code, float("inf"))
+    best_dir = output_dir / "best"
+    best_score = _program_info_score(best_dir / "best_program_info.json")
+    if best_dir.exists():
+        for program in sorted(best_dir.glob("*.py")):
+            try:
+                add_code(program.read_text(encoding="utf-8"), best_score)
+            except Exception:
+                continue
+    for program in (output_dir / "best_program.py", output_dir / "initial_program.py"):
+        if program.exists():
+            try:
+                add_code(program.read_text(encoding="utf-8"), _program_info_score(program.with_suffix(".json")))
+            except Exception:
+                continue
     checkpoint_root = output_dir / "checkpoints"
     checkpoints = []
     if checkpoint_root.exists():
@@ -755,26 +826,38 @@ def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> li
             key=lambda path: int(path.name.rsplit("_", 1)[-1]) if "_" in path.name and path.name.rsplit("_", 1)[-1].isdigit() else -1,
             reverse=True,
         )
-    for checkpoint in checkpoints[:1]:
-        for program_json in (checkpoint / "programs").glob("*.json"):
+    for checkpoint in checkpoints[:8]:
+        iteration = _checkpoint_iteration(checkpoint)
+        checkpoint_score = max(
+            _program_info_score(checkpoint / "best_program_info.json"),
+            _program_info_score(checkpoint / "best" / "best_program_info.json"),
+        )
+        for program in (checkpoint / "best_program.py", checkpoint / "best" / "best_program.py"):
+            if program.exists():
+                try:
+                    add_code(program.read_text(encoding="utf-8"), checkpoint_score, iteration)
+                except Exception:
+                    continue
+        for program_json in list((checkpoint / "programs").glob("*.json")) + list(
+            (checkpoint / "database" / "programs").glob("*.json")
+        ):
             try:
                 data = json.loads(program_json.read_text(encoding="utf-8"))
             except Exception:
                 continue
             code = data.get("code")
-            if not isinstance(code, str) or not code.strip():
-                continue
-            metrics = data.get("metrics", {})
-            score = metrics.get("combined_score", 0.0) if isinstance(metrics, dict) else 0.0
-            try:
-                scored.append((float(score), code))
-            except (TypeError, ValueError):
-                scored.append((0.0, code))
-    scored.sort(key=lambda item: item[0], reverse=True)
+            add_code(code, _program_data_score(data), iteration)
+    for program_json in (output_dir / "programs").glob("*.json"):
+        try:
+            data = json.loads(program_json.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        add_code(data.get("code"), _program_data_score(data))
+    scored.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
     result = []
     seen = set()
-    for code in [best_code] + [item[1] for item in scored]:
-        digest = hash(code)
+    for _score, _iteration, _order, code in scored:
+        digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
         if digest in seen:
             continue
         seen.add(digest)
@@ -782,6 +865,38 @@ def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> li
         if len(result) >= limit:
             break
     return result
+
+
+def _checkpoint_iteration(path: Path) -> int:
+    tail = path.name.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else -1
+
+
+def _program_info_score(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    try:
+        return _program_data_score(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return 0.0
+
+
+def _program_data_score(data: Any) -> float:
+    if not isinstance(data, dict):
+        return 0.0
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        for key in ("combined_score", "score", "fitness"):
+            try:
+                return float(metrics[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+    for key in ("combined_score", "score", "fitness"):
+        try:
+            return float(data[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def _select_final_choice(
@@ -1942,6 +2057,13 @@ def _int_map(value: Any) -> dict[str, int]:
     return result
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _cheap_cost(assign: Assign) -> float:
     return float(sum(assign.v_lvl_out.values()) + sum(assign.v_scl_out.values()))
 
@@ -2153,6 +2275,59 @@ class PlacementBuilder:
         policy.update(overrides)
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 
+    def depth_fanout_aware(self, **overrides: Any) -> dict[str, Any]:
+        """Return a level-preserving policy seeded by graph depth and fanout.
+
+        Candidate programs can mutate the scalar penalties and the sparse
+        preferred-node maps without emitting full assignments. Orbit still
+        validates the final assignment through the normal repair path.
+        """
+        ckks = _ckks_dict(self.context)
+        nodes = self.context.get("graph_summary", {}).get("nodes", {})
+        depths = [
+            _safe_int(info.get("depth_to_output"), 0)
+            for info in nodes.values()
+            if isinstance(info, dict)
+        ]
+        max_depth = max(depths or [0])
+        depth_threshold = max(2, max_depth // 2)
+        preferred_levels: dict[str, int] = {}
+        preferred_scales: dict[str, int] = {}
+        for node, info in nodes.items():
+            if not isinstance(info, dict):
+                continue
+            op = str(info.get("op", ""))
+            if op in {"constant", "input"}:
+                continue
+            fanout = _safe_int(info.get("out_degree"), 0)
+            depth = _safe_int(info.get("depth_to_output"), 0)
+            scale_lb = _safe_int(info.get("scale_lb_out"), int(ckks["Sw"]))
+            if fanout >= 2 or depth >= depth_threshold:
+                preferred_levels[str(node)] = int(ckks["lvl_ub"])
+                preferred_scales[str(node)] = max(int(ckks["Sw"]), scale_lb)
+        policy = {
+            "strategy": "level_preserving",
+            "prefer_level_preservation": True,
+            "allow_bootstrap": False,
+            "allow_seed_fallback": True,
+            "refresh_fanout_at_level_floor": True,
+            "max_scale_candidates": 40,
+            "bootstrap_penalty": 900_000_000.0,
+            "rescale_penalty": 250_000.0,
+            "level_drop_penalty": 16_000_000.0,
+            "min_internal_level": max(int(ckks["lvl_lb"]), int(ckks["bts_lb"]) + 1),
+            "scale_penalty": 1_000.0,
+            "preferred_node_levels": preferred_levels,
+            "preferred_node_scales": preferred_scales,
+            "preferred_edge_scales": {},
+        }
+        for key in ("preferred_node_levels", "preferred_node_scales", "preferred_edge_scales"):
+            values = overrides.pop(key, None)
+            if isinstance(values, dict):
+                policy[key].update(values)
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
     def placement_records(
         self, records: list[dict[str, Any]], fallback_policy: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -2338,37 +2513,72 @@ def _maintenance_counts(assign: Assign) -> dict[str, int]:
     return counts
 
 
-def _bootstrap_locations(assign: Assign) -> dict[str, int]:
-    locations: Counter[str] = Counter()
+def _boundary_quality(params: Params, final_io_choice: tuple[int, int, int, int] | None) -> float:
+    if final_io_choice is None:
+        return 0.0
+    _in_lvl, _in_scl, out_lvl, out_scl = final_io_choice
+    level_span = max(1, params.lvl_ub - params.lvl_lb)
+    level_score = max(0.0, min(1.0, (out_lvl - params.lvl_lb) / level_span))
+    target_scale = max(params.Sw, params.Sf)
+    scale_score = 1.0 / (1.0 + abs(out_scl - target_scale) / max(1, params.Sf))
+    decrypt_score = 1.0 if _is_decryptable(params, out_lvl, out_scl) else 0.0
+    return 0.55 * level_score + 0.30 * scale_score + 0.15 * decrypt_score
+
+
+def _maintenance_locations(assign: Assign) -> dict[str, dict[str, int]]:
+    locations = {"bootstrap": Counter(), "rescale": Counter()}
     params = assign.params
     for v in assign.tdag.nodes:
         if assign.tdag.nodes[v]["op"] == "constant":
             continue
         in_lvl, in_scl = assign.get_v_in_lvl_scl(v)
-        if not params.check_res(in_lvl, in_scl, assign.v_lvl_out[v], assign.v_scl_out[v]):
-            locations[_node_location(assign.tdag.nodes[v])] += 1
+        delta = _transition_count_values(params, in_lvl, in_scl, assign.v_lvl_out[v], assign.v_scl_out[v])
+        location = _node_location(assign.tdag.nodes[v])
+        locations["bootstrap"][location] += delta["bootstrap"]
+        locations["rescale"][location] += delta["rescale"]
     for u, v in assign.tdag.edges:
         if assign.tdag.nodes[u]["op"] == "constant":
             continue
-        if not params.check_res(
+        delta = _transition_count_values(
+            params,
             assign.v_lvl_out[u],
             assign.v_scl_out[u],
             assign.e_lvl_out[(u, v)],
             assign.e_scl_out[(u, v)],
-        ):
-            locations[_node_location(assign.tdag.nodes[v])] += 1
-    return dict(locations)
+        )
+        location = _node_location(assign.tdag.nodes[v])
+        locations["bootstrap"][location] += delta["bootstrap"]
+        locations["rescale"][location] += delta["rescale"]
+    return {
+        "bootstrap": {key: value for key, value in locations["bootstrap"].items() if value},
+        "rescale": {key: value for key, value in locations["rescale"].items() if value},
+    }
+
+
+def _bootstrap_locations(assign: Assign) -> dict[str, int]:
+    return _maintenance_locations(assign)["bootstrap"]
 
 
 def _node_location(attrs: dict[str, Any]) -> str:
     comment = str(attrs.get("comment", ""))
     layer = "none"
     op = str(attrs.get("op", "unknown"))
+    scope = ""
     for part in comment.split(";"):
         if part.startswith("layer="):
             layer = part.split("=", 1)[1]
         elif part.startswith("op="):
             op = part.split("=", 1)[1]
+        elif part.startswith("scope="):
+            scope = part.split("=", 1)[1]
+    if layer == "none" and scope:
+        pieces = [piece for piece in scope.split(".") if piece]
+        if "layer" in pieces:
+            idx = pieces.index("layer")
+            if idx + 1 < len(pieces):
+                layer = f"layer.{pieces[idx + 1]}"
+        elif pieces:
+            layer = ".".join(pieces[: min(3, len(pieces))])
     return f"layer={layer};op={op}"
 
 

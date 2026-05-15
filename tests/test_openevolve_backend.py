@@ -200,6 +200,7 @@ class FakeDatabaseConfig:
 class FakeConfig:
     def __init__(self):
         self.random_seed = None
+        self.checkpoint_interval = None
         self.llm = FakeLLMConfig()
         self.database = FakeDatabaseConfig()
 
@@ -496,6 +497,49 @@ def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
     assert PlacementBuilder(context).level_preserving()["policy"]["strategy"] == "level_preserving"
 
 
+def test_builder_depth_fanout_policy_uses_graph_summary(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+
+    policy = PlacementBuilder(context).depth_fanout_aware()["policy"]
+
+    assert policy["strategy"] == "level_preserving"
+    assert policy["refresh_fanout_at_level_floor"] is True
+    assert policy["min_internal_level"] == params.bts_lb + 1
+    assert policy["preferred_node_levels"]["mul0"] == params.lvl_ub
+
+
+def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
+    output_dir = tmp_path / "openevolve_output"
+    best_code = "def place(context):\n    return {'tag': 'result_best'}\n"
+    high_code = "def place(context):\n    return {'tag': 'high_checkpoint'}\n"
+    best_dir_code = "def place(context):\n    return {'tag': 'best_dir'}\n"
+    low_code = "def place(context):\n    return {'tag': 'low_checkpoint'}\n"
+    (output_dir / "best").mkdir(parents=True)
+    (output_dir / "best" / "best_program.py").write_text(best_dir_code, encoding="utf-8")
+    (output_dir / "best" / "best_program_info.json").write_text(
+        json.dumps({"metrics": {"combined_score": 1.5}}),
+        encoding="utf-8",
+    )
+    for name, code, score in (
+        ("checkpoint_10", high_code, 1.9),
+        ("checkpoint_20", low_code, 0.2),
+    ):
+        program_dir = output_dir / "checkpoints" / name / "programs"
+        program_dir.mkdir(parents=True)
+        (program_dir / "program.json").write_text(
+            json.dumps({"code": code, "metrics": {"combined_score": score}}),
+            encoding="utf-8",
+        )
+
+    finalists = oe_backend._discover_finalist_codes(output_dir, best_code, 3)
+
+    assert finalists[0] == best_code
+    assert high_code in finalists
+    assert best_dir_code in finalists
+    assert low_code not in finalists
+
+
 def test_evaluator_validity_counts_duplicate_requested_budgets(
     toy_cost_json: str, tmp_path: Path
 ):
@@ -600,7 +644,7 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
 
 def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     _install_fake_openevolve(monkeypatch, lambda **_kwargs: None)
-    params = _params(toy_cost_json, openevolve_iterations=2, openevolve_seed=7)
+    params = _params(toy_cost_json, openevolve_iterations=50, openevolve_seed=7)
     worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
 
     config = worker._openevolve_config_arg()
@@ -611,10 +655,13 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     assert config.llm.models[0].name == "gemini-3.1-pro-preview"
     assert config.llm.models[0].api_base == config.llm.api_base
     assert config.llm.models[0].random_seed == 7
+    assert config.checkpoint_interval == 10
     assert config.database.feature_dimensions == [
         "final_latency_usec",
+        "boundary_quality",
         "bootstrap_count",
         "rescale_count",
+        "fallback_selected_budgets",
         "profile_risk",
         "placement_runtime_sec",
     ]

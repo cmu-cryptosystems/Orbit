@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from scripts.assignment import Assign
 from scripts.latency_estimator.latency_estimator import LatencyEstimator
 import scripts.optimizer.orbit.openevolve_backend as oe_backend
 from scripts.optimizer.orbit.openevolve_backend import (
     OpenEvolvePlacementWorker,
     PlacementBuilder,
+    PlacementConstraints,
     _aggregate_counts,
     build_context,
     build_compile_context,
@@ -24,6 +26,7 @@ from scripts.optimizer.orbit.openevolve_backend import (
     serialize_assignment_record,
     solve_budget_batch,
     tdag_from_context,
+    transition_slack,
     valid_transition,
 )
 from scripts.optimizer.orbit.qbp_manager import QBPManager
@@ -258,6 +261,8 @@ def test_context_roundtrip_and_conservative_placement(toy_cost_json: str):
     assert context["graph_summary"]["max_scale"] == params.Sf + 2 * params.Sw
     assert context["budget_summary"]["count"] == 1
     assert context["constraints"]["local_scale_lower_bounds"]["0"]["in"] == 40
+    assert context["constraints"]["ilp_semantics"]["solver_free"] is True
+    assert "decryptable" in context["constraints"]["ilp_semantics"]["constraints"]
     assert context["latency_model"]["available_ops"]
 
     le = LatencyEstimator(params)
@@ -521,7 +526,57 @@ def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
 
     assert valid_transition(context, 16, 40, 15, 40)
     assert not valid_transition(context, 1, 131, 16, 40)
+    assert not valid_transition(context, 16, params.max_scale() + 1, 15, 40)
+    slack = transition_slack(context, 16, 40, 15, 40)
+    assert slack["valid"] is True
+    assert slack["uses_bootstrap"] is False
+    assert slack["transition_reserve_bits"] >= 0
+    invalid = transition_slack(context, 1, 131, 16, 40)
+    assert invalid["valid"] is False
+    assert "input_not_decryptable" in invalid["violations"]
+    above_max = transition_slack(context, 16, params.max_scale() + 1, 15, 40)
+    assert above_max["valid"] is False
+    assert "input_scale_above_max" in above_max["violations"]
     assert PlacementBuilder(context).level_preserving()["policy"]["strategy"] == "level_preserving"
+    constraints = PlacementConstraints(context)
+    assert constraints.decryptability_bound(16) == params.Sf * (16 - params.lvl_lb + 2) - 7
+    assert constraints.boundary_output_scale_bound(16) == params.Sf * (16 + 1) - 7
+    assert constraints.valid_transition(16, 40, 15, 40)
+    assert constraints.transition_slack(16, 40, 15, 40)["valid"] is True
+    assert constraints.node_scale_lower_bound("0", "out") == params.Sw
+    assert constraints.edge_scale_lower_bound("arg0", "0") == params.Sw
+    assert constraints.mul_input_scale([40]) == 80
+    states = constraints.legal_output_states(16, 40, include_bootstrap=False)
+    assert states
+    assert all(not state["uses_bootstrap"] for state in states)
+    assert states[0]["level"] <= params.lvl_ub
+    assert PlacementBuilder(context).constraints.legal_output_states(16, 40)
+
+
+def test_assignment_validation_rejects_non_decryptable_candidate_record(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    assign = Assign(graph)
+    too_large_scale = params.max_scale() + 1
+    assign.v_lvl_in["arg0"] = params.lvl_ub
+    assign.v_scl_in["arg0"] = 40
+    assign.v_lvl_out["arg0"] = params.lvl_ub
+    assign.v_scl_out["arg0"] = 40
+    assign.e_lvl_out[("arg0", "0")] = params.lvl_ub
+    assign.e_scl_out[("arg0", "0")] = 40
+    assign.v_lvl_out["0"] = params.lvl_ub
+    assign.v_scl_out["0"] = too_large_scale
+
+    with pytest.raises(ValueError, match="decryptability bounds"):
+        assign.check_assign()
+
+
+def test_none_min_internal_level_matches_ilp_lower_bound(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    options = oe_backend._policy_options({"strategy": "level_preserving", "min_internal_level": None}, params)
+
+    assert options["min_internal_level"] is None
+    assert oe_backend._effective_min_internal_level(options, params) == params.lvl_lb
 
 
 def test_patch_vocabulary_and_portfolio_normalize(toy_cost_json: str, tmp_path: Path):
@@ -576,7 +631,41 @@ def test_builder_depth_fanout_policy_uses_graph_summary(toy_cost_json: str):
     assert policy["preferred_node_levels"]["mul0"] == params.lvl_ub
 
 
-def test_builder_low_scale_frontier_policy_is_compile_seed(toy_cost_json: str, tmp_path: Path):
+def test_builder_noise_guarded_policy_preserves_headroom(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+
+    policy = PlacementBuilder(context).noise_guarded_refresh()["policy"]
+
+    assert policy["strategy"] == "level_preserving"
+    assert policy["refresh_fanout_at_level_floor"] is True
+    assert policy["allow_seed_fallback"] is False
+    assert policy["min_internal_level"] == 12
+    assert policy["max_scale_candidates"] == 12
+    assert policy["reserve_penalty"] > 0
+    assert policy["min_transition_reserve"] > 0
+
+
+def test_profile_layer_refresh_targets_reference_bert_layernorm_comments(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _branch_merge_pdag(params)
+    graph.nodes["left"]["comment"] = (
+        "scope=bert.encoder.layer.0.attention.output.LayerNorm;op=layer_norm"
+    )
+    graph.nodes["right"]["comment"] = (
+        "scope=bert.encoder.layer.0.output.LayerNorm;op=layer_norm"
+    )
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    policy = PlacementBuilder(context).profile_layer_refresh(include_attention=True)["policy"]
+
+    assert policy["preferred_node_levels"]["left"] == params.lvl_ub
+    assert policy["preferred_node_levels"]["right"] == params.lvl_ub
+    assert policy["preferred_node_scales"]["left"] == params.Sf
+    assert policy["preferred_node_scales"]["right"] == params.Sf
+
+
+def test_builder_compile_seed_includes_bounded_reliable_portfolio(toy_cost_json: str, tmp_path: Path):
     params = _params(toy_cost_json)
     context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
     program_path = tmp_path / "initial.py"
@@ -587,9 +676,126 @@ def test_builder_low_scale_frontier_policy_is_compile_seed(toy_cost_json: str, t
     assert hints["strategy"] == "level_preserving"
     assert hints["refresh_fanout_at_level_floor"] is True
     assert hints["max_scale_candidates"] == 10
-    assert hints["scale_penalty"] == 0.0
+    assert hints["min_internal_level"] is None
+    assert hints["level_drop_penalty"] == 20_000_000.0
     assert hints["allow_seed_fallback"] is False
-    assert not hints.get("portfolio")
+    assert [policy["strategy"] for policy in hints["portfolio"]] == [
+        "level_preserving",
+        "level_preserving",
+        "level_preserving",
+        "level_preserving",
+        "level_preserving",
+        "level_preserving",
+    ]
+    assert hints["portfolio"][0]["refresh_fanout_at_level_floor"] is True
+    assert hints["portfolio"][0]["min_internal_level"] is None
+    assert hints["portfolio"][1]["bootstrap_penalty"] == 650_000_000.0
+    assert hints["portfolio"][2]["bootstrap_penalty"] == 650_000_000.0
+    assert hints["portfolio"][3]["min_internal_level"] == 6
+    assert hints["portfolio"][4]["min_internal_level"] == 8
+    assert hints["portfolio"][5]["min_internal_level"] == 12
+
+
+def test_sampled_compile_eval_scores_bounded_primary_policy(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
+    full = oe_backend._compile_hints_for_eval_suite(hints, "polybert-full")
+
+    assert sampled["strategy"] == hints["strategy"]
+    assert "portfolio" not in sampled
+    assert sampled["allow_seed_fallback"] is False
+    assert sampled["max_scale_candidates"] <= 16
+    assert sampled["beam_width"] <= 4
+    assert len(full["portfolio"]) == 6
+
+
+def test_full_bundle_finalist_replay_bounds_portfolio(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    finalist = oe_backend._finalist_hints_for_full_bundle(hints)
+
+    assert finalist["strategy"] == "level_preserving"
+    assert "portfolio" not in finalist
+    assert finalist["allow_seed_fallback"] is False
+    assert finalist["max_scale_candidates"] <= 16
+
+
+def test_compile_fail_open_uses_validated_zero_iteration_portfolio(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+    initial_hints = oe_backend._load_candidate_hints(program_path, context)
+
+    fail_open = oe_backend._bounded_fail_open_hints(initial_hints)
+
+    assert fail_open["fail_open_reason"] == "zero_iteration_seed_portfolio"
+    assert fail_open["strategy"] == "level_preserving"
+    assert isinstance(fail_open.get("portfolio"), list)
+    assert {policy.get("min_internal_level") for policy in fail_open["portfolio"]} >= {6, 8, 12}
+
+
+def test_sampled_invalid_best_skips_expensive_full_bundle(tmp_path: Path):
+    output_dir = tmp_path / "openevolve_output"
+    best_dir = output_dir / "best"
+    best_dir.mkdir(parents=True)
+    (best_dir / "best_program_info.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "combined_score": 0.0925,
+                    "validity": 0.0,
+                    "effective_validity": 0.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert oe_backend._sampled_best_invalid_reason(output_dir) == "sampled_best_solved_no_budgets"
+
+
+def test_full_bundle_finalist_variants_include_bounded_portfolio(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    variants = oe_backend._finalist_hint_variants(hints)
+
+    assert [label for label, _policy in variants] == [
+        "primary",
+        "portfolio_1",
+        "portfolio_3",
+        "portfolio_4",
+        "portfolio_5",
+    ]
+    assert all("portfolio" not in policy for _label, policy in variants)
+
+
+def test_sampled_compile_eval_rejects_expensive_policy(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["eval_suite"] = "polybert-sampled"
+
+    reasons = oe_backend._sampled_policy_static_reasons(
+        context,
+        {"strategy": "waterline_seed"},
+    )
+
+    assert "sampled policy rejects strategy 'waterline_seed'" in reasons
 
 
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
@@ -799,6 +1005,37 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
     assert evolved["metrics"]["validity"] == 1.0
     assert "candidate_final_latency_usec" in evolved["artifacts"]
     assert evolved["metrics"]["final_latency_usec"] > 0.0
+
+
+def test_compile_invalid_metrics_cover_configured_feature_dimensions(
+    toy_cost_json: str,
+    tmp_path: Path,
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="toy")
+    graph = _toy_pdag(params)
+    context_path = tmp_path / "compile_context.json"
+    bad_program = tmp_path / "bad.py"
+    context_path.write_text(json.dumps(build_compile_context(graph, params)), encoding="utf-8")
+    bad_program.write_text(
+        "def place(context):\n"
+        "    return {'preferred_node_scales': {'0': 9999}}\n",
+        encoding="utf-8",
+    )
+
+    result = evaluate_compile_candidate_program(context_path, bad_program)
+
+    for key in (
+        "final_latency_usec",
+        "boundary_quality",
+        "bootstrap_count",
+        "rescale_count",
+        "fallback_selected_budgets",
+        "profile_risk",
+        "placement_runtime_sec",
+        "estimated_precision_bits",
+        "output_margin_bits",
+    ):
+        assert key in result["metrics"]
 
 
 def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
@@ -1026,6 +1263,7 @@ def test_compile_harness_fail_open_returns_initial_seed(
 
     assert hints["strategy"] == "level_preserving"
     assert hints["refresh_fanout_at_level_floor"] is True
+    assert hints["max_scale_candidates"] == 10
     assert (tmp_path / "compile_oe_toy" / "openevolve_recovery.json").is_file()
 
 
@@ -1138,6 +1376,63 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
     assert ("polybert-full", None) in eval_suites
     assert ("polybert-full", 123.0) in eval_suites
     assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
+
+
+def test_compile_harness_reuses_existing_output_without_llm(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "compile_oe_toy"
+    best_dir = root / "openevolve_output" / "best"
+    best_dir.mkdir(parents=True)
+    best_dir.joinpath("best_program.py").write_text(
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+        "def place(context):\n"
+        "    return PlacementBuilder(context).level_preserving(level_drop_penalty=456.0)\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_evolution(**_kwargs):
+        raise AssertionError("reuse mode must not call OpenEvolve")
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if hints.get("level_drop_penalty") == 456.0 else 100.0,
+            "bootstrap_count": 4,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {"out_scl": 40},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=50,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+        openevolve_reuse_output=True,
+        noise_estimator="off",
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["level_drop_penalty"] == 456.0
+    assert (root / "finalists" / "full_bundle_summary.json").is_file()
+    assert (root / "finalists" / "full_bundle_progress.json").is_file()
 
 
 def test_noise_estimator_invalid_finalist_falls_back_to_initial_seed(
@@ -1256,6 +1551,247 @@ def test_noise_estimator_off_allows_fast_finalist(
     assert hints["level_drop_penalty"] == 123.0
 
 
+def test_full_bundle_finalist_gate_ignores_legacy_min_bootstrap_count(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving(level_drop_penalty=123.0)\n"
+        )
+
+    def fake_run_evolution(**_kwargs):
+        return FakeResult()
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        is_fast_low_bootstrap = hints.get("level_drop_penalty") == 123.0
+        is_balanced_seed = hints.get("max_scale_candidates") == 8
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if is_fast_low_bootstrap else 90.0 if is_balanced_seed else 120.0,
+            "bootstrap_count": 6 if is_fast_low_bootstrap else 10,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {"out_scl": 40},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    reference = tmp_path / "reference.json"
+    reference.write_text(
+        json.dumps({"final_latency_usec": 100.0, "min_bootstrap_count": 10}),
+        encoding="utf-8",
+    )
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+        openevolve_reference_json=str(reference),
+        noise_estimator="off",
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints["level_drop_penalty"] == 123.0
+    summary = json.loads(
+        (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").read_text()
+    )
+    assert summary["finalist_gate"]["forced_bootstrap_floor"] is None
+    assert summary["selected_index"] == 0
+
+
+def test_full_bundle_finalist_gate_honors_explicit_forced_bootstrap_floor(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResult:
+        best_code = (
+            "from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder\n"
+            "def place(context):\n"
+            "    return PlacementBuilder(context).level_preserving(level_drop_penalty=123.0)\n"
+        )
+
+    def fake_run_evolution(**_kwargs):
+        return FakeResult()
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        is_fast_low_bootstrap = hints.get("level_drop_penalty") == 123.0
+        is_balanced_seed = hints.get("max_scale_candidates") == 8
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if is_fast_low_bootstrap else 90.0 if is_balanced_seed else 120.0,
+            "bootstrap_count": 6 if is_fast_low_bootstrap else 10,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {"out_scl": 40},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    reference = tmp_path / "reference.json"
+    reference.write_text(
+        json.dumps({"final_latency_usec": 100.0, "force_min_bootstrap_count": 10}),
+        encoding="utf-8",
+    )
+    _install_fake_openevolve(monkeypatch, fake_run_evolution)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=2,
+        openevolve_harness="compile",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        openevolve_output_dir=str(tmp_path),
+        openevolve_reference_json=str(reference),
+        noise_estimator="off",
+    )
+
+    hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
+
+    assert hints.get("level_drop_penalty") != 123.0
+    assert hints["max_scale_candidates"] == 10
+    summary = json.loads(
+        (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").read_text()
+    )
+    assert summary["finalist_gate"]["forced_bootstrap_floor"] == 10
+    assert any(
+        candidate.get("finalist_gate", {}).get("bootstrap_reject")
+        for candidate in summary["candidates"]
+        if candidate.get("label") == "candidate_0"
+    )
+
+
+def test_plaintext_quality_gate_rejects_near_constant_reference():
+    reject, reason = oe_backend._finalist_plaintext_quality_reject(
+        {
+            "harness": {
+                "reference_json": {
+                    "plaintext_sanity": {
+                        "records": 10,
+                        "near_constant_first2_logits": True,
+                        "first2_margin_min": 0.0001,
+                    },
+                    "min_plaintext_logit_margin": 0.001,
+                }
+            }
+        }
+    )
+    assert reject is True
+    assert reason == "near_constant_first2_logits"
+
+
+def test_profile_noise_metadata_gate_requires_estimator_profile():
+    reject, reason = oe_backend._profile_noise_metadata_reject(
+        {"resilience": {"enabled": True, "ckks_noise_model": None}}
+    )
+    assert reject is True
+    assert reason == "missing_ckks_noise_model"
+    reject, reason = oe_backend._profile_noise_metadata_reject(
+        {
+            "resilience": {
+                "enabled": True,
+                "ckks_noise_model": {"model": "tuneinsight-lattigo-v6", "fallback": False},
+            }
+        }
+    )
+    assert reject is False
+    assert reason is None
+
+
+def test_balanced_noise_margin_is_not_tied_to_reference_bootstrap_count(
+    toy_cost_json: str,
+    tmp_path: Path,
+):
+    params = _params(toy_cost_json, openevolve_reference_json=str(tmp_path / "reference.json"))
+    (tmp_path / "reference.json").write_text(
+        json.dumps({"min_bootstrap_count": 11, "force_min_bootstrap_count": 11}),
+        encoding="utf-8",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+
+    policy = PlacementBuilder(context).balanced_noise_margin()["policy"]
+
+    assert policy["max_scale_candidates"] == 8
+
+
+def test_ilp_style_reserve_metrics_are_exposed_to_openevolve(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _branch_merge_pdag(params)
+    le = LatencyEstimator(params)
+    io_to_assign, _io_to_cost = solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": 40}],
+        le,
+        params,
+        PlacementBuilder(build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params))
+        .noise_guarded_refresh()
+        ["policy"],
+    )
+
+    assign = next(iter(next(iter(io_to_assign.values())).values()))
+    reserve = oe_backend._assignment_reserve_summary(assign, graph, params)
+
+    assert reserve["min_decryptability_reserve_bits"] is not None
+    assert reserve["min_transition_reserve_bits"] is not None
+    assert reserve["min_decryptability_reserve_bits"] >= 0
+    assert reserve["min_transition_reserve_bits"] >= 0
+    assert oe_backend._reserve_quality_score(reserve) >= 0.0
+
+
+def test_estimator_backed_profile_rejects_trace_noise_warnings(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    noise = {
+        "valid": True,
+        "warning_ops": ["trace_precision_below_margin"],
+    }
+
+    reject, reason = oe_backend._finalist_noise_warning_reject(
+        {
+            "resilience": {
+                "enabled": True,
+                "ckks_noise_model": {"model": "tuneinsight-lattigo-v6", "fallback": False},
+            }
+        },
+        noise,
+        params,
+    )
+    assert reject is True
+    assert reason == "trace_precision_below_margin"
+
+    reject, reason = oe_backend._finalist_noise_warning_reject(
+        {"resilience": {"enabled": False}},
+        noise,
+        params,
+    )
+    assert reject is False
+    assert reason is None
+
+
 def test_zero_iteration_openevolve_path_does_not_import_gurobipy(
     toy_cost_json: str,
     monkeypatch,
@@ -1276,6 +1812,26 @@ def test_zero_iteration_openevolve_path_does_not_import_gurobipy(
 
     assert io_to_assign
     assert io_to_cost
+
+
+def test_zero_iteration_worker_uses_safety_portfolio(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json, openevolve_iterations=0)
+    graph = _toy_pdag(params)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    captured = {}
+
+    def fake_solve_budget_batch(_pdag, _budgets, _le, _params, hints, _diagnostics):
+        captured.update(hints)
+        return {}, {}
+
+    monkeypatch.setattr(oe_backend, "solve_budget_batch", fake_solve_budget_batch)
+
+    worker.get_qbp(graph, [{"in_lvl": -1, "in_scl": 40}])
+
+    portfolio = captured.get("portfolio")
+    assert isinstance(portfolio, list)
+    assert {policy.get("min_internal_level") for policy in portfolio} >= {6, 8, 12}
+    assert all(policy.get("allow_seed_fallback") is False for policy in portfolio)
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

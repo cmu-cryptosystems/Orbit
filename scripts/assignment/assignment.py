@@ -113,12 +113,22 @@ class Assign:
                 raise ValueError(
                     f"Node {v} output scale {v_os} below local lower bound {scale_lb}."
                 )
+            if not self.params.is_decryptable_state(v_ol, v_os):
+                raise ValueError(
+                    f"Node {v} output state (level={v_ol}, scale={v_os}) "
+                    "violates Orbit ILP decryptability bounds."
+                )
 
             v_il, v_is = self.get_v_in_lvl_scl(v)
             input_scale_lb = self.params.scale_lower_bound(v, self.tdag.nodes[v], "in")
             if v_is < input_scale_lb:
                 raise ValueError(
                     f"Node {v} input scale {v_is} below local lower bound {input_scale_lb}."
+                )
+            if not self.params.is_decryptable_state(v_il, v_is):
+                raise ValueError(
+                    f"Node {v} input state (level={v_il}, scale={v_is}) "
+                    "violates Orbit ILP decryptability bounds."
                 )
             if not self.params.check_resbts(v_il, v_is, v_ol, v_os):
                 raise ValueError(f"Node {v} with operation {op} has invalid level/scale transition: in({v_il}, {v_is}) -> out({v_ol}, {v_os}).")
@@ -142,6 +152,11 @@ class Assign:
                     raise ValueError(
                         f"Edge ({u} -> {v}) output scale {e_os} below "
                         f"local lower bound {edge_scale_lb}."
+                    )
+                if not self.params.is_decryptable_state(e_ol, e_os):
+                    raise ValueError(
+                        f"Edge ({u} -> {v}) output state (level={e_ol}, "
+                        f"scale={e_os}) violates Orbit ILP decryptability bounds."
                     )
                 if not self.params.check_resbts(e_il, e_is, e_ol, e_os):
                     raise ValueError(f"Edge ({u} -> {v}) has invalid level/scale transition: in({e_il}, {e_is}) -> out({e_ol}, {e_os}).")

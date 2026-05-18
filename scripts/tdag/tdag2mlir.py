@@ -19,7 +19,6 @@ def _get_op_descr(v: dict, params: Params) -> str:
     elif op == 'constant':
         return f"<{{rms_var = {descr['rms_var']} : f64, value = {descr['value']} : i64}}>"
     elif op in ['add', 'mul']:
-        assert descr['single'] + descr['double'] == 1, f"Only single or double operations are supported. Got {descr} for {v}"
         return ""
     elif op == 'rotate':
         return f"<{{offset = array<i64: {descr['offset']}>}}>"
@@ -89,8 +88,7 @@ def tdag_to_mlir(tdag: Tdag, filename: str):
         "  }) : () -> () loc(unknown)",
         "}) : () -> () loc(unknown)"
     ]
-    
+
     with open(filename, 'w') as f:
         for line in itertools.chain(headers, lines, footers):
             f.write(line + "\n")
-            

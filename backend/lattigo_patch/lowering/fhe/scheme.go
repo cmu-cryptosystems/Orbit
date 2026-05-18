@@ -71,39 +71,41 @@ type TimingStats struct {
 }
 
 type LattigoFHE struct {
-	params            *ckks.Parameters
-	btpParams         *bootstrapping.Parameters
-	terms             map[int]*Term                    // stores term info
-	env               map[int]*rlwe.Ciphertext         // stores ciphertexts
-	ptEnv             map[int][]float64                // stores plaintexts
-	constants         map[int][]float64                // stores constants by value
-	refCounts         map[int]int                      // stores reference counts for memory management
-	hoistedRots       map[int]map[int]*rlwe.Ciphertext // hoisted rotations: childlinenum -> offset -> ciphertext
-	rotCount          map[int]int                      // count of rotation uses: childlinenum -> count
-	n                 int
-	maxLevel          int
-	bootstrapMinLevel int
-	bootstrapMaxLevel int
-	eval              *ckks.Evaluator
-	btpEval           *bootstrapping.Evaluator
-	enc               *rlwe.Encryptor
-	ecd               *ckks.Encoder
-	dec               *rlwe.Decryptor
-	instructionsPath  string
-	mlirPath          string
-	constantsPath     string
-	inputPath         string
-	outputFile        string
-	trueLabelsPath    string
-	fileType          FileType
-	getStats          bool
-	logFile           string
-	enableTiming      bool
-	heMode            bool
-	timingStats       *TimingStats
+	params               *ckks.Parameters
+	btpParams            *bootstrapping.Parameters
+	terms                map[int]*Term                    // stores term info
+	env                  map[int]*rlwe.Ciphertext         // stores ciphertexts
+	ptEnv                map[int][]float64                // stores plaintexts
+	constants            map[int][]float64                // stores constants by value
+	refCounts            map[int]int                      // stores reference counts for memory management
+	hoistedRots          map[int]map[int]*rlwe.Ciphertext // hoisted rotations: childlinenum -> offset -> ciphertext
+	rotCount             map[int]int                      // count of rotation uses: childlinenum -> count
+	n                    int
+	maxLevel             int
+	bootstrapMinLevel    int
+	bootstrapMaxLevel    int
+	eval                 *ckks.Evaluator
+	btpEval              *bootstrapping.Evaluator
+	enc                  *rlwe.Encryptor
+	ecd                  *ckks.Encoder
+	dec                  *rlwe.Decryptor
+	instructionsPath     string
+	mlirPath             string
+	constantsPath        string
+	dynamicMaskTablePath string
+	dynamicMaskPath      string
+	inputPath            string
+	outputFile           string
+	trueLabelsPath       string
+	fileType             FileType
+	getStats             bool
+	logFile              string
+	enableTiming         bool
+	heMode               bool
+	timingStats          *TimingStats
 }
 
-func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPath string, inputPath string, outputFile string, trueLabelsPath string, fileType FileType, maxLevel int, bootstrapMinLevel int, bootstrapMaxLevel int, logFile string, enableTiming bool, heMode bool) *LattigoFHE {
+func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPath string, dynamicMaskTablePath string, dynamicMaskPath string, inputPath string, outputFile string, trueLabelsPath string, fileType FileType, maxLevel int, bootstrapMinLevel int, bootstrapMaxLevel int, logFile string, enableTiming bool, heMode bool) *LattigoFHE {
 	var timingStats *TimingStats
 	if enableTiming {
 		timingStats = &TimingStats{
@@ -113,29 +115,31 @@ func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPat
 	}
 
 	return &LattigoFHE{
-		terms:             make(map[int]*Term),
-		env:               make(map[int]*rlwe.Ciphertext),
-		ptEnv:             make(map[int][]float64),
-		constants:         make(map[int][]float64),
-		refCounts:         make(map[int]int),
-		hoistedRots:       make(map[int]map[int]*rlwe.Ciphertext),
-		rotCount:          make(map[int]int),
-		n:                 n,
-		maxLevel:          maxLevel,
-		bootstrapMinLevel: bootstrapMinLevel,
-		bootstrapMaxLevel: bootstrapMaxLevel,
-		instructionsPath:  instructionsPath,
-		mlirPath:          mlirPath,
-		constantsPath:     constantsPath,
-		inputPath:         inputPath,
-		outputFile:        outputFile,
-		trueLabelsPath:    trueLabelsPath,
-		fileType:          fileType,
-		getStats:          logFile != "",
-		logFile:           logFile,
-		enableTiming:      enableTiming,
-		timingStats:       timingStats,
-		heMode:            heMode,
+		terms:                make(map[int]*Term),
+		env:                  make(map[int]*rlwe.Ciphertext),
+		ptEnv:                make(map[int][]float64),
+		constants:            make(map[int][]float64),
+		refCounts:            make(map[int]int),
+		hoistedRots:          make(map[int]map[int]*rlwe.Ciphertext),
+		rotCount:             make(map[int]int),
+		n:                    n,
+		maxLevel:             maxLevel,
+		bootstrapMinLevel:    bootstrapMinLevel,
+		bootstrapMaxLevel:    bootstrapMaxLevel,
+		instructionsPath:     instructionsPath,
+		mlirPath:             mlirPath,
+		constantsPath:        constantsPath,
+		dynamicMaskTablePath: dynamicMaskTablePath,
+		dynamicMaskPath:      dynamicMaskPath,
+		inputPath:            inputPath,
+		outputFile:           outputFile,
+		trueLabelsPath:       trueLabelsPath,
+		fileType:             fileType,
+		getStats:             logFile != "",
+		logFile:              logFile,
+		enableTiming:         enableTiming,
+		timingStats:          timingStats,
+		heMode:               heMode,
 	}
 }
 
@@ -527,6 +531,12 @@ func (lattigo *LattigoFHE) Run() (pt_results []float64, _err error) {
 			return nil, fmt.Errorf("error loading constants: %v", err)
 		}
 	}
+	if lattigo.dynamicMaskTablePath != "" {
+		err := lattigo.applyDynamicPlaintextMasks(lattigo.dynamicMaskPathForInput(lattigo.inputPath))
+		if err != nil {
+			return nil, fmt.Errorf("error applying dynamic plaintext masks: %v", err)
+		}
+	}
 
 	fmt.Println("Preprocessing...")
 	lattigo.preprocess(operations)
@@ -623,15 +633,6 @@ func (lattigo *LattigoFHE) RunBatch() error {
 	fmt.Println("Creating context...")
 	lattigo.createContext(lattigo.maxLevel, rots)
 
-	// Process constants once for all inputs
-	if lattigo.constantsPath != "" {
-		fmt.Println("Loading constants...")
-		err := lattigo.loadConstants(lattigo.constantsPath)
-		if err != nil {
-			return fmt.Errorf("error loading constants: %v", err)
-		}
-	}
-
 	inputFiles, err := lattigo.findInputFiles()
 	if err != nil {
 		return fmt.Errorf("error finding input files: %v", err)
@@ -668,6 +669,19 @@ func (lattigo *LattigoFHE) RunBatch() error {
 		lattigo.inputPath = inputFile
 		lattigo.processInputs(inputs)
 		lattigo.inputPath = originalInputPath
+		if lattigo.constantsPath != "" {
+			fmt.Println("Loading constants...")
+			err := lattigo.loadConstants(lattigo.constantsPath)
+			if err != nil {
+				return fmt.Errorf("error loading constants: %v", err)
+			}
+			if lattigo.dynamicMaskTablePath != "" {
+				err := lattigo.applyDynamicPlaintextMasks(lattigo.dynamicMaskPathForInput(inputFile))
+				if err != nil {
+					return fmt.Errorf("error applying dynamic plaintext masks: %v", err)
+				}
+			}
+		}
 
 		fmt.Println("Preprocessing...")
 		lattigo.preprocess(operations)

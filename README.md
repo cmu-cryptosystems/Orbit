@@ -73,7 +73,7 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-iterations <n>`: OpenEvolve iterations. Use `0` for deterministic placement without LLM calls.
 - `--openevolve-harness <compile|partition>`: Harness scope for positive iterations. Default `compile` runs one OpenEvolve search for the compile and replays final placement scoring; `partition` keeps the legacy per-batch behavior.
 - `--openevolve-eval-suite <toy|polybert-sampled|polybert-full>`: Evaluator bundle. Default `polybert-sampled` keeps compile-level scoring fast while preserving all final validation outside the harness.
-- `--openevolve-reference-json <path>`: Optional precomputed reference metrics for reporting only. This never runs PuLP/Gurobi inside OpenEvolve.
+- `--openevolve-reference-json <path>`: Optional precomputed reference metrics and quality gates. This never runs PuLP/Gurobi inside OpenEvolve; if it includes plaintext sanity fields, near-constant-logit candidates are gated below validated candidates.
 - `--openevolve-finalists <n>`: Number of candidates reserved for full-bundle finalist scoring metadata.
 - `--openevolve-seed <n>`: Seed passed into the generated OpenEvolve context and config override.
 - `--openevolve-provider <gemini|openai|custom>`: Provider for generated OpenEvolve config. Default is `gemini`.
@@ -88,7 +88,7 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--noise-estimator-binary <path>`: Optional JSON sidecar binary for CKKS noise estimation. If omitted, Orbit uses the built-in deterministic estimator contract.
 - `--noise-estimator-min-output-margin-bits <n>`: Minimum estimated precision margin for a finalist to beat a fully valid candidate. Default `2`.
 - `--noise-estimator-alpha <n>`: Gaussian tail multiplier used by the mathematical noise bound. Default `14`; see `math/ckks_noise_policy.md`.
-- `--resilience-profile <path>`: ckks-robustness-profiler 0.8.0 profile, generated Orbit constraint sidecar, or Orbit-native constraints JSON.
+- `--resilience-profile <path>`: ckks-robustness-profiler 0.8.0 profile, generated Orbit constraint sidecar, or Orbit-native constraints JSON. Positive-iteration OpenEvolve finalist selection expects regenerated profiles with populated `ckks_noise_model` metadata.
 - `--resilience-constraint-policy <relax-only|hard-tau>`: Use profile constraints as relaxed waterline guidance or hard local scale lower bounds.
 
 **Output files:**

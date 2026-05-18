@@ -67,3 +67,30 @@ def test_tdag_to_mlir_constant_uses_plaintext_type(toy_cost_json: str, tmp_path)
     assert "earth.constant" in text
     assert "rms_var = 0.25 : f64" in text and "value = 3 : i64" in text
     assert "!earth.pl<" in text
+
+
+def test_tdag_to_mlir_allows_mixed_compressed_add_descriptor(toy_cost_json: str, tmp_path):
+    p = _params(toy_cost_json)
+    g = Tdag(p, name="mixed_add")
+    g.add_node("arg0", op="input", weight=1, level=10, scale=51, op_descr={}, comment="")
+    g.add_node("arg1", op="input", weight=1, level=10, scale=51, op_descr={}, comment="")
+    g.add_node(
+        "add",
+        op="add",
+        weight=1,
+        level=10,
+        scale=51,
+        op_descr={"single": 1, "double": 1},
+        comment="// mixed compressed add",
+    )
+    g.add_edge("arg0", "add", weight=1)
+    g.add_edge("arg1", "add", weight=1)
+    g.inputs = {"arg0", "arg1"}
+    g.outputs = {"add"}
+
+    out = tmp_path / "out.mlir"
+    tdag_to_mlir(g, str(out))
+    text = out.read_text()
+
+    assert "earth.add" in text
+    assert "mixed compressed add" in text

@@ -76,6 +76,58 @@ def test_profiler_schema_080_loads_orbit_constraint_sidecar(tmp_path: Path):
     ) == 20
 
 
+def test_profiler_sidecars_are_relocatable_by_basename(tmp_path: Path):
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    sidecar_path = artifacts_dir / "remote_profile.orbit_constraints.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "orbit-resilience-constraints-v0",
+                "constraints": [
+                    {
+                        "scope": "bert.encoder.layer.3",
+                        "min_scale": 33,
+                        "ports": ["out"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "remote_profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.8.0",
+                "model": {"name": "relocated"},
+                "artifacts": {
+                    "orbit_constraints": (
+                        "/home/ec2-user/profiles/artifacts/"
+                        "remote_profile.orbit_constraints.json"
+                    ),
+                    "state_traces": (
+                        "/home/ec2-user/profiles/artifacts/"
+                        "remote_profile.state_traces.jsonl"
+                    ),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = ResilienceProfile.load(profile_path)
+
+    assert profile is not None
+    assert profile.artifacts["orbit_constraints"] == str(sidecar_path)
+    assert profile.scale_lower_bound(
+        "n",
+        {"comment": "scope=bert.encoder.layer.3.output;op=linear"},
+        20,
+        "out",
+    ) == 33
+
+
 def test_orbit_native_constraints_support_node_and_scope_matching(tmp_path: Path):
     payload = {
         "schema_version": "orbit-resilience-constraints-v0",

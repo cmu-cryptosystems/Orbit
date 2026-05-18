@@ -41,11 +41,14 @@ if __name__ == "__main__":
     parser.add_argument('--openevolve-parallel-evaluations', type=int, default=1)
     parser.add_argument('--openevolve-checkpoint-interval', type=int, default=5)
     parser.add_argument('--openevolve-fail-open', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--openevolve-reuse-output', action='store_true')
     parser.add_argument('--noise-estimator', choices=['off', 'finalists'], default='finalists')
     parser.add_argument('--noise-estimator-binary', type=str, default=None)
     parser.add_argument('--noise-estimator-timeout-sec', type=int, default=30)
     parser.add_argument('--noise-estimator-min-output-margin-bits', type=float, default=2.0)
     parser.add_argument('--noise-estimator-alpha', type=float, default=14.0)
+    parser.add_argument('--noise-estimator-max-trace-message-bits', type=float, default=20.0)
+    parser.add_argument('--noise-estimator-require-trace-safe', action='store_true')
     parser.add_argument('--resilience-profile', type=str, default=None)
     parser.add_argument('--resilience-mode', choices=['waterline', 'error-state'], default='waterline')
     parser.add_argument('--allow-empty-resilience-match', action='store_true')
@@ -111,6 +114,8 @@ if __name__ == "__main__":
         cmds += ["--openevolve-parallel-evaluations", str(args.openevolve_parallel_evaluations)]
         cmds += ["--openevolve-checkpoint-interval", str(args.openevolve_checkpoint_interval)]
         cmds.append("--openevolve-fail-open" if args.openevolve_fail_open else "--no-openevolve-fail-open")
+        if args.openevolve_reuse_output:
+            cmds.append("--openevolve-reuse-output")
         cmds += ["--noise-estimator", args.noise_estimator]
         cmds += ["--noise-estimator-timeout-sec", str(args.noise_estimator_timeout_sec)]
         cmds += [
@@ -118,6 +123,12 @@ if __name__ == "__main__":
             str(args.noise_estimator_min_output_margin_bits),
         ]
         cmds += ["--noise-estimator-alpha", str(args.noise_estimator_alpha)]
+        cmds += [
+            "--noise-estimator-max-trace-message-bits",
+            str(args.noise_estimator_max_trace_message_bits),
+        ]
+        if args.noise_estimator_require_trace_safe:
+            cmds.append("--noise-estimator-require-trace-safe")
         if args.noise_estimator_binary:
             cmds += ["--noise-estimator-binary", args.noise_estimator_binary]
         if args.openevolve_reference_json:

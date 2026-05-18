@@ -1,5 +1,5 @@
 import json
-import numpy as np
+import math
 from ..resilience import ResilienceProfile
 
 DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-flash-lite"
@@ -64,11 +64,14 @@ class Params:
         openevolve_parallel_evaluations=1,
         openevolve_checkpoint_interval=5,
         openevolve_fail_open=True,
+        openevolve_reuse_output=False,
         noise_estimator="finalists",
         noise_estimator_binary=None,
         noise_estimator_timeout_sec=30,
         noise_estimator_min_output_margin_bits=2.0,
         noise_estimator_alpha=14.0,
+        noise_estimator_max_trace_message_bits=20.0,
+        noise_estimator_require_trace_safe=False,
     ):
         if le_json is None:
             return # should be filled later
@@ -241,6 +244,11 @@ class Params:
             if openevolve_fail_open is not None
             else json_parsed.get("openevolve_fail_open", True)
         )
+        self.openevolve_reuse_output = bool(
+            openevolve_reuse_output
+            if openevolve_reuse_output is not None
+            else json_parsed.get("openevolve_reuse_output", False)
+        )
         self.noise_estimator = (
             noise_estimator
             if noise_estimator is not None
@@ -273,6 +281,16 @@ class Params:
             noise_estimator_alpha
             if noise_estimator_alpha is not None
             else json_parsed.get("noise_estimator_alpha", 14.0)
+        )
+        self.noise_estimator_max_trace_message_bits = float(
+            noise_estimator_max_trace_message_bits
+            if noise_estimator_max_trace_message_bits is not None
+            else json_parsed.get("noise_estimator_max_trace_message_bits", 20.0)
+        )
+        self.noise_estimator_require_trace_safe = bool(
+            noise_estimator_require_trace_safe
+            if noise_estimator_require_trace_safe is not None
+            else json_parsed.get("noise_estimator_require_trace_safe", False)
         )
         self.openevolve_compile_hints = None
         self.openevolve_evaluating_candidate = False
@@ -335,6 +353,23 @@ class Params:
     def max_scale(self) -> int:
         return int(self.Sf + 2 * max(self.Sw, self.Csw))
 
+    def decryptable_scale_bound(self, level: int) -> int:
+        """Maximum scale bits decryptable at ``level`` under Orbit's ILP model."""
+        return int(self.Sf * (int(level) - self.lvl_lb + 2) - 7)
+
+    def boundary_output_scale_bound(self, level: int) -> int:
+        """Lattigo output boundary bound used by Orbit's IO-budget ILP constraint."""
+        return int(self.Sf * (int(level) + 1) - 7)
+
+    def is_decryptable_state(self, level: int, scale: int) -> bool:
+        level = int(level)
+        scale = int(scale)
+        return (
+            self.lvl_lb <= level <= self.lvl_ub
+            and 0 <= scale <= self.max_scale()
+            and scale <= self.decryptable_scale_bound(level)
+        )
+
     def scale_lower_bound(self, node_label: str, node_attrs: dict, port: str) -> int:
         if self.resilience_profile is None:
             return self.Sw
@@ -360,7 +395,7 @@ class Params:
             return True
         if not self.check_res(in_lvl, in_scl, self.bts_lb, self.Sf):
             return False
-        r = max(0, round(np.ceil((self.Sf - out_scl) / self.Sf)))
+        r = max(0, int(math.ceil((self.Sf - out_scl) / max(self.Sf, 1))))
         if not (self.bts_lb < out_lvl + r <= self.bts_ub):
             return False
         if not self.check_res(out_lvl+r, self.Sf, out_lvl, out_scl):

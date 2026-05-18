@@ -67,21 +67,36 @@ def _scope_comment_regex(scopes: list[str]) -> str | None:
 def _resolve_json_sidecar(profile_path: Path, raw_path: str | None) -> dict[str, Any] | None:
     if not raw_path:
         return None
-    sidecar_path = Path(raw_path)
-    if not sidecar_path.is_absolute():
-        sidecar_path = profile_path.parent / sidecar_path
+    sidecar_path = _resolve_sidecar_path(profile_path, raw_path)
     if not sidecar_path.is_file():
         return None
     return json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+
+def _resolve_sidecar_path(profile_path: Path, raw_path: str) -> Path:
+    sidecar_path = Path(raw_path)
+    if not sidecar_path.is_absolute():
+        return profile_path.parent / sidecar_path
+    if sidecar_path.exists():
+        return sidecar_path
+    # Profiles are often generated on a training host and pulled locally with
+    # the sidecars under a sibling artifacts/ directory. Keep those profiles
+    # relocatable without editing the JSON.
+    basename = sidecar_path.name
+    for candidate in (
+        profile_path.parent / "artifacts" / basename,
+        profile_path.parent / basename,
+    ):
+        if candidate.exists():
+            return candidate
+    return sidecar_path
 
 
 def _resolve_artifacts(profile_path: Path, artifacts: dict[str, Any]) -> dict[str, Any]:
     resolved = {}
     for key, value in artifacts.items():
         if isinstance(value, str):
-            artifact_path = Path(value)
-            if not artifact_path.is_absolute():
-                artifact_path = profile_path.parent / artifact_path
+            artifact_path = _resolve_sidecar_path(profile_path, value)
             resolved[key] = str(artifact_path)
         else:
             resolved[key] = value

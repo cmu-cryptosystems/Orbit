@@ -65,10 +65,9 @@ class _BudgetAttempt:
 class OpenEvolvePlacementWorker:
     """OpenEvolve-backed QBP worker.
 
-    With ``openevolve_iterations == 0`` this uses the intentionally conservative
-    waterline seed directly. Positive iteration counts run OpenEvolve once for
-    the whole budget batch, then validate the best candidate through the same
-    deterministic repair path.
+    With ``openevolve_iterations == 0`` this uses a deterministic no-LLM policy.
+    Positive iteration counts run OpenEvolve once for the whole budget batch,
+    then validate the best candidate through the same deterministic repair path.
     """
 
     def __init__(self, params: Params, le: LatencyEstimator):
@@ -90,6 +89,8 @@ class OpenEvolvePlacementWorker:
             hints = compile_hints
         elif self.params.openevolve_iterations > 0:
             hints = self._run_openevolve(pdag, io_budgets_list)
+        else:
+            hints = _zero_iteration_portfolio_hints()
         diagnostics = {} if getattr(self.params, "openevolve_evaluating_candidate", False) else None
         result = solve_budget_batch(pdag, io_budgets_list, self.le, self.params, hints, diagnostics)
         self.last_diagnostics = diagnostics or {}
@@ -340,15 +341,20 @@ def place(context):
     The candidate may either return explicit placement records or a policy
     built from Orbit's helper API. Orbit validates every assignment and owns
     final repair into Assign objects.
+
+    During polybert-sampled evolution, Orbit scores a bounded portfolio of real
+    scheduler algorithms. Full-bundle finalist validation reruns the best
+    bounded variants and Orbit selects the final assignment after deterministic
+    validation and noise estimation.
     """
     builder = PlacementBuilder(context)
-    return builder.low_scale_frontier(
-        allow_seed_fallback=False,
-        max_scale_candidates=10,
-        bootstrap_penalty=1000000000.0,
-        rescale_penalty=0.0,
-        level_drop_penalty=20000000.0,
-        scale_penalty=0.0,
+    return builder.portfolio(
+        builder.low_scale_frontier()["policy"],
+        builder.profile_layer_refresh(include_attention=True)["policy"],
+        builder.profile_layer_refresh(include_attention=False)["policy"],
+        builder.bootstrap_safe_margin(min_internal_level=6)["policy"],
+        builder.bootstrap_safe_margin(min_internal_level=8)["policy"],
+        builder.noise_guarded_refresh()["policy"],
     )
 # EVOLVE-BLOCK-END
 '''
@@ -433,6 +439,12 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "noise_estimator": params.noise_estimator,
             "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
             "noise_estimator_alpha": params.noise_estimator_alpha,
+            "noise_estimator_max_trace_message_bits": getattr(
+                params, "noise_estimator_max_trace_message_bits", 20.0
+            ),
+            "noise_estimator_require_trace_safe": getattr(
+                params, "noise_estimator_require_trace_safe", False
+            ),
         },
         "latency_model": {
             "backend": params.backend,
@@ -450,6 +462,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
                 "constant_waterline": params.Csw,
                 "max_scale": _max_scale(params),
             },
+            "ilp_semantics": _ilp_semantics_summary(params),
             "local_scale_lower_bounds": {
                 str(node): {
                     "in": params.scale_lower_bound(str(node), attrs, "in"),
@@ -488,6 +501,14 @@ def tdag_from_context(context: dict[str, Any]) -> Tdag:
             2.0,
         ),
         noise_estimator_alpha=pdata.get("noise_estimator_alpha", 14.0),
+        noise_estimator_max_trace_message_bits=pdata.get(
+            "noise_estimator_max_trace_message_bits",
+            20.0,
+        ),
+        noise_estimator_require_trace_safe=pdata.get(
+            "noise_estimator_require_trace_safe",
+            False,
+        ),
     )
     params.Sf = int(pdata["Sf"])
     params.lvl_lb = int(pdata["lvl_lb"])
@@ -518,6 +539,12 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
         "noise_estimator": params.noise_estimator,
         "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
         "noise_estimator_alpha": params.noise_estimator_alpha,
+        "noise_estimator_max_trace_message_bits": getattr(
+            params, "noise_estimator_max_trace_message_bits", 20.0
+        ),
+        "noise_estimator_require_trace_safe": getattr(
+            params, "noise_estimator_require_trace_safe", False
+        ),
     }
     return context
 
@@ -552,29 +579,45 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     initial_hints = _load_candidate_hints(initial_path, context)
 
     worker = OpenEvolvePlacementWorker(params, le)
-    try:
-        with worker._openevolve_runtime_env():
-            result = run_evolution(
-                initial_program=initial_path,
-                evaluator=evaluator_path,
-                config=worker._openevolve_config_arg(),
-                iterations=params.openevolve_iterations,
-                output_dir=str(output_dir),
-                cleanup=False,
+    if getattr(params, "openevolve_reuse_output", False):
+        best_code = _load_reusable_best_code(output_dir)
+        if not best_code:
+            if not params.openevolve_fail_open:
+                raise PlacementError(
+                    f"--openevolve-reuse-output found no reusable programs under {output_dir}"
+                )
+            _write_recovery_summary(
+                root,
+                PlacementError(
+                    f"--openevolve-reuse-output found no reusable programs under {output_dir}"
+                ),
             )
-    except Exception as exc:
-        if not params.openevolve_fail_open:
-            raise
-        _write_recovery_summary(root, exc)
-        return _recover_compile_hints(output_dir, context, initial_hints, params)
+            return _recover_compile_hints(output_dir, context, initial_hints, params)
+    else:
+        try:
+            with worker._openevolve_runtime_env():
+                result = run_evolution(
+                    initial_program=initial_path,
+                    evaluator=evaluator_path,
+                    config=worker._openevolve_config_arg(),
+                    iterations=params.openevolve_iterations,
+                    output_dir=str(output_dir),
+                    cleanup=False,
+                )
+        except Exception as exc:
+            if not params.openevolve_fail_open:
+                raise
+            _write_recovery_summary(root, exc)
+            return _recover_compile_hints(output_dir, context, initial_hints, params)
+        best_code = result.best_code
     best_program = root / "best_program.py"
-    best_program.write_text(result.best_code, encoding="utf-8")
+    best_program.write_text(best_code, encoding="utf-8")
     try:
         finalist_hints = _run_full_bundle_finalists(
             root,
             output_dir,
             context,
-            result.best_code,
+            best_code,
             params,
             initial_hints,
         )
@@ -585,7 +628,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         if not params.openevolve_fail_open:
             raise
         _write_recovery_summary(root, exc)
-        return _recover_compile_hints(output_dir, context, initial_hints, params, result.best_code)
+        return _recover_compile_hints(output_dir, context, initial_hints, params, best_code)
     finally:
         if not params.openevolve_keep_workdir and params.openevolve_output_dir is None:
             shutil.rmtree(root, ignore_errors=True)
@@ -600,6 +643,11 @@ def evaluate_compile_candidate_program(
         static = _static_validate_hints(context, hints)
         if not static["valid"]:
             result = _invalid_compile_result("compile_static_gate", static["reasons"])
+            _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
+            return result
+        sampled_reasons = _sampled_policy_static_reasons(context, hints)
+        if sampled_reasons:
+            result = _invalid_compile_result("compile_sampled_policy_gate", sampled_reasons)
             _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
             return result
         result = _evaluate_compile_hints(context, hints, suppress_output=True)
@@ -626,15 +674,17 @@ def evaluate_compile_candidate_program(
         boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
         noise_estimate = _fast_compile_noise_estimate(context, result)
         noise_score = 1.0 if noise_estimate.get("valid", False) else 0.0
+        reserve_score = _reserve_quality_score(result.get("reserve_summary", {}))
         quality_score = (
-            0.50 * latency_score
-            + 0.13 * bootstrap_score
-            + 0.07 * rescale_score
+            0.45 * latency_score
+            + 0.10 * bootstrap_score
+            + 0.05 * rescale_score
             + 0.08 * boundary_score
             + 0.07 * risk_score
-            + 0.05 * noise_score
-            + 0.05 * fallback_score
-            + 0.05 * runtime_score
+            + 0.08 * noise_score
+            + 0.09 * reserve_score
+            + 0.04 * fallback_score
+            + 0.04 * runtime_score
         )
         if not result["valid"] or result["fallback_selected_budgets"] > 0:
             combined_score = min(0.999, 0.40 * result["validity"] + 0.30 * quality_score)
@@ -658,6 +708,19 @@ def evaluate_compile_candidate_program(
                 "fallback_selected_budgets": float(result["fallback_selected_budgets"]),
                 "estimated_precision_bits": float(noise_estimate.get("estimated_precision_bits", 0.0)),
                 "output_margin_bits": float(noise_estimate.get("output_margin_bits", 0.0)),
+                "reserve_score": float(reserve_score),
+                "min_decryptability_reserve_bits": float(
+                    _finite_float(
+                        result.get("reserve_summary", {}).get("min_decryptability_reserve_bits"),
+                        0.0,
+                    )
+                ),
+                "min_transition_reserve_bits": float(
+                    _finite_float(
+                        result.get("reserve_summary", {}).get("min_transition_reserve_bits"),
+                        0.0,
+                    )
+                ),
                 "graph_nodes": float(len(context["tdag"]["nodes"])),
                 "graph_edges": float(len(context["tdag"]["edges"])),
             },
@@ -680,12 +743,16 @@ def evaluate_compile_candidate_program(
                         "boundary_score": boundary_score,
                         "risk_score": risk_score,
                         "noise_score": noise_score,
+                        "reserve_score": reserve_score,
                         "fallback_score": fallback_score,
                         "runtime_score": runtime_score,
                     },
                     sort_keys=True,
                 ),
                 "noise_estimator": json.dumps(noise_estimate, sort_keys=True)[:4000],
+                "reserve_summary": json.dumps(
+                    result.get("reserve_summary", {}), sort_keys=True
+                )[:4000],
                 "bootstrap_locations": json.dumps(result["bootstrap_locations"], sort_keys=True),
                 "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
                 "bottleneck_summary": json.dumps(result.get("bottleneck_summary", []), sort_keys=True),
@@ -724,6 +791,10 @@ def evaluate_compile_candidate_program(
                 "bootstrap_count": 0.0,
                 "rescale_count": 0.0,
                 "profile_risk": 1.0,
+                "placement_runtime_sec": 0.0,
+                "fallback_selected_budgets": 0.0,
+                "estimated_precision_bits": 0.0,
+                "output_margin_bits": 0.0,
             },
             "artifacts": {
                 "failure_stage": "compile_harness",
@@ -741,11 +812,12 @@ def _evaluate_compile_hints(
 
     tdag = tdag_from_context(context)
     params = tdag.params
+    eval_suite = context.get("harness", {}).get("eval_suite", "polybert-sampled")
     params.openevolve_iterations = 0
     params.openevolve_harness = "compile"
-    params.openevolve_compile_hints = hints
+    params.openevolve_compile_hints = _compile_hints_for_eval_suite(hints, eval_suite)
     params.openevolve_evaluating_candidate = True
-    params.openevolve_eval_suite = context.get("harness", {}).get("eval_suite", "polybert-sampled")
+    params.openevolve_eval_suite = eval_suite
     le = LatencyEstimator(params)
     qbp_manager = QBPManager(params, le)
     log_buffer = io.StringIO()
@@ -766,6 +838,7 @@ def _evaluate_compile_hints(
         assign.check_assign()
         counts = _maintenance_counts(assign)
         locations = _maintenance_locations(assign)
+        reserve_summary = _assignment_reserve_summary(assign, tdag, params)
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
         return {
             "valid": True,
@@ -784,6 +857,7 @@ def _evaluate_compile_hints(
                 "out_lvl": final_io_choice[2],
                 "out_scl": final_io_choice[3],
             },
+            "reserve_summary": reserve_summary,
             "assignment": _serialize_assign(assign),
             "bootstrap_locations": locations["bootstrap"],
             "rescale_locations": locations["rescale"],
@@ -804,12 +878,114 @@ def _evaluate_compile_hints(
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": 0,
             "selected_output_state": {},
+            "reserve_summary": {},
             "assignment": {},
             "bootstrap_locations": {},
             "rescale_locations": {},
             "diagnostics": {"invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1}},
             "log_tail": log_buffer.getvalue()[-3000:],
         }
+
+
+def _compile_hints_for_eval_suite(hints: dict[str, Any], eval_suite: str) -> dict[str, Any]:
+    normalized = _with_default_policy(hints)
+    if eval_suite == "polybert-full":
+        return normalized
+    return _bounded_sampled_policy(normalized)
+
+
+def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
+    bounded = _with_default_policy(hints)
+    bounded.pop("portfolio", None)
+    bounded["allow_seed_fallback"] = False
+    bounded["allow_bootstrap"] = False
+    bounded["refresh_fanout_at_level_floor"] = True
+    bounded["max_scale_candidates"] = min(16, _int_hint(bounded.get("max_scale_candidates"), 16))
+    bounded["state_cap_per_node"] = min(8, _int_hint(bounded.get("state_cap_per_node"), 8))
+    bounded["beam_width"] = min(4, _int_hint(bounded.get("beam_width"), 4))
+    return bounded
+
+
+def _finalist_hints_for_full_bundle(hints: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded single-policy finalist replay candidate.
+
+    Full-bundle replay may examine several policies from a candidate portfolio,
+    but each variant is evaluated as one concrete scheduler. That keeps final
+    selection faithful to a real placement algorithm instead of hiding a large
+    per-budget search behind a single evolved program.
+    """
+
+    bounded = _with_default_policy(hints)
+    bounded.pop("portfolio", None)
+    bounded["allow_seed_fallback"] = False
+    bounded["max_scale_candidates"] = min(16, _int_hint(bounded.get("max_scale_candidates"), 16))
+    bounded["state_cap_per_node"] = min(8, _int_hint(bounded.get("state_cap_per_node"), 8))
+    if str(bounded.get("strategy")) == "latency_beam":
+        bounded["beam_width"] = min(3, _int_hint(bounded.get("beam_width"), 3))
+    return bounded
+
+
+def _finalist_hint_variants(hints: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    variants: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def add(label: str, item: dict[str, Any]) -> None:
+        bounded = _finalist_hints_for_full_bundle(item)
+        digest = _hint_digest(
+            {
+                key: value
+                for key, value in bounded.items()
+                if key not in {"api_version", "placement_records", "portfolio"}
+            }
+        )
+        if digest in seen:
+            return
+        seen.add(digest)
+        variants.append((label, bounded))
+
+    add("primary", hints)
+    portfolio = hints.get("portfolio")
+    if isinstance(portfolio, list):
+        for idx, item in enumerate(portfolio):
+            if not isinstance(item, dict):
+                continue
+            add(f"portfolio_{idx}", item)
+            if len(variants) >= 6:
+                break
+    return variants
+
+
+def _hint_digest(hints: dict[str, Any]) -> str:
+    try:
+        payload = json.dumps(hints, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        payload = repr(hints)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sampled_policy_static_reasons(context: dict[str, Any], hints: dict[str, Any]) -> list[str]:
+    if context.get("harness", {}).get("eval_suite") != "polybert-sampled":
+        return []
+    sampled = _compile_hints_for_eval_suite(hints, "polybert-sampled")
+    reasons = []
+    for idx, policy in enumerate(_portfolio_policies(sampled)):
+        prefix = "sampled policy" if idx == 0 else f"sampled portfolio[{idx - 1}]"
+        strategy = str(policy.get("strategy", "level_preserving"))
+        if strategy not in {"level_preserving", "latency_beam"}:
+            reasons.append(f"{prefix} rejects strategy {strategy!r}")
+        if _bool_hint(policy.get("allow_bootstrap"), False):
+            reasons.append(f"{prefix} rejects explicit bootstrap search")
+        if _bool_hint(policy.get("allow_seed_fallback"), False):
+            reasons.append(f"{prefix} rejects seed fallback")
+        if not _bool_hint(policy.get("refresh_fanout_at_level_floor"), False):
+            reasons.append(f"{prefix} requires low-scale frontier refresh")
+        if _int_hint(policy.get("max_scale_candidates"), 32) > 16:
+            reasons.append(f"{prefix} caps max_scale_candidates at 16")
+        if _int_hint(policy.get("state_cap_per_node"), 8) > 8:
+            reasons.append(f"{prefix} caps state_cap_per_node at 8")
+        if _int_hint(policy.get("beam_width"), 4) > 4:
+            reasons.append(f"{prefix} caps beam_width at 4")
+    return reasons
 
 
 def _compile_workspace_root(dag: Tdag, params: Params) -> Path:
@@ -834,6 +1010,27 @@ def _run_full_bundle_finalists(
         return None
     finalist_dir = root / "finalists"
     finalist_dir.mkdir(parents=True, exist_ok=True)
+    sampled_invalid_reason = _sampled_best_invalid_reason(output_dir)
+    if sampled_invalid_reason is not None:
+        fail_open = _bounded_fail_open_hints(initial_hints)
+        (finalist_dir / "full_bundle_summary.json").write_text(
+            json.dumps(
+                {
+                    "reference": {"valid": False},
+                    "candidates": [],
+                    "selected_index": None,
+                    "skipped_full_bundle": True,
+                    "skip_reason": sampled_invalid_reason,
+                    "fail_open": True,
+                    "fail_open_policy": _compact_policy_summary(fail_open or {}),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return fail_open
     full_context = json.loads(json.dumps(sampled_context))
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
     reference = _evaluate_compile_hints(full_context, {}, suppress_output=True)
@@ -847,56 +1044,190 @@ def _run_full_bundle_finalists(
     summaries = []
     best = None
     estimator_records = []
-    for idx, code in enumerate(candidates):
-        program_path = finalist_dir / f"finalist_{idx}.py"
-        program_path.write_text(code, encoding="utf-8")
+    result_cache: dict[str, dict[str, Any]] = {}
+
+    def write_progress() -> None:
         try:
-            hints = _load_candidate_hints(program_path, full_context)
-            static = _static_validate_hints(full_context, hints)
-            if not static["valid"]:
-                raise PlacementError("; ".join(static["reasons"][:4]))
-            result = _evaluate_compile_hints(full_context, hints, suppress_output=True)
-            summary = {
-                "index": idx,
-                "valid": result["valid"],
-                "final_latency_usec": result["final_latency_usec"],
-                "boundary_quality": result.get("boundary_quality", 0.0),
-                "bootstrap_count": result["bootstrap_count"],
-                "rescale_count": result["rescale_count"],
-                "fallback_selected_budgets": result["fallback_selected_budgets"],
-                "selected_output_state": result["selected_output_state"],
-                "bootstrap_locations": result.get("bootstrap_locations", {}),
-                "rescale_locations": result.get("rescale_locations", {}),
-            }
-            noise = _noise_estimator_for_finalist(full_context, result, params)
-            if noise is not None:
-                summary["noise_estimator"] = noise
-                estimator_records.append({"index": idx, **noise})
-            if result["valid"]:
-                noise_reject = int(noise is not None and not noise.get("valid", False))
-                item = (
-                    noise_reject,
-                    int(result["fallback_selected_budgets"] > 0),
-                    float(result["final_latency_usec"]),
-                    idx,
-                    hints,
-                    summary,
+            (finalist_dir / "full_bundle_progress.json").write_text(
+                json.dumps(
+                    {
+                        "reference": full_context["reference"],
+                        "candidates": summaries,
+                        "updated_at": time.time(),
+                    },
+                    indent=2,
+                    sort_keys=True,
                 )
-                if best is None or item[:4] < best[:4]:
-                    best = item
+                + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    finalist_items: list[tuple[str, str | None, dict[str, Any] | None]] = [
+        (f"candidate_{idx}", code, None)
+        for idx, code in enumerate(candidates)
+    ]
+    if initial_hints is not None:
+        finalist_items.append(("initial_seed", None, initial_hints))
+    for item_idx, (label, code, preset_hints) in enumerate(finalist_items):
+        program_path = finalist_dir / f"finalist_{item_idx}.py"
+        if code is not None:
+            program_path.write_text(code, encoding="utf-8")
+        else:
+            program_path.write_text(
+                "# Materialized initial OpenEvolve seed policy.\n"
+                "def place(context):\n"
+                f"    return {preset_hints!r}\n",
+                encoding="utf-8",
+            )
+        try:
+            hints = (
+                preset_hints
+                if preset_hints is not None
+                else _load_candidate_hints(program_path, full_context)
+            )
+            hint_variants = _finalist_hint_variants(hints)
         except Exception as exc:
-            summary = {
-                "index": idx,
-                "valid": False,
-                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
-            }
-        summaries.append(summary)
+            summaries.append(
+                {
+                    "index": len(summaries),
+                    "label": label,
+                    "valid": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+            )
+            continue
+
+        for variant_label, finalist_hints in hint_variants:
+            summary_index = len(summaries)
+            summary_label = label if variant_label == "primary" else f"{label}:{variant_label}"
+            try:
+                hint_digest = _hint_digest(finalist_hints)
+                cached = result_cache.get(hint_digest)
+                if cached is not None:
+                    result = cached["result"]
+                    noise = cached.get("noise")
+                    summary = {
+                        **cached["summary"],
+                        "index": summary_index,
+                        "label": summary_label,
+                        "cached_from_index": cached["index"],
+                    }
+                else:
+                    static = _static_validate_hints(full_context, finalist_hints)
+                    if not static["valid"]:
+                        raise PlacementError("; ".join(static["reasons"][:4]))
+                    result = _evaluate_compile_hints(full_context, finalist_hints, suppress_output=True)
+                    summary = {
+                        "index": summary_index,
+                        "label": summary_label,
+                        "valid": result["valid"],
+                        "final_latency_usec": result["final_latency_usec"],
+                        "boundary_quality": result.get("boundary_quality", 0.0),
+                        "bootstrap_count": result["bootstrap_count"],
+                        "rescale_count": result["rescale_count"],
+                        "fallback_selected_budgets": result["fallback_selected_budgets"],
+                        "selected_output_state": result["selected_output_state"],
+                        "reserve_summary": result.get("reserve_summary", {}),
+                        "bootstrap_locations": result.get("bootstrap_locations", {}),
+                        "rescale_locations": result.get("rescale_locations", {}),
+                    }
+                    noise = _noise_estimator_for_finalist(full_context, result, params)
+                    if noise is not None:
+                        summary["noise_estimator"] = noise
+                        estimator_records.append({"index": summary_index, "label": summary_label, **noise})
+                    result_cache[hint_digest] = {
+                        "index": summary_index,
+                        "result": result,
+                        "noise": noise,
+                        "summary": dict(summary),
+                    }
+                if result["valid"]:
+                    noise_reject = int(noise is not None and not noise.get("valid", False))
+                    margin = (
+                        _finite_float(noise.get("output_margin_bits"), 0.0)
+                        if noise is not None
+                        else 0.0
+                    )
+                    latency_target = _finalist_latency_target_usec(full_context)
+                    margin_target = _finalist_output_margin_target_bits(full_context)
+                    forced_bootstrap_floor = _finalist_forced_bootstrap_floor(full_context)
+                    plaintext_quality_reject, plaintext_quality_reason = _finalist_plaintext_quality_reject(
+                        full_context
+                    )
+                    profile_noise_reject, profile_noise_reason = _profile_noise_metadata_reject(
+                        full_context
+                    )
+                    noise_warning_reject, noise_warning_reason = _finalist_noise_warning_reject(
+                        full_context,
+                        noise,
+                        params,
+                    )
+                    latency_reject = int(
+                        latency_target is not None
+                        and float(result["final_latency_usec"]) > latency_target
+                    )
+                    margin_reject = int(
+                        noise is not None
+                        and margin_target is not None
+                        and margin < margin_target
+                    )
+                    bootstrap_reject = int(
+                        forced_bootstrap_floor is not None
+                        and int(result["bootstrap_count"]) < forced_bootstrap_floor
+                    )
+                    summary["finalist_gate"] = {
+                        "latency_target_usec": latency_target,
+                        "latency_reject": bool(latency_reject),
+                        "output_margin_target_bits": margin_target,
+                        "output_margin_reject": bool(margin_reject),
+                        "forced_bootstrap_floor": forced_bootstrap_floor,
+                        "bootstrap_reject": bool(bootstrap_reject),
+                        "plaintext_quality_reject": plaintext_quality_reject,
+                        "plaintext_quality_reason": plaintext_quality_reason,
+                        "profile_noise_reject": profile_noise_reject,
+                        "profile_noise_reason": profile_noise_reason,
+                        "noise_warning_reject": noise_warning_reject,
+                        "noise_warning_reason": noise_warning_reason,
+                    }
+                    item = (
+                        int(plaintext_quality_reject),
+                        int(profile_noise_reject),
+                        int(noise_warning_reject),
+                        noise_reject,
+                        margin_reject,
+                        int(result["fallback_selected_budgets"] > 0),
+                        bootstrap_reject,
+                        latency_reject,
+                        float(result["final_latency_usec"]),
+                        -float(margin),
+                        summary_index,
+                        finalist_hints,
+                        summary,
+                    )
+                    if best is None or item[:11] < best[:11]:
+                        best = item
+            except Exception as exc:
+                summary = {
+                    "index": summary_index,
+                    "label": summary_label,
+                    "valid": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+            summaries.append(summary)
+            write_progress()
     (finalist_dir / "full_bundle_summary.json").write_text(
         json.dumps(
             {
                 "reference": full_context["reference"],
                 "candidates": summaries,
-                "selected_index": None if best is None else best[3],
+                "selected_index": None if best is None else best[10],
+                "finalist_gate": {
+                    "latency_target_usec": _finalist_latency_target_usec(full_context),
+                    "output_margin_target_bits": _finalist_output_margin_target_bits(full_context),
+                    "forced_bootstrap_floor": _finalist_forced_bootstrap_floor(full_context),
+                },
                 "noise_estimator": {
                     "mode": params.noise_estimator,
                     "min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
@@ -910,18 +1241,219 @@ def _run_full_bundle_finalists(
         encoding="utf-8",
     )
     if best is None:
-        return initial_hints
-    if best[0] and params.noise_estimator == "finalists":
-        return initial_hints
+        return _bounded_fail_open_hints(initial_hints)
+    if best[0] or best[1] or ((best[2] or best[3]) and params.noise_estimator == "finalists"):
+        _write_finalist_rejection_summary(
+            finalist_dir,
+            best[12],
+            {
+                "plaintext_quality_reject": bool(best[0]),
+                "profile_noise_reject": bool(best[1]),
+                "noise_warning_reject": bool(best[2]),
+                "noise_estimator_reject": bool(best[3]),
+                "selected_index": best[10],
+            },
+        )
+        return _bounded_fail_open_hints(initial_hints)
     write_noise_summary(
         finalist_dir / "noise_estimator_summary.json",
         {
-            "selected_index": best[3],
-            "selected": best[5],
+            "selected_index": best[10],
+            "selected": best[12],
             "records": estimator_records,
         },
     )
-    return best[4]
+    return best[11]
+
+
+def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the deterministic smoke portfolio after finalist/runtime failure.
+
+    The finalist replay path intentionally strips portfolios and seed fallback
+    so that a successful evolved finalist represents one concrete placement
+    algorithm. That bounded policy is not a good fail-open artifact: if every
+    finalist is invalid, returning another bounded invalid policy can make the
+    production compile fail after OpenEvolve has already recovered. The
+    zero-iteration portfolio is the validated no-LLM smoke path, so use it as
+    the final safety net.
+    """
+
+    fallback = _zero_iteration_portfolio_hints()
+    fallback["fail_open_reason"] = "zero_iteration_seed_portfolio"
+    if initial_hints is not None:
+        fallback["recovered_from_initial_digest"] = _hint_digest(initial_hints)
+    return fallback
+
+
+def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
+    info_path = output_dir / "best" / "best_program_info.json"
+    if not info_path.is_file():
+        return None
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    metrics = info.get("metrics") if isinstance(info, dict) else None
+    if not isinstance(metrics, dict):
+        return None
+    validity = _finite_float(metrics.get("validity"), 0.0)
+    effective_validity = _finite_float(metrics.get("effective_validity"), validity)
+    combined_score = _finite_float(metrics.get("combined_score"), 0.0)
+    if validity <= 0.0 and effective_validity <= 0.0 and combined_score < 1.0:
+        return "sampled_best_solved_no_budgets"
+    return None
+
+
+def _write_finalist_rejection_summary(
+    finalist_dir: Path,
+    selected_summary: dict[str, Any],
+    reason: dict[str, Any],
+) -> None:
+    try:
+        (finalist_dir / "finalist_rejection_summary.json").write_text(
+            json.dumps(
+                {
+                    "reason": reason,
+                    "selected_summary": selected_summary,
+                    "fail_open": True,
+                    "fallback": "bounded_initial_seed",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _finalist_latency_target_usec(context: dict[str, Any]) -> float | None:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict):
+        return None
+    for key in (
+        "final_latency_usec",
+        "final_tdag_latency_usec",
+        "tdag_latency_usec",
+        "baseline_latency_usec",
+    ):
+        value = reference.get(key)
+        if value is not None:
+            return _finite_float(value, float("inf"))
+    for key in (
+        "final_latency_sec",
+        "final_tdag_latency_sec",
+        "tdag_latency_sec",
+        "baseline_latency_sec",
+    ):
+        value = reference.get(key)
+        if value is not None:
+            return _finite_float(value, float("inf")) * 1_000_000.0
+    return None
+
+
+def _finalist_output_margin_target_bits(context: dict[str, Any]) -> float | None:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict):
+        return None
+    for key in (
+        "required_output_margin_bits",
+        "min_output_margin_bits",
+        "precision_margin_bits",
+    ):
+        value = reference.get(key)
+        if value is not None:
+            target = _finite_float(value, float("nan"))
+            if math.isfinite(target):
+                return target
+    return None
+
+
+def _finalist_forced_bootstrap_floor(context: dict[str, Any]) -> int | None:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict):
+        return None
+    for key in (
+        "force_min_bootstrap_count",
+        "forced_min_bootstrap_count",
+        "force_bootstrap_floor",
+        "debug_min_bootstrap_count",
+    ):
+        value = reference.get(key)
+        if value is None:
+            continue
+        try:
+            floor = int(value)
+        except (TypeError, ValueError):
+            continue
+        if floor > 0:
+            return floor
+    return None
+
+
+def _finalist_plaintext_quality_reject(context: dict[str, Any]) -> tuple[bool, str | None]:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict):
+        return False, None
+    sanity = reference.get("plaintext_sanity") or reference.get("output_quality_sanity")
+    if not isinstance(sanity, dict):
+        return False, None
+    if sanity.get("near_constant_first2_logits") is True:
+        return True, "near_constant_first2_logits"
+    zero_records = int(sanity.get("zero_output_collapse_records", 0) or 0)
+    records = int(sanity.get("records", 0) or 0)
+    if records > 0 and zero_records >= records:
+        return True, "zero_output_collapse"
+    min_margin = sanity.get("first2_margin_min")
+    target = reference.get("min_plaintext_logit_margin")
+    if target is not None and min_margin is not None:
+        if _finite_float(min_margin, 0.0) < _finite_float(target, 0.0):
+            return True, "plaintext_margin_below_target"
+    return False, None
+
+
+def _profile_noise_metadata_reject(context: dict[str, Any]) -> tuple[bool, str | None]:
+    resilience = context.get("resilience", {})
+    if not isinstance(resilience, dict) or not resilience.get("enabled"):
+        return False, None
+    noise_model = resilience.get("ckks_noise_model")
+    if not isinstance(noise_model, dict):
+        return True, "missing_ckks_noise_model"
+    if noise_model.get("fallback") is True:
+        return True, "ckks_noise_model_fallback"
+    if noise_model.get("model") not in {None, "tuneinsight-lattigo-v6"}:
+        return True, "unexpected_ckks_noise_model"
+    return False, None
+
+
+def _finalist_noise_warning_reject(
+    context: dict[str, Any],
+    noise: dict[str, Any] | None,
+    params: Params,
+) -> tuple[bool, str | None]:
+    if noise is None:
+        return False, None
+    warnings = noise.get("warning_ops") or []
+    if not isinstance(warnings, list):
+        warnings = [str(warnings)]
+    critical = {
+        "trace_precision_below_margin",
+        "trace_message_too_large",
+    }.intersection(str(item) for item in warnings)
+    if not critical:
+        return False, None
+    if getattr(params, "noise_estimator_require_trace_safe", False) or _has_estimator_backed_profile(context):
+        return True, ",".join(sorted(critical))
+    return False, None
+
+
+def _has_estimator_backed_profile(context: dict[str, Any]) -> bool:
+    resilience = context.get("resilience", {})
+    if not isinstance(resilience, dict) or not resilience.get("enabled"):
+        return False
+    noise_model = resilience.get("ckks_noise_model")
+    return isinstance(noise_model, dict) and noise_model.get("fallback") is not True
 
 
 def _noise_estimator_for_finalist(
@@ -950,6 +1482,14 @@ def _fast_compile_noise_estimate(
         noise_estimator_alpha=context.get("harness", {}).get(
             "noise_estimator_alpha",
             params_data.get("noise_estimator_alpha", 14.0),
+        ),
+        noise_estimator_max_trace_message_bits=context.get("harness", {}).get(
+            "noise_estimator_max_trace_message_bits",
+            params_data.get("noise_estimator_max_trace_message_bits", 20.0),
+        ),
+        noise_estimator_require_trace_safe=context.get("harness", {}).get(
+            "noise_estimator_require_trace_safe",
+            params_data.get("noise_estimator_require_trace_safe", False),
         ),
         poly_deg=ckks.get("poly_degree", 32768),
         max_slot=ckks.get("max_slots", 16384),
@@ -1045,6 +1585,28 @@ def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> li
         if len(result) >= limit:
             break
     return result
+
+
+def _load_reusable_best_code(output_dir: Path) -> str | None:
+    """Load the best available program from a completed OpenEvolve workspace."""
+
+    candidates = _discover_finalist_codes(output_dir, "", 1)
+    if candidates:
+        return candidates[0]
+    for program in (
+        output_dir / "best" / "best_program.py",
+        output_dir / "best_program.py",
+        output_dir / "initial_program.py",
+    ):
+        if not program.exists():
+            continue
+        try:
+            code = program.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if code.strip():
+            return code
+    return None
 
 
 def _checkpoint_iteration(path: Path) -> int:
@@ -1183,7 +1745,7 @@ def _recover_compile_hints(
         )
         if best is None or item[:3] < best[:3]:
             best = item
-    return initial_hints if best is None else best[3]
+    return _bounded_fail_open_hints(initial_hints) if best is None else best[3]
 
 
 def _hints_from_code(code: str, context: dict[str, Any]) -> dict[str, Any] | None:
@@ -1241,7 +1803,10 @@ def _invalid_compile_result(stage: str, reasons: list[str]) -> dict[str, Any]:
             "bootstrap_count": 0.0,
             "rescale_count": 0.0,
             "profile_risk": 1.0,
+            "placement_runtime_sec": 0.0,
             "fallback_selected_budgets": 0.0,
+            "estimated_precision_bits": 0.0,
+            "output_margin_bits": 0.0,
         },
         "artifacts": {
             "failure_stage": stage,
@@ -1393,6 +1958,8 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         )
         counts = _aggregate_counts(assignments)
         profile_risk = _profile_risk(assignments, tdag.params)
+        reserve_summary = _aggregate_reserve_summary(assignments, tdag, tdag.params)
+        reserve_score = _reserve_quality_score(reserve_summary)
         reference = _reference_metrics(tdag, io_budgets, le)
         reference_avg = reference["avg_latency_usec"]
         latency_ratio = (
@@ -1407,10 +1974,11 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         rescale_score = _relative_reduction(reference["rescale_count"], counts["rescale"])
         risk_score = 1.0 / (1.0 + profile_risk)
         quality_score = (
-            0.55 * latency_score
-            + 0.20 * bootstrap_score
-            + 0.10 * rescale_score
-            + 0.15 * risk_score
+            0.50 * latency_score
+            + 0.17 * bootstrap_score
+            + 0.08 * rescale_score
+            + 0.13 * risk_score
+            + 0.12 * reserve_score
         )
         if effective_validity < 1.0:
             combined_score = min(
@@ -1446,6 +2014,13 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "candidate_solved_budgets": float(candidate_solved),
                 "fallback_selected_budgets": float(fallback_selected),
                 "candidate_improved_budgets": float(candidate_improved),
+                "reserve_score": float(reserve_score),
+                "min_decryptability_reserve_bits": float(
+                    _finite_float(reserve_summary.get("min_decryptability_reserve_bits"), 0.0)
+                ),
+                "min_transition_reserve_bits": float(
+                    _finite_float(reserve_summary.get("min_transition_reserve_bits"), 0.0)
+                ),
                 "graph_nodes": float(len(tdag.nodes)),
                 "graph_edges": float(len(tdag.edges)),
                 "budget_count": float(len(io_budgets)),
@@ -1477,6 +2052,7 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": diagnostics.get("candidate_invalid_reasons", {})}
                 ),
+                "reserve_summary": json.dumps(reserve_summary, sort_keys=True)[:4000],
                 "policy_summary": _compact_policy_summary(hints),
                 "unmatched_resilience_targets": json.dumps(
                     _profile_unmatched_targets(context), sort_keys=True
@@ -1967,6 +2543,20 @@ def _default_policy_hints() -> dict[str, Any]:
     return _low_scale_frontier_policy()
 
 
+def _zero_iteration_portfolio_hints() -> dict[str, Any]:
+    hints = _low_scale_frontier_policy()
+    safe6 = _bootstrap_safe_margin_policy()
+    safe6["min_internal_level"] = 6
+    safe8 = _bootstrap_safe_margin_policy()
+    safe8["min_internal_level"] = 8
+    hints["portfolio"] = [
+        safe6,
+        safe8,
+        _noise_guarded_refresh_policy(),
+    ]
+    return hints
+
+
 def _waterline_seed_policy() -> dict[str, Any]:
     return {
         "strategy": "waterline_seed",
@@ -1980,6 +2570,9 @@ def _waterline_seed_policy() -> dict[str, Any]:
         "level_drop_penalty": 20_000_000.0,
         "min_internal_level": None,
         "scale_penalty": 0.0,
+        "reserve_penalty": 0.0,
+        "min_transition_reserve": 0,
+        "min_decryptability_reserve": 0,
         "preferred_node_levels": {},
         "preferred_node_scales": {},
         "preferred_edge_scales": {},
@@ -1999,10 +2592,66 @@ def _low_scale_frontier_policy() -> dict[str, Any]:
         "level_drop_penalty": 20_000_000.0,
         "min_internal_level": None,
         "scale_penalty": 0.0,
+        "reserve_penalty": 0.0,
+        "min_transition_reserve": 0,
+        "min_decryptability_reserve": 0,
         "preferred_node_levels": {},
         "preferred_node_scales": {},
         "preferred_edge_scales": {},
     }
+
+
+def _balanced_noise_margin_policy() -> dict[str, Any]:
+    policy = _low_scale_frontier_policy()
+    policy.update(
+        {
+            "refresh_fanout_at_level_floor": False,
+            "max_scale_candidates": 8,
+            "allow_seed_fallback": False,
+        }
+    )
+    return policy
+
+
+def _bootstrap_safe_margin_policy() -> dict[str, Any]:
+    policy = _low_scale_frontier_policy()
+    policy.update(
+        {
+            "refresh_fanout_at_level_floor": True,
+            "max_scale_candidates": 16,
+            "allow_seed_fallback": False,
+            "min_internal_level": 8,
+            "level_drop_penalty": 50_000_000.0,
+            "rescale_penalty": 250_000.0,
+            "scale_penalty": 0.0,
+            "reserve_penalty": 150_000.0,
+            "min_transition_reserve": 6,
+            "min_decryptability_reserve": 6,
+        }
+    )
+    return policy
+
+
+def _noise_guarded_refresh_policy() -> dict[str, Any]:
+    policy = _low_scale_frontier_policy()
+    policy.update(
+        {
+            "strategy": "level_preserving",
+            "refresh_fanout_at_level_floor": True,
+            "max_scale_candidates": 12,
+            "allow_bootstrap": False,
+            "allow_seed_fallback": False,
+            "min_internal_level": 12,
+            "bootstrap_penalty": 1_000_000_000.0,
+            "rescale_penalty": 500_000.0,
+            "level_drop_penalty": 80_000_000.0,
+            "scale_penalty": 0.0,
+            "reserve_penalty": 250_000.0,
+            "min_transition_reserve": 10,
+            "min_decryptability_reserve": 8,
+        }
+    )
+    return policy
 
 
 def _with_default_policy(hints: dict[str, Any] | None) -> dict[str, Any]:
@@ -2021,6 +2670,7 @@ def _with_default_policy(hints: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
+    min_internal_level = _normalize_min_internal_level(hints.get("min_internal_level"), params)
     return {
         "strategy": str(hints.get("strategy", "waterline_seed")),
         "prefer_level_preservation": _bool_hint(hints.get("prefer_level_preservation"), True),
@@ -2032,16 +2682,35 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
         "bootstrap_penalty": max(0.0, _float_hint(hints.get("bootstrap_penalty"), 1_000_000_000.0)),
         "rescale_penalty": max(0.0, _float_hint(hints.get("rescale_penalty"), 0.0)),
         "level_drop_penalty": max(0.0, _float_hint(hints.get("level_drop_penalty"), 20_000_000.0)),
-        "min_internal_level": max(
-            params.lvl_lb,
-            min(params.lvl_ub, _int_hint(hints.get("min_internal_level"), params.bts_lb + 1)),
-        ),
+        "min_internal_level": min_internal_level,
         "scale_penalty": max(0.0, _float_hint(hints.get("scale_penalty"), 0.0)),
+        "reserve_penalty": max(0.0, _float_hint(hints.get("reserve_penalty"), 0.0)),
+        "min_transition_reserve": max(
+            0,
+            min(params.Sf * max(1, params.lvl_ub), _int_hint(hints.get("min_transition_reserve"), 0)),
+        ),
+        "min_decryptability_reserve": max(
+            0,
+            min(params.Sf * max(1, params.lvl_ub), _int_hint(hints.get("min_decryptability_reserve"), 0)),
+        ),
         "beam_width": max(1, min(8, _int_hint(hints.get("beam_width"), 4))),
         "state_cap_per_node": max(1, min(32, _int_hint(hints.get("state_cap_per_node"), 8))),
         "scale_lattice": str(hints.get("scale_lattice", "default")),
         "max_scale": _max_scale(params),
     }
+
+
+def _normalize_min_internal_level(value: Any, params: Params) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return max(params.lvl_lb, min(params.lvl_ub, _int_hint(value, params.lvl_lb)))
+
+
+def _effective_min_internal_level(policy: dict[str, Any], params: Params) -> int:
+    value = policy.get("min_internal_level")
+    return params.lvl_lb if value is None else int(value)
 
 
 def _bool_hint(value: Any, default: bool) -> bool:
@@ -2105,10 +2774,11 @@ def _incoming_level_scale(
     best_no_bootstrap = None
     best_bootstrap = None
     best_any = None
+    min_internal_level = _effective_min_internal_level(policy, params)
     levels = [
         level
         for level in _level_candidates(params, preferred_level)
-        if level >= int(policy["min_internal_level"])
+        if level >= min_internal_level
     ]
     if not levels:
         levels = _level_candidates(params, preferred_level)
@@ -2119,7 +2789,8 @@ def _incoming_level_scale(
             if not _incoming_level_ok(tdag, assign, v, preds, edge_scales, level, node_scale, params):
                 continue
             if (
-                level <= int(policy["min_internal_level"])
+                policy["min_internal_level"] is not None
+                and level <= min_internal_level
                 and not params.check_res(level, node_scale, params.bts_lb, params.Sf)
             ):
                 continue
@@ -2453,7 +3124,7 @@ def _choose_output_state(
     if exact_level is not None:
         levels = [int(exact_level)]
     else:
-        min_level = int(policy["min_internal_level"])
+        min_level = _effective_min_internal_level(policy, params)
         levels = [
             level
             for level in _level_candidates(params, preferred_level)
@@ -2468,7 +3139,8 @@ def _choose_output_state(
                 continue
             if (
                 exact_level is None
-                and out_level <= int(policy["min_internal_level"])
+                and policy["min_internal_level"] is not None
+                and out_level <= min_level
                 and not params.check_res(out_level, out_scale, params.bts_lb, params.Sf)
             ):
                 continue
@@ -2490,7 +3162,8 @@ def _choose_output_state(
     if (
         exact_level is None
         and policy["refresh_fanout_at_level_floor"]
-        and in_level <= int(policy["min_internal_level"]) + 1
+        and policy["min_internal_level"] is not None
+        and in_level <= _effective_min_internal_level(policy, params) + 1
         and tdag.out_degree(v) > 1
         and best_bootstrap is not None
     ):
@@ -2514,19 +3187,67 @@ def _transition_score(
     out_scl: int,
     policy: dict[str, Any],
 ) -> float | None:
+    cache = policy.setdefault("_transition_score_cache", {})
+    cache_key = (int(in_lvl), int(in_scl), int(out_lvl), int(out_scl))
+    if cache_key in cache:
+        return cache[cache_key]
     if not _transition_ok(params, in_lvl, in_scl, out_lvl, out_scl):
+        cache[cache_key] = None
         return None
     try:
         cost = float(le.resbts_cost(in_lvl, in_scl, out_lvl, out_scl)) if le is not None else 0.0
     except Exception:
+        cache[cache_key] = None
         return None
     counts = _transition_count_values(params, in_lvl, in_scl, out_lvl, out_scl)
-    return (
+    reserve_penalty = float(policy.get("reserve_penalty", 0.0))
+    reserve_deficit = 0.0
+    if reserve_penalty > 0.0:
+        reserve_deficit += max(
+            0.0,
+            float(policy.get("min_transition_reserve", 0))
+            - float(_transition_reserve_bits(params, in_lvl, in_scl, out_lvl, out_scl)),
+        )
+        reserve_deficit += max(
+            0.0,
+            float(policy.get("min_decryptability_reserve", 0))
+            - float(_decryptability_reserve_bits(params, out_lvl, out_scl)),
+        )
+    score = (
         cost
         + policy["bootstrap_penalty"] * counts["bootstrap"]
         + policy["rescale_penalty"] * counts["rescale"]
         + policy["level_drop_penalty"] * max(0, in_lvl - out_lvl)
+        + reserve_penalty * reserve_deficit
     )
+    cache[cache_key] = score
+    return score
+
+
+def _decryptability_reserve_bits(params: Params, level: int, scale: int) -> int:
+    return int(params.Sf * (level - params.lvl_lb + 2) - 7 - scale)
+
+
+def _linear_noise_budget_bits(params: Params, level: int, scale: int) -> int:
+    return int(params.Sf * level - scale)
+
+
+def _transition_reserve_bits(
+    params: Params,
+    in_lvl: int,
+    in_scl: int,
+    out_lvl: int,
+    out_scl: int,
+) -> int:
+    """ILP-style level/scale slack for one legal rescale/bootstrap transition."""
+
+    if params.check_res(in_lvl, in_scl, out_lvl, out_scl):
+        return _linear_noise_budget_bits(params, in_lvl, in_scl) - _linear_noise_budget_bits(
+            params, out_lvl, out_scl
+        )
+    bootstrap_input = int(params.Sf * (in_lvl - params.bts_lb + 1) - in_scl)
+    bootstrap_output = _decryptability_reserve_bits(params, out_lvl, out_scl)
+    return min(bootstrap_input, bootstrap_output)
 
 
 def _transition_level(
@@ -2570,7 +3291,7 @@ def _highest_decryptable_level(params: Params, scale: int) -> int:
 
 
 def _is_decryptable(params: Params, level: int, scale: int) -> bool:
-    return params.lvl_lb <= level <= params.lvl_ub and scale <= params.Sf * (level - params.lvl_lb + 2) - 7
+    return params.is_decryptable_state(level, scale)
 
 
 def _assert_decryptable(params: Params, level: int, scale: int) -> None:
@@ -2579,12 +3300,7 @@ def _assert_decryptable(params: Params, level: int, scale: int) -> None:
 
 
 def _transition_ok(params: Params, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
-    if not params.check_resbts(in_lvl, in_scl, out_lvl, out_scl):
-        return False
-    if params.check_res(in_lvl, in_scl, out_lvl, out_scl):
-        return True
-    r = max(0, round(math.ceil((params.Sf - out_scl) / params.Sf)))
-    return out_lvl + r <= params.lvl_ub
+    return valid_transition(params, in_lvl, in_scl, out_lvl, out_scl)
 
 
 def _edge_scale_lb(tdag: Tdag, u: str, v: str, params: Params) -> int:
@@ -2638,6 +3354,128 @@ def _assignment_score(assign: Assign, le: LatencyEstimator | None) -> float:
     return float(estimate_assign(assign, le))
 
 
+def _assignment_reserve_summary(assign: Assign, tdag: Tdag, params: Params) -> dict[str, Any]:
+    decryptability_margins: list[int] = []
+    transition_reserves: list[int] = []
+    bootstrap_input_reserves: list[int] = []
+
+    def add_state(level: int | None, scale: int | None) -> None:
+        if level is None or scale is None:
+            return
+        decryptability_margins.append(_decryptability_reserve_bits(params, int(level), int(scale)))
+
+    for node in tdag.nodes:
+        add_state(assign.v_lvl_in.get(node), assign.v_scl_in.get(node))
+        add_state(assign.v_lvl_out.get(node), assign.v_scl_out.get(node))
+    for edge, level in assign.e_lvl_out.items():
+        add_state(level, assign.e_scl_out.get(edge))
+
+    for node in tdag.nodes:
+        if tdag.nodes[node]["op"] == "constant":
+            continue
+        if node in assign.v_lvl_in and node in assign.v_scl_in and node in assign.v_lvl_out and node in assign.v_scl_out:
+            reserve = _transition_reserve_bits(
+                params,
+                assign.v_lvl_in[node],
+                assign.v_scl_in[node],
+                assign.v_lvl_out[node],
+                assign.v_scl_out[node],
+            )
+            transition_reserves.append(reserve)
+            if not params.check_res(
+                assign.v_lvl_in[node],
+                assign.v_scl_in[node],
+                assign.v_lvl_out[node],
+                assign.v_scl_out[node],
+            ):
+                bootstrap_input_reserves.append(
+                    int(params.Sf * (assign.v_lvl_in[node] - params.bts_lb + 1) - assign.v_scl_in[node])
+                )
+        for pred in tdag.predecessors(node):
+            if tdag.nodes[pred]["op"] == "constant":
+                continue
+            edge = (pred, node)
+            if edge not in assign.e_lvl_out or edge not in assign.e_scl_out:
+                continue
+            reserve = _transition_reserve_bits(
+                params,
+                assign.v_lvl_out[pred],
+                assign.v_scl_out[pred],
+                assign.e_lvl_out[edge],
+                assign.e_scl_out[edge],
+            )
+            transition_reserves.append(reserve)
+            if not params.check_res(
+                assign.v_lvl_out[pred],
+                assign.v_scl_out[pred],
+                assign.e_lvl_out[edge],
+                assign.e_scl_out[edge],
+            ):
+                bootstrap_input_reserves.append(
+                    int(params.Sf * (assign.v_lvl_out[pred] - params.bts_lb + 1) - assign.v_scl_out[pred])
+                )
+
+    def stats(values: list[int]) -> dict[str, Any]:
+        if not values:
+            return {"count": 0, "min": None, "p10": None, "median": None}
+        ordered = sorted(values)
+        return {
+            "count": len(ordered),
+            "min": int(ordered[0]),
+            "p10": int(ordered[min(len(ordered) - 1, max(0, len(ordered) // 10))]),
+            "median": int(ordered[len(ordered) // 2]),
+        }
+
+    return {
+        "decryptability": stats(decryptability_margins),
+        "transition": stats(transition_reserves),
+        "bootstrap_input": stats(bootstrap_input_reserves),
+        "min_decryptability_reserve_bits": (
+            min(decryptability_margins) if decryptability_margins else None
+        ),
+        "min_transition_reserve_bits": min(transition_reserves) if transition_reserves else None,
+        "min_bootstrap_input_reserve_bits": (
+            min(bootstrap_input_reserves) if bootstrap_input_reserves else None
+        ),
+    }
+
+
+def _aggregate_reserve_summary(assignments: list[Assign], tdag: Tdag, params: Params) -> dict[str, Any]:
+    summaries = [_assignment_reserve_summary(assign, tdag, params) for assign in assignments]
+    if not summaries:
+        return {
+            "min_decryptability_reserve_bits": None,
+            "min_transition_reserve_bits": None,
+            "min_bootstrap_input_reserve_bits": None,
+        }
+
+    def min_present(key: str) -> int | None:
+        values = [item.get(key) for item in summaries if item.get(key) is not None]
+        return min(values) if values else None
+
+    return {
+        "assignment_count": len(summaries),
+        "min_decryptability_reserve_bits": min_present("min_decryptability_reserve_bits"),
+        "min_transition_reserve_bits": min_present("min_transition_reserve_bits"),
+        "min_bootstrap_input_reserve_bits": min_present("min_bootstrap_input_reserve_bits"),
+        "first_assignment": summaries[0],
+    }
+
+
+def _reserve_quality_score(summary: dict[str, Any]) -> float:
+    values = [
+        summary.get("min_decryptability_reserve_bits"),
+        summary.get("min_transition_reserve_bits"),
+    ]
+    if summary.get("min_bootstrap_input_reserve_bits") is not None:
+        values.append(summary.get("min_bootstrap_input_reserve_bits"))
+    numeric = [_finite_float(value, float("-inf")) for value in values if value is not None]
+    if not numeric:
+        return 0.0
+    weakest = min(numeric)
+    return max(0.0, min(1.0, weakest / 16.0))
+
+
 def _reference_metrics(
     tdag: Tdag,
     io_budgets: list[dict[str, Any]],
@@ -2676,6 +3514,9 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
         "level_drop_penalty",
         "min_internal_level",
         "scale_penalty",
+        "reserve_penalty",
+        "min_transition_reserve",
+        "min_decryptability_reserve",
         "beam_width",
         "state_cap_per_node",
         "scale_lattice",
@@ -2816,6 +3657,7 @@ class PlacementBuilder:
 
     def __init__(self, context: dict[str, Any]):
         self.context = context
+        self.constraints = PlacementConstraints(context)
         self._patches: list[dict[str, Any]] = []
 
     def level_preserving(self, **overrides: Any) -> dict[str, Any]:
@@ -2831,6 +3673,9 @@ class PlacementBuilder:
             "level_drop_penalty": 20_000_000.0,
             "min_internal_level": None,
             "scale_penalty": 0.0,
+            "reserve_penalty": 0.0,
+            "min_transition_reserve": 0,
+            "min_decryptability_reserve": 0,
             "preferred_node_levels": {},
             "preferred_node_scales": {},
             "preferred_edge_scales": {},
@@ -2885,6 +3730,9 @@ class PlacementBuilder:
             "level_drop_penalty": 16_000_000.0,
             "min_internal_level": max(int(ckks["lvl_lb"]), int(ckks["bts_lb"]) + 1),
             "scale_penalty": 1_000.0,
+            "reserve_penalty": 75_000.0,
+            "min_transition_reserve": 4,
+            "min_decryptability_reserve": 4,
             "preferred_node_levels": preferred_levels,
             "preferred_node_scales": preferred_scales,
             "preferred_edge_scales": {},
@@ -2917,6 +3765,95 @@ class PlacementBuilder:
     def low_scale_frontier(self, **overrides: Any) -> dict[str, Any]:
         """Policy that keeps partition boundary scales low when CKKS permits it."""
         policy = _low_scale_frontier_policy()
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def balanced_noise_margin(self, **overrides: Any) -> dict[str, Any]:
+        """Policy seed that trades some latency for a larger CKKS noise margin."""
+        policy = _balanced_noise_margin_policy()
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def bootstrap_safe_margin(self, **overrides: Any) -> dict[str, Any]:
+        """Policy seed that preserves extra level headroom before bootstraps."""
+        policy = _bootstrap_safe_margin_policy()
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def noise_guarded_refresh(self, **overrides: Any) -> dict[str, Any]:
+        """Safety-first seed for deep PolyBERT graphs with tight noise margins."""
+        policy = _noise_guarded_refresh_policy()
+        policy.update(overrides)
+        return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
+
+    def profile_layer_refresh(
+        self,
+        *,
+        include_attention: bool = True,
+        scale_bits: int | None = None,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        """Anchor refreshes at HE-native transformer block boundary nodes.
+
+        The profiler reasons at layer/module boundaries, while an unconstrained
+        scheduler may refresh inside residual or Goldschmidt subexpressions
+        where decoded values are much larger. This seed prefers the final
+        ``polynorm_proxy`` nodes for each layer, and optionally the attention
+        sublayer norm proxies, so OpenEvolve starts from numerically meaningful
+        refresh sites.
+        """
+
+        ckks = _ckks_dict(self.context)
+        preferred_levels: dict[str, int] = {}
+        preferred_scales: dict[str, int] = {}
+        target_scale = int(scale_bits) if scale_bits is not None else int(ckks["Sf"])
+        target_scale = max(int(ckks["Sw"]), min(int(ckks["max_scale"]), target_scale))
+        nodes = (self.context.get("tdag") or {}).get("nodes", {})
+        for node, info in nodes.items():
+            if not isinstance(info, dict) or str(info.get("op")) in {"constant", "input"}:
+                continue
+            comment = str(info.get("comment", ""))
+            if "bert.encoder.layer." not in comment:
+                continue
+            is_norm_boundary = (
+                "op=polynorm_proxy" in comment
+                or "op=layer_norm" in comment
+                or "LayerNorm" in comment
+            )
+            if not is_norm_boundary:
+                continue
+            is_attention = ".attention.output.LayerNorm" in comment
+            is_block_output = ".output.LayerNorm" in comment and ".attention.output.LayerNorm" not in comment
+            if not is_block_output and not (include_attention and is_attention):
+                continue
+            preferred_levels[str(node)] = int(ckks["lvl_ub"])
+            preferred_scales[str(node)] = target_scale
+
+        policy = _bootstrap_safe_margin_policy()
+        policy.update(
+            {
+                "strategy": "level_preserving",
+                "allow_bootstrap": False,
+                "allow_seed_fallback": False,
+                "refresh_fanout_at_level_floor": False,
+                "max_scale_candidates": 20,
+                "bootstrap_penalty": 650_000_000.0,
+                "rescale_penalty": 350_000.0,
+                "level_drop_penalty": 60_000_000.0,
+                "min_internal_level": max(int(ckks["lvl_lb"]), int(ckks["bts_lb"]) + 1),
+                "scale_penalty": 0.0,
+                "reserve_penalty": 150_000.0,
+                "min_transition_reserve": 6,
+                "min_decryptability_reserve": 6,
+                "preferred_node_levels": preferred_levels,
+                "preferred_node_scales": preferred_scales,
+                "preferred_edge_scales": {},
+            }
+        )
+        for key in ("preferred_node_levels", "preferred_node_scales", "preferred_edge_scales"):
+            values = overrides.pop(key, None)
+            if isinstance(values, dict):
+                policy[key].update(values)
         policy.update(overrides)
         return {"api_version": "placement-builder-v1", "policy": policy, "placement_records": []}
 
@@ -2980,6 +3917,178 @@ class PlacementBuilder:
         }
 
 
+class PlacementConstraints:
+    """Solver-free CKKS legality helpers mirroring Orbit's ILP constraints."""
+
+    def __init__(self, context_or_params: Any):
+        self.context_or_params = context_or_params
+        self.ckks = _ckks_dict(context_or_params)
+
+    @property
+    def sf(self) -> int:
+        return int(self.ckks["Sf"])
+
+    @property
+    def lvl_lb(self) -> int:
+        return int(self.ckks["lvl_lb"])
+
+    @property
+    def lvl_ub(self) -> int:
+        return int(self.ckks["lvl_ub"])
+
+    @property
+    def sw(self) -> int:
+        return int(self.ckks["Sw"])
+
+    @property
+    def csw(self) -> int:
+        return int(self.ckks["Csw"])
+
+    @property
+    def max_scale(self) -> int:
+        return int(self.ckks["max_scale"])
+
+    def decryptability_bound(self, level: int) -> int:
+        if isinstance(self.context_or_params, Params):
+            return self.context_or_params.decryptable_scale_bound(level)
+        return int(self.sf * (int(level) - self.lvl_lb + 2) - 7)
+
+    def boundary_output_scale_bound(self, level: int) -> int:
+        # This is the explicit terminal-boundary constraint in add_ilp_io_budgets.
+        if isinstance(self.context_or_params, Params):
+            return self.context_or_params.boundary_output_scale_bound(level)
+        return int(self.sf * (int(level) + 1) - 7)
+
+    def is_decryptable(self, level: int, scale: int) -> bool:
+        if isinstance(self.context_or_params, Params):
+            return self.context_or_params.is_decryptable_state(level, scale)
+        return (
+            self.lvl_lb <= int(level) <= self.lvl_ub
+            and 0 <= int(scale) <= self.max_scale
+            and int(scale) <= self.decryptability_bound(int(level))
+        )
+
+    def valid_transition(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
+        return valid_transition(self.context_or_params, in_lvl, in_scl, out_lvl, out_scl)
+
+    def transition_slack(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> dict[str, Any]:
+        return transition_slack(self.context_or_params, in_lvl, in_scl, out_lvl, out_scl)
+
+    def transition_cost(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> float:
+        return transition_cost(self.context_or_params, in_lvl, in_scl, out_lvl, out_scl)
+
+    def node_scale_lower_bound(self, node: str, port: str = "out") -> int:
+        node_info = self._node_info(node)
+        key = "scale_lb_in" if port == "in" else "scale_lb_out"
+        value = node_info.get(key)
+        if value is None:
+            return self.sw
+        return int(value)
+
+    def edge_scale_lower_bound(self, u: str, v: str) -> int:
+        source = self._node_info(u)
+        if str(source.get("op", "")) == "constant":
+            return max(self.csw, self.node_scale_lower_bound(v, "in"))
+        return max(
+            self.node_scale_lower_bound(u, "out"),
+            self.node_scale_lower_bound(v, "in"),
+        )
+
+    def mul_input_scale(self, predecessor_scales: list[int]) -> int:
+        if not predecessor_scales:
+            raise ValueError("mul_input_scale needs at least one predecessor scale")
+        if len(predecessor_scales) == 1:
+            return int(predecessor_scales[0]) * 2
+        return int(sum(int(value) for value in predecessor_scales))
+
+    def candidate_scales(
+        self,
+        values: list[Any],
+        lower_bound: int | None = None,
+        max_count: int = 32,
+    ) -> list[int]:
+        return candidate_scales(self.context_or_params, values, lower_bound, max_count)
+
+    def legal_output_states(
+        self,
+        in_lvl: int,
+        in_scl: int,
+        *,
+        exact_out_lvl: int | None = None,
+        lower_bound: int | None = None,
+        max_count: int = 32,
+        include_bootstrap: bool = True,
+    ) -> list[dict[str, Any]]:
+        bases = [
+            lower_bound,
+            in_scl,
+            int(in_scl) - self.sf,
+            math.ceil(int(in_scl) / 2),
+            self.sw,
+            self.csw,
+            self.sf,
+        ]
+        scales = self.candidate_scales(
+            [value for value in bases if value is not None],
+            lower_bound if lower_bound is not None else self.sw,
+            max_count,
+        )
+        if exact_out_lvl is not None and int(exact_out_lvl) >= 0:
+            levels = [int(exact_out_lvl)]
+        else:
+            levels = list(range(self.lvl_ub, self.lvl_lb - 1, -1))
+        states = []
+        for level in levels:
+            for scale in scales:
+                if not self.is_decryptable(level, scale):
+                    continue
+                slack = self.transition_slack(in_lvl, in_scl, level, scale)
+                if not slack["valid"]:
+                    continue
+                if slack["uses_bootstrap"] and not include_bootstrap:
+                    continue
+                states.append(
+                    {
+                        "level": int(level),
+                        "scale": int(scale),
+                        "uses_bootstrap": bool(slack["uses_bootstrap"]),
+                        "rescale_count": int(slack["rescale_count"]),
+                        "transition_reserve_bits": int(slack["transition_reserve_bits"]),
+                        "decryptability_reserve_out_bits": int(
+                            slack["decryptability_reserve_out_bits"]
+                        ),
+                        "cost": float(self.transition_cost(in_lvl, in_scl, level, scale)),
+                    }
+                )
+        states.sort(
+            key=lambda item: (
+                item["uses_bootstrap"],
+                item["cost"],
+                -item["transition_reserve_bits"],
+                -item["level"],
+                item["scale"],
+            )
+        )
+        return states
+
+    def boundary_penalty(self, out_lvl: int, out_scl: int, dag_size: int = 1) -> float:
+        bound = self.boundary_output_scale_bound(out_lvl)
+        hard_violation = max(0, int(out_scl) - bound)
+        return float(1_000_000 * hard_violation + 0.2 * max(1, int(dag_size)) * int(out_scl))
+
+    def _node_info(self, node: str) -> dict[str, Any]:
+        if isinstance(self.context_or_params, dict):
+            graph_nodes = self.context_or_params.get("graph_summary", {}).get("nodes", {})
+            info = graph_nodes.get(str(node))
+            if isinstance(info, dict):
+                return info
+            tdag_nodes = self.context_or_params.get("tdag", {}).get("nodes", {})
+            info = tdag_nodes.get(str(node))
+            if isinstance(info, dict):
+                return info
+        return {}
+
+
 def valid_transition(context_or_params: Any, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
     ckks = _ckks_dict(context_or_params)
     sf = int(ckks["Sf"])
@@ -3017,6 +4126,50 @@ def transition_cost(context_or_params: Any, in_lvl: int, in_scl: int, out_lvl: i
     bootstrap = 0 if (in_lvl >= out_lvl and sf * in_lvl - in_scl >= sf * out_lvl - out_scl) else 1
     rescale = max(0, int(math.ceil((in_scl - out_scl) / max(sf, 1))))
     return float(bootstrap * 1_000_000_000 + rescale * 1_000_000 + max(0, in_lvl - out_lvl))
+
+
+def transition_slack(
+    context_or_params: Any,
+    in_lvl: int,
+    in_scl: int,
+    out_lvl: int,
+    out_scl: int,
+) -> dict[str, Any]:
+    """Expose Orbit ILP level/scale feasibility slack to evolved candidates.
+
+    These fields mirror the original Gurobi/PuLP constraints without importing
+    or calling either solver. Candidate programs can use this for guarded
+    heuristics; Orbit still validates final assignments with ``Assign.check_assign``.
+    """
+
+    ckks = _ckks_dict(context_or_params)
+    params = _ParamsProxy(ckks)
+    valid = valid_transition(context_or_params, in_lvl, in_scl, out_lvl, out_scl)
+    no_bootstrap = params.check_res(in_lvl, in_scl, out_lvl, out_scl)
+    rescale_count = max(0, int(math.ceil((int(in_scl) - int(out_scl)) / max(params.Sf, 1))))
+    decrypt_in = int(params.Sf * (int(in_lvl) - params.lvl_lb + 2) - 7 - int(in_scl))
+    decrypt_out = int(params.Sf * (int(out_lvl) - params.lvl_lb + 2) - 7 - int(out_scl))
+    linear_in = int(params.Sf * int(in_lvl) - int(in_scl))
+    linear_out = int(params.Sf * int(out_lvl) - int(out_scl))
+    bootstrap_input = int(params.Sf * (int(in_lvl) - params.bts_lb + 1) - int(in_scl))
+    if no_bootstrap:
+        transition_reserve = linear_in - linear_out
+    else:
+        transition_reserve = min(bootstrap_input, decrypt_out)
+    return {
+        "valid": bool(valid),
+        "uses_bootstrap": bool(valid and not no_bootstrap),
+        "rescale_count": int(rescale_count),
+        "decryptability_reserve_in_bits": decrypt_in,
+        "decryptability_reserve_out_bits": decrypt_out,
+        "linear_noise_budget_in_bits": linear_in,
+        "linear_noise_budget_out_bits": linear_out,
+        "transition_reserve_bits": int(transition_reserve),
+        "bootstrap_input_reserve_bits": int(bootstrap_input),
+        "violations": _transition_slack_violations(
+            params, int(in_lvl), int(in_scl), int(out_lvl), int(out_scl)
+        ),
+    }
 
 
 def candidate_scales(
@@ -3075,6 +4228,101 @@ class _ParamsProxy:
         self.lvl_ub = int(ckks["lvl_ub"])
         self.bts_lb = int(ckks["bts_lb"])
         self.bts_ub = int(ckks["bts_ub"])
+        self.max_scale = int(ckks["max_scale"])
+
+    def check_res(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
+        if in_lvl < out_lvl:
+            return False
+        return self.Sf * in_lvl - in_scl >= self.Sf * out_lvl - out_scl
+
+    def check_resbts(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
+        if self.check_res(in_lvl, in_scl, out_lvl, out_scl):
+            return True
+        if not self.check_res(in_lvl, in_scl, self.bts_lb, self.Sf):
+            return False
+        r = max(0, int(math.ceil((self.Sf - out_scl) / max(self.Sf, 1))))
+        if not (self.bts_lb < out_lvl + r <= self.bts_ub):
+            return False
+        return self.check_res(out_lvl + r, self.Sf, out_lvl, out_scl)
+
+
+def _ilp_semantics_summary(params: Params) -> dict[str, Any]:
+    return {
+        "source": "Orbit ILP VarPool/add_ilp_constraints semantics",
+        "solver_free": True,
+        "variables": {
+            "node": ["v_lvl_in", "v_scl_in", "v_lvl_out", "v_scl_out", "v_use_r", "v_use_b"],
+            "edge": ["e_lvl_in", "e_scl_in", "e_lvl_out", "e_scl_out", "e_use_r"],
+        },
+        "constraints": {
+            "decryptable": "scale <= Sf * (level - lvl_lb + 2) - 7",
+            "mul_input_scale": "mul input scale equals sum of predecessor output scales",
+            "no_bootstrap": [
+                "out_lvl <= in_lvl - r",
+                "out_scl >= in_scl - Sf * r",
+            ],
+            "bootstrap": [
+                "in_scl <= Sf * (in_lvl - bts_lb + 1)",
+                "out_lvl >= bts_lb + 1",
+                "out_scl >= Sf",
+            ],
+            "edge_rescale": [
+                "edge_out_lvl <= edge_in_lvl - r",
+                "edge_out_scl >= edge_in_scl - Sf * r",
+            ],
+            "boundary_output": "output_scale <= Sf * (output_level + 1) - 7",
+            "local_bounds": "node/edge scales obey resilience scale_lower_bound",
+        },
+        "objective_terms": [
+            "bootstrap latency * use_b",
+            "rescale latency * use_r",
+            "operator latency at input level",
+            "small boundary output scale penalty",
+        ],
+        "ckks": {
+            "Sf": params.Sf,
+            "Sw": params.Sw,
+            "Csw": params.Csw,
+            "lvl_lb": params.lvl_lb,
+            "lvl_ub": params.lvl_ub,
+            "bts_lb": params.bts_lb,
+            "bts_ub": params.bts_ub,
+            "max_scale": params.max_scale(),
+        },
+    }
+
+
+def _transition_slack_violations(
+    params: _ParamsProxy,
+    in_lvl: int,
+    in_scl: int,
+    out_lvl: int,
+    out_scl: int,
+) -> list[str]:
+    violations: list[str] = []
+
+    def decryptable(level: int, scale: int, label: str) -> None:
+        if not params.lvl_lb <= level <= params.lvl_ub:
+            violations.append(f"{label}_level_out_of_bounds")
+        if scale < 0:
+            violations.append(f"{label}_scale_negative")
+        if scale > params.max_scale:
+            violations.append(f"{label}_scale_above_max")
+        if scale > params.Sf * (level - params.lvl_lb + 2) - 7:
+            violations.append(f"{label}_not_decryptable")
+
+    decryptable(in_lvl, in_scl, "input")
+    decryptable(out_lvl, out_scl, "output")
+    if params.check_res(in_lvl, in_scl, out_lvl, out_scl):
+        return violations
+    if not params.check_res(in_lvl, in_scl, params.bts_lb, params.Sf):
+        violations.append("bootstrap_input_above_refresh_bound")
+    r = max(0, int(math.ceil((params.Sf - out_scl) / max(params.Sf, 1))))
+    if not (params.bts_lb < out_lvl + r <= params.bts_ub):
+        violations.append("bootstrap_output_level_window")
+    if not params.check_res(out_lvl + r, params.Sf, out_lvl, out_scl):
+        violations.append("bootstrap_output_rescale_invalid")
+    return violations
 
 
 def _load_candidate_hints(program_path: Path, context: dict[str, Any]) -> dict[str, Any]:
@@ -3169,6 +4417,9 @@ _PATCHABLE_POLICY_KEYS = {
     "level_drop_penalty",
     "min_internal_level",
     "scale_penalty",
+    "reserve_penalty",
+    "min_transition_reserve",
+    "min_decryptability_reserve",
     "beam_width",
     "state_cap_per_node",
     "scale_lattice",

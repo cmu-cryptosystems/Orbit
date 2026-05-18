@@ -8,6 +8,7 @@ from ...utils.fix_random import set_global_seed
 from .orbit_core import orbit_core
 
 import argparse
+import copy
 import time
 import os
 
@@ -87,6 +88,46 @@ def _optimize_and_emit_mlir(og_dag, output_file: str, params: Params, le: Latenc
     print("=" * 40)
 
 
+def _optimize_and_emit_mlir_with_bypass_retry(
+    og_dag,
+    output_file: str,
+    params: Params,
+    le: LatencyEstimator,
+    timestamps: dict,
+) -> None:
+    """Run Orbit and fail open to the no-bypass path for known QBP registration gaps."""
+
+    base_dag = og_dag.copy_tdag()
+    try:
+        _optimize_and_emit_mlir(
+            base_dag.copy_tdag(),
+            output_file,
+            params,
+            le,
+            dict(timestamps),
+        )
+        return
+    except AssertionError as exc:
+        if params.bpsdepth is None or "QBP not found" not in str(exc):
+            raise
+        print(
+            "Bypass QBP registration failed; retrying compile with bypass disabled. "
+            f"Original error: {exc}"
+        )
+
+    retry_params = copy.copy(params)
+    retry_params.bpsdepth = None
+    retry_timestamps = dict(timestamps)
+    retry_timestamps["Bypass Retry Triggered"] = 0.0
+    _optimize_and_emit_mlir(
+        base_dag.copy_tdag(),
+        output_file,
+        retry_params,
+        le,
+        retry_timestamps,
+    )
+
+
 def run(input_file: str, output_file: str, params: Params):
     le = LatencyEstimator(params)
 
@@ -98,7 +139,7 @@ def run(input_file: str, output_file: str, params: Params):
     print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
     timestamps['DAG Load Time'] = time.time() - start_time
 
-    _optimize_and_emit_mlir(og_dag, output_file, params, le, timestamps)
+    _optimize_and_emit_mlir_with_bypass_retry(og_dag, output_file, params, le, timestamps)
 
 
 def run_from_rotom(manifest_path: str, output_file: str, params: Params) -> None:
@@ -113,7 +154,7 @@ def run_from_rotom(manifest_path: str, output_file: str, params: Params) -> None
     print(f"Built original DAG from Rotom with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
     timestamps['DAG Load Time'] = time.time() - start_time
 
-    _optimize_and_emit_mlir(og_dag, output_file, params, le, timestamps)
+    _optimize_and_emit_mlir_with_bypass_retry(og_dag, output_file, params, le, timestamps)
 
 def main():
     set_global_seed(42)
@@ -180,6 +221,11 @@ def main():
         help='Return the best recovered/initial candidate if OpenEvolve runtime fails',
     )
     parser.add_argument(
+        '--openevolve-reuse-output',
+        action='store_true',
+        help='Reuse an existing OpenEvolve output directory and skip the LLM call',
+    )
+    parser.add_argument(
         '--noise-estimator',
         choices=['off', 'finalists'],
         default='finalists',
@@ -198,6 +244,18 @@ def main():
         type=float,
         default=14.0,
         help='Gaussian tail multiplier for the CKKS noise bound',
+    )
+    parser.add_argument(
+        '--noise-estimator-max-trace-message-bits',
+        type=float,
+        default=20.0,
+        help='Trace message-bit warning threshold; output/bootstrap gates remain hard checks',
+    )
+    parser.add_argument(
+        '--noise-estimator-require-trace-safe',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Treat whole-trace precision/message warnings as hard finalist rejections',
     )
     parser.add_argument(
         '--resilience-profile',
@@ -278,11 +336,14 @@ def main():
                     openevolve_parallel_evaluations=args.openevolve_parallel_evaluations,
                     openevolve_checkpoint_interval=args.openevolve_checkpoint_interval,
                     openevolve_fail_open=args.openevolve_fail_open,
+                    openevolve_reuse_output=args.openevolve_reuse_output,
                     noise_estimator=args.noise_estimator,
                     noise_estimator_binary=args.noise_estimator_binary,
                     noise_estimator_timeout_sec=args.noise_estimator_timeout_sec,
                     noise_estimator_min_output_margin_bits=args.noise_estimator_min_output_margin_bits,
-                    noise_estimator_alpha=args.noise_estimator_alpha)
+                    noise_estimator_alpha=args.noise_estimator_alpha,
+                    noise_estimator_max_trace_message_bits=args.noise_estimator_max_trace_message_bits,
+                    noise_estimator_require_trace_safe=args.noise_estimator_require_trace_safe)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

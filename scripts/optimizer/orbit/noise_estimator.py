@@ -11,7 +11,7 @@ from typing import Any
 ESTIMATOR_SOURCE = "tuneinsight/ckks-noise-estimator"
 ESTIMATOR_PAPER = "https://eprint.iacr.org/2024/853"
 ESTIMATOR_MODEL = "componentwise-average-case-ckks"
-ESTIMATOR_VERSION = "orbit-estimator-gate-v2"
+ESTIMATOR_VERSION = "orbit-estimator-gate-v4"
 
 ROUNDING_VARIANCE = 1.0 / 12.0
 PUBLIC_KEY_FRESH_VARIANCE_0 = 1.0 / 6.0
@@ -20,6 +20,8 @@ DEFAULT_INPUT_STD = 1.0 / math.sqrt(3.0)
 DEFAULT_ALPHA = 14.0
 DEFAULT_FRESH_ENCRYPTION_SIGMA = 3.2
 DEFAULT_PRECISION_RESERVE_BITS = 2.0
+DEFAULT_BOOTSTRAP_INPUT_MESSAGE_BITS = 4.0
+DEFAULT_TRACE_MESSAGE_BITS = 4.0
 
 
 def estimate_compile_result_noise(
@@ -199,6 +201,7 @@ def _assignment_estimate(request: dict[str, Any], unsupported: list[str]) -> dic
 
     states: dict[str, _NoiseState] = {}
     trace: dict[str, dict[str, Any]] = {}
+    transition_events: list[dict[str, Any]] = []
     try:
         for node in topo:
             attrs = nodes.get(node, {})
@@ -212,7 +215,7 @@ def _assignment_estimate(request: dict[str, Any], unsupported: list[str]) -> dic
                 raw = _fresh_input_state(node, assignment, sf_bits, sw_bits, input_std, fresh_sigma)
             else:
                 pred_states = [
-                    _state_on_edge(states[pred], pred, node, assignment, ckks)
+                    _state_on_edge(states[pred], pred, node, assignment, ckks, policy, transition_events)
                     for pred in incoming.get(node, [])
                     if pred in states
                 ]
@@ -220,7 +223,15 @@ def _assignment_estimate(request: dict[str, Any], unsupported: list[str]) -> dic
 
             out_level = _map_int(assignment, "v_lvl_out", node, raw.level)
             out_scale = _map_int(assignment, "v_scl_out", node, raw.scale_bits)
-            states[node] = _apply_transition(raw, out_level, out_scale, ckks, f"node:{node}")
+            states[node] = _apply_transition(
+                raw,
+                out_level,
+                out_scale,
+                ckks,
+                f"node:{node}",
+                policy,
+                transition_events,
+            )
             trace[node] = _trace_entry(op, states[node])
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         fallback_unsupported = list(unsupported)
@@ -233,8 +244,10 @@ def _assignment_estimate(request: dict[str, Any], unsupported: list[str]) -> dic
         output_states = list(states.values())[-1:]
     bound = max(_decoded_bound_bits(state, ckks, policy) for state in output_states)
 
+    trace_safety = _trace_safety_summary(trace, transition_events, ckks, policy)
     hotspots = _hotspots(candidate)
     hotspots.extend(_noise_hotspots(trace, ckks, policy))
+    hotspots.extend(_message_hotspots(trace, ckks, policy))
     return _estimate_payload(
         request,
         mode="internal_componentwise_average_case",
@@ -244,11 +257,13 @@ def _assignment_estimate(request: dict[str, Any], unsupported: list[str]) -> dic
         hotspots=hotspots,
         details={
             "outputs": {
-                state.node or f"output_{idx}": _decoded_bound_bits(state, ckks, policy)
+                state.node or f"output_{idx}": _state_bound_summary(state, ckks, policy)
                 for idx, state in enumerate(output_states)
             },
             "assignment_replayed": True,
             "trace_node_count": len(trace),
+            "trace_safety": trace_safety,
+            "bootstrap_inputs": transition_events[:32],
         },
     )
 
@@ -349,10 +364,66 @@ def _estimate_payload(
 
 def _normalize_estimate(data: dict[str, Any], params: Any) -> dict[str, Any]:
     min_margin = float(getattr(params, "noise_estimator_min_output_margin_bits", 2.0))
+    max_bootstrap_message_bits = float(
+        getattr(
+            params,
+            "noise_estimator_max_bootstrap_message_bits",
+            DEFAULT_BOOTSTRAP_INPUT_MESSAGE_BITS,
+        )
+    )
+    max_trace_message_bits = float(
+        getattr(
+            params,
+            "noise_estimator_max_trace_message_bits",
+            DEFAULT_TRACE_MESSAGE_BITS,
+        )
+    )
+    require_trace_safe = bool(getattr(params, "noise_estimator_require_trace_safe", False))
     margin = _as_float(data.get("output_margin_bits"), float("-inf"))
     unsupported = data.get("unsupported_ops") or []
     if not isinstance(unsupported, list):
         unsupported = [str(unsupported)]
+    unsupported = list(unsupported)
+    warning_ops = data.get("warning_ops") or []
+    if not isinstance(warning_ops, list):
+        warning_ops = [str(warning_ops)]
+    warning_ops = list(warning_ops)
+    if "trace_precision_below_margin" in warning_ops:
+        warning_ops = [op for op in warning_ops if op != "trace_precision_below_margin"]
+        if require_trace_safe:
+            unsupported.append("trace_precision_below_margin")
+        else:
+            warning_ops.append("trace_precision_below_margin")
+    trace_safety = (data.get("details") or {}).get("trace_safety") or {}
+    min_trace_precision = trace_safety.get("min_trace_precision_bits")
+    if min_trace_precision is not None and _as_float(min_trace_precision, float("inf")) < min_margin:
+        if require_trace_safe:
+            unsupported.append("trace_precision_below_margin")
+        else:
+            warning_ops.append("trace_precision_below_margin")
+    max_trace_message = trace_safety.get("max_decoded_message_bits")
+    if (
+        max_trace_message is not None
+        and _as_float(max_trace_message, float("-inf")) > max_trace_message_bits
+    ):
+        if require_trace_safe:
+            unsupported.append("trace_message_too_large")
+        else:
+            warning_ops.append("trace_message_too_large")
+    min_bootstrap_precision = trace_safety.get("min_bootstrap_input_precision_bits")
+    if (
+        min_bootstrap_precision is not None
+        and _as_float(min_bootstrap_precision, float("inf")) < min_margin
+    ):
+        unsupported.append("bootstrap_input_precision_below_margin")
+    max_bootstrap_message = trace_safety.get("max_bootstrap_decoded_message_bits")
+    if (
+        max_bootstrap_message is not None
+        and _as_float(max_bootstrap_message, float("-inf")) > max_bootstrap_message_bits
+    ):
+        unsupported.append("bootstrap_input_message_too_large")
+    unsupported = sorted(set(unsupported))
+    warning_ops = sorted(set(warning_ops))
     fallback = bool(data.get("fallback", False))
     valid = bool(data.get("valid", True)) and margin >= min_margin and not fallback and not unsupported
     result = {
@@ -363,10 +434,13 @@ def _normalize_estimate(data: dict[str, Any], params: Any) -> dict[str, Any]:
         "model": data.get("model", ESTIMATOR_MODEL),
         "version": data.get("version", ESTIMATOR_VERSION),
         "min_output_margin_bits": min_margin,
+        "max_bootstrap_decoded_message_bits": max_bootstrap_message_bits,
+        "max_trace_decoded_message_bits": max_trace_message_bits,
         "output_margin_bits": margin,
         "estimated_noise_bits": _as_float(data.get("estimated_noise_bits"), 0.0),
         "estimated_precision_bits": _as_float(data.get("estimated_precision_bits"), 0.0),
         "unsupported_ops": unsupported,
+        "warning_ops": warning_ops,
         "fallback": fallback,
         "valid": valid,
     }
@@ -446,11 +520,21 @@ def _state_on_edge(
     v: str,
     assignment: dict[str, Any],
     ckks: dict[str, Any],
+    policy: dict[str, Any],
+    transition_events: list[dict[str, Any]],
 ) -> _NoiseState:
     key = _edge_key(u, v)
     out_level = _map_int(assignment, "e_lvl_out", key, state.level)
     out_scale = _map_int(assignment, "e_scl_out", key, state.scale_bits)
-    return _apply_transition(state, out_level, out_scale, ckks, f"edge:{u}->{v}")
+    return _apply_transition(
+        state,
+        out_level,
+        out_scale,
+        ckks,
+        f"edge:{u}->{v}",
+        policy,
+        transition_events,
+    )
 
 
 def _apply_node_operation(
@@ -677,10 +761,23 @@ def _apply_transition(
     out_scale: int,
     ckks: dict[str, Any],
     node: str,
+    policy: dict[str, Any] | None = None,
+    transition_events: list[dict[str, Any]] | None = None,
 ) -> _NoiseState:
     sf_bits = max(1, _as_int(ckks.get("Sf"), 40))
     result = state
     if not _check_res(sf_bits, state.level, state.scale_bits, out_level, out_scale):
+        if transition_events is not None and policy is not None:
+            event = _state_bound_summary(result, ckks, policy)
+            event.update(
+                {
+                    "kind": "bootstrap_input",
+                    "location": node,
+                    "target_level": out_level,
+                    "target_scale_bits": out_scale,
+                }
+            )
+            transition_events.append(event)
         result = _bootstrap_state(result, ckks, node)
 
     while result.scale_bits - out_scale > 0:
@@ -757,6 +854,70 @@ def _decoded_bound_bits(
     }
 
 
+def _state_bound_summary(
+    state: _NoiseState,
+    ckks: dict[str, Any],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    bound = _decoded_bound_bits(state, ckks, policy)
+    decoded_message_bits = _decoded_message_bits(state)
+    bound["decoded_message_bits"] = decoded_message_bits
+    bound["message_scale_margin_bits"] = float(state.scale_bits) - decoded_message_bits
+    return bound
+
+
+def _trace_safety_summary(
+    trace: dict[str, dict[str, Any]],
+    transition_events: list[dict[str, Any]],
+    ckks: dict[str, Any],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    bounds = [_state_bound_summary(entry["state"], ckks, policy) for entry in trace.values()]
+    if not bounds:
+        return {
+            "min_trace_precision_bits": None,
+            "max_trace_noise_bits": None,
+            "max_decoded_message_bits": None,
+            "min_bootstrap_input_precision_bits": None,
+            "max_bootstrap_decoded_message_bits": None,
+            "bootstrap_input_count": 0,
+        }
+    bootstrap_precision = [
+        _as_float(event.get("estimated_precision_bits"), float("inf"))
+        for event in transition_events
+    ]
+    bootstrap_message = [
+        _as_float(event.get("decoded_message_bits"), float("-inf"))
+        for event in transition_events
+    ]
+    return {
+        "min_trace_precision_bits": min(
+            _as_float(bound.get("estimated_precision_bits"), float("inf"))
+            for bound in bounds
+        ),
+        "max_trace_noise_bits": max(
+            _as_float(bound.get("estimated_noise_bits"), float("-inf"))
+            for bound in bounds
+        ),
+        "max_decoded_message_bits": max(
+            _as_float(bound.get("decoded_message_bits"), float("-inf"))
+            for bound in bounds
+        ),
+        "min_bootstrap_input_precision_bits": (
+            min(bootstrap_precision) if bootstrap_precision else None
+        ),
+        "max_bootstrap_decoded_message_bits": (
+            max(bootstrap_message) if bootstrap_message else None
+        ),
+        "bootstrap_input_count": len(transition_events),
+    }
+
+
+def _decoded_message_bits(state: _NoiseState) -> float:
+    magnitude = max(abs(state.message_sigma), 2.0 ** -1022)
+    return math.log2(magnitude) - float(state.scale_bits)
+
+
 def _coefficient_bound_sigma(state: _NoiseState, ckks: dict[str, Any]) -> float:
     poly_degree = max(2, _as_int(ckks.get("poly_degree"), 32768))
     secret_sigma = _secret_component_sigma(poly_degree, ckks, squared=False)
@@ -812,6 +973,27 @@ def _noise_hotspots(
         {
             "location": f"node={node};op={entry['op']}",
             "estimated_noise_bits": _decoded_bound_bits(entry["state"], ckks, policy)["estimated_noise_bits"],
+        }
+        for node, entry in ranked[:8]
+    ]
+
+
+def _message_hotspots(
+    trace: dict[str, dict[str, Any]],
+    ckks: dict[str, Any],
+    policy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ranked = sorted(
+        trace.items(),
+        key=lambda item: _state_bound_summary(item[1]["state"], ckks, policy)["decoded_message_bits"],
+        reverse=True,
+    )
+    return [
+        {
+            "location": f"node={node};op={entry['op']}",
+            "decoded_message_bits": _state_bound_summary(entry["state"], ckks, policy)[
+                "decoded_message_bits"
+            ],
         }
         for node, entry in ranked[:8]
     ]

@@ -19,6 +19,8 @@ func main() {
 	var instructionsPath string
 	var mlirPath string
 	var constantsPath string
+	var dynamicMaskTablePath string
+	var dynamicMaskPath string
 	var inputsPath string
 	var outputPath string
 	var trueLabelsPath string
@@ -35,6 +37,8 @@ func main() {
 	flag.StringVar(&outFile, "getLog", "", "Enable debug log. Optionally specify output file (default: precision_debug.txt)")
 	flag.StringVar(&instructionsPath, "i", "", "Path to instructions file")
 	flag.StringVar(&constantsPath, "cons", "", "Path to constants cst file")
+	flag.StringVar(&dynamicMaskTablePath, "dynamicMaskTable", "", "Path to dynamic plaintext mask metadata JSON")
+	flag.StringVar(&dynamicMaskPath, "dynamicMask", "", "Path to per-sample dynamic plaintext mask values")
 	flag.StringVar(&inputsPath, "input", "", "Path to inputs directory")
 	flag.StringVar(&outputPath, "output", "", "Path to output file")
 	flag.StringVar(&trueLabelsPath, "true", "", "Path to true labels file (for batch processing validation)")
@@ -57,7 +61,7 @@ func main() {
 		os.Remove(filepath.Join("logs", outFile))
 	}
 
-	fhe := NewLattigoFHE(n, instructionsPath, mlirPath, constantsPath, inputsPath, outputPath, trueLabelsPath, fileType, maxLevel, bootstrapMinLevel, bootstrapMaxLevel, outFile, enableTiming, heMode)
+	fhe := NewLattigoFHE(n, instructionsPath, mlirPath, constantsPath, dynamicMaskTablePath, dynamicMaskPath, inputsPath, outputPath, trueLabelsPath, fileType, maxLevel, bootstrapMinLevel, bootstrapMaxLevel, outFile, enableTiming, heMode)
 
 	// Batch processing mode
 	if inputsPath != "" {

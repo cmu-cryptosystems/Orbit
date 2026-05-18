@@ -211,6 +211,8 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["noise_estimator_timeout_sec"] == 30
     assert init["noise_estimator_min_output_margin_bits"] == 2.0
     assert init["noise_estimator_alpha"] == 14.0
+    assert init["noise_estimator_max_trace_message_bits"] == 20.0
+    assert init["noise_estimator_require_trace_safe"] is False
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"
@@ -224,6 +226,36 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     mkdir_call = captured["makedirs"]
     assert mkdir_call["path"] == str(tmp_path / "out")
     assert mkdir_call["exist_ok"] is True
+
+
+def test_optimizer_bypass_qbp_failure_retries_without_bypass(monkeypatch: pytest.MonkeyPatch):
+    import scripts.optimizer.orbit.optimizer as optimizer_mod
+
+    calls: list[int | None] = []
+
+    class FakeDag:
+        def copy_tdag(self):
+            return FakeDag()
+
+    class FakeParams:
+        bpsdepth = 15
+
+    def fake_optimize(og_dag, output_file, params, le, timestamps):
+        calls.append(params.bpsdepth)
+        if len(calls) == 1:
+            raise AssertionError("Main PDAG #toy QBP not found in manager. Please add it first.")
+
+    monkeypatch.setattr(optimizer_mod, "_optimize_and_emit_mlir", fake_optimize)
+
+    optimizer_mod._optimize_and_emit_mlir_with_bypass_retry(
+        FakeDag(),
+        "out.mlir",
+        FakeParams(),
+        object(),
+        {"DAG Load Time": 0.01},
+    )
+
+    assert calls == [15, None]
 
 
 def test_optimizer_cli_openevolve_resilience_smoke(

@@ -444,8 +444,39 @@ class QBPManager:
             groups.setdefault(key, []).append(budget)
         for budgets in groups.values():
             budgets.sort(key=lambda item: int(item.get("out_lvl", -1)))
+        per_group_output_cap = max(
+            1,
+            min(4, int(getattr(self.params, "openevolve_max_unit_samples", 64))),
+        )
+
+        def sample_group_outputs(budgets: list[dict]) -> list[dict]:
+            if len(budgets) <= per_group_output_cap:
+                return budgets
+            by_level = {int(item.get("out_lvl", -1)): item for item in budgets}
+            ordered_levels = sorted(by_level)
+            keep_levels = [
+                ordered_levels[0],
+                max(1, self.params.bts_lb + 1),
+                max(1, self.params.lvl_ub // 2),
+                ordered_levels[-1],
+            ]
+            selected: list[dict] = []
+            seen_levels = set()
+            for level in keep_levels:
+                if level in by_level and level not in seen_levels:
+                    selected.append(by_level[level])
+                    seen_levels.add(level)
+                if len(selected) >= per_group_output_cap:
+                    return selected
+            for level in ordered_levels:
+                if level not in seen_levels:
+                    selected.append(by_level[level])
+                    seen_levels.add(level)
+                if len(selected) >= per_group_output_cap:
+                    break
+            return selected or budgets[:1]
         if len(groups) <= max_groups:
-            return io_budgets_list
+            return [budget for key in groups for budget in sample_group_outputs(groups[key])]
 
         selected_keys: list[tuple] = []
         seen = set()
@@ -537,8 +568,8 @@ class QBPManager:
                 add_key(key)
                 if len(selected_keys) >= max_groups:
                     break
-        selected = [budget for key in selected_keys for budget in groups[key]]
-        return selected or groups[group_keys[0]]
+        selected = [budget for key in selected_keys for budget in sample_group_outputs(groups[key])]
+        return selected or sample_group_outputs(groups[group_keys[0]])
 
     def _record_openevolve_budget_task(
         self,

@@ -1234,8 +1234,13 @@ def test_bootstrap_mcts_sampled_budget_sampler_preserves_boundary_groups(
 
     sampled = manager._sample_openevolve_eval_budgets(_toy_pdag(params), budgets)
 
-    assert len(sampled) == params.lvl_ub
-    assert {int(item["out_lvl"]) for item in sampled} == set(range(1, params.lvl_ub + 1))
+    expected_levels = {1, max(1, params.bts_lb + 1), max(1, params.lvl_ub // 2), params.lvl_ub}
+    assert len(sampled) == len(expected_levels)
+    assert {int(item["out_lvl"]) for item in sampled} == expected_levels
+    assert {
+        (int(item["in_lvl"]), int(item["in_scl"]), str(item.get("maino_v", "")))
+        for item in sampled
+    } == {(-1, params.Sw, "")}
 
 
 def test_bootstrap_mcts_returns_complete_qbp_boundary_group(toy_cost_json: str):

@@ -1183,23 +1183,23 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
         bounded["mcts_rollout_budget"] = min(
-            10 if budget_aggressive else 6,
-            _int_hint(bounded.get("mcts_rollout_budget"), 10 if budget_aggressive else 6),
+            3 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_rollout_budget"), 3 if budget_aggressive else 2),
         )
         bounded["mcts_action_cap"] = min(
-            8 if budget_aggressive else 5,
-            _int_hint(bounded.get("mcts_action_cap"), 8 if budget_aggressive else 5),
+            3 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_action_cap"), 3 if budget_aggressive else 2),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
-            128 if budget_aggressive else 4,
+            32 if budget_aggressive else 4,
             _int_hint(
                 bounded.get("mcts_max_repair_bootstraps"),
-                128 if budget_aggressive else 4,
+                32 if budget_aggressive else 4,
             ),
         )
         bounded["boundary_state_cap"] = min(
-            3 if budget_aggressive else 2,
-            _int_hint(bounded.get("boundary_state_cap"), 3 if budget_aggressive else 2),
+            1,
+            _int_hint(bounded.get("boundary_state_cap"), 1),
         )
     if isinstance(portfolio, list) and portfolio:
         sampled_portfolio = [

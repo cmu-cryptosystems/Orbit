@@ -800,8 +800,8 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     assert len(hints["mcts_actions"]) >= 4
     assert hints["mcts_actions"][0]["policy"]["forbid_bootstrap"] is True
     assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
-    assert sampled["mcts_rollout_budget"] <= 10
-    assert sampled["mcts_action_cap"] <= 8
+    assert sampled["mcts_rollout_budget"] <= 2
+    assert sampled["mcts_action_cap"] <= 2
     assert sampled["mcts_max_repair_bootstraps"] <= 4
 
 
@@ -865,9 +865,10 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 10
-    assert captured["mcts_action_cap"] <= 8
-    assert captured["mcts_max_repair_bootstraps"] == 128
+    assert captured["mcts_rollout_budget"] <= 3
+    assert captured["mcts_action_cap"] <= 3
+    assert captured["mcts_max_repair_bootstraps"] == 32
+    assert captured["boundary_state_cap"] == 1
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(

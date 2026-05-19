@@ -1383,12 +1383,12 @@ def _sampled_progress_compile_result(
         list(diagnostics.get("boundary_group_summaries", []))
     )
     sampled_bootstrap_count = (
-        group_summary["avg_bootstrap"]
+        group_summary["frontier_bootstrap"]
         if group_summary["boundary_group_count"]
         else count_summary["avg_bootstrap"]
     )
     sampled_rescale_count = (
-        group_summary["avg_rescale"]
+        group_summary["frontier_rescale"]
         if group_summary["boundary_group_count"]
         else count_summary["avg_rescale"]
     )
@@ -1582,12 +1582,12 @@ def _evaluate_sampled_budget_tasks(
         total["assignment_count_summary"] = count_summary
         total["boundary_group_count_summary"] = group_summary
         sampled_bootstrap_count = (
-            group_summary["avg_bootstrap"]
+            group_summary["frontier_bootstrap"]
             if group_summary["boundary_group_count"]
             else count_summary["avg_bootstrap"]
         )
         sampled_rescale_count = (
-            group_summary["avg_rescale"]
+            group_summary["frontier_rescale"]
             if group_summary["boundary_group_count"]
             else count_summary["avg_rescale"]
         )
@@ -2953,6 +2953,8 @@ def _record_compile_trace(
                 "repair_summary",
                 "per_unit_score_table",
                 "selected_source_counts",
+                "assignment_count_summary",
+                "boundary_group_count_summary",
                 "candidate_qbp_coverage",
                 "boundary_group_validity",
                 "fallback_selected_groups",
@@ -7602,6 +7604,8 @@ def _boundary_group_count_summary(summaries: list[dict[str, Any]]) -> dict[str, 
             "boundary_group_count": 0.0,
             "avg_bootstrap": 0.0,
             "avg_rescale": 0.0,
+            "frontier_bootstrap": 0.0,
+            "frontier_rescale": 0.0,
             "min_bootstrap": 0.0,
             "min_rescale": 0.0,
             "max_bootstrap": 0.0,
@@ -7618,6 +7622,8 @@ def _boundary_group_count_summary(summaries: list[dict[str, Any]]) -> dict[str, 
         "boundary_group_count": float(count),
         "avg_bootstrap": float(sum(avg_bootstraps) / count),
         "avg_rescale": float(sum(avg_rescales) / count),
+        "frontier_bootstrap": float(sum(min_bootstraps) / count),
+        "frontier_rescale": float(sum(min_rescales) / count),
         "min_bootstrap": float(min(min_bootstraps)),
         "min_rescale": float(min(min_rescales)),
         "max_bootstrap": float(max(max_bootstraps)),

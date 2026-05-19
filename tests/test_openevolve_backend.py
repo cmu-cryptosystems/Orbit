@@ -1334,6 +1334,45 @@ def test_bootstrap_mcts_returns_complete_qbp_boundary_group(toy_cost_json: str):
     assert diagnostics["boundary_group_summaries"][0]["complete"] is True
 
 
+def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
+    summary = oe_backend._boundary_group_count_summary(
+        [
+            {
+                "solved_budgets": 4,
+                "avg_bootstrap": 20.0,
+                "avg_rescale": 12.0,
+                "min_bootstrap": 3.0,
+                "min_rescale": 4.0,
+                "max_bootstrap": 32.0,
+                "max_rescale": 20.0,
+            },
+            {
+                "solved_budgets": 2,
+                "avg_bootstrap": 10.0,
+                "avg_rescale": 6.0,
+                "min_bootstrap": 1.0,
+                "min_rescale": 2.0,
+                "max_bootstrap": 18.0,
+                "max_rescale": 9.0,
+            },
+            {
+                "solved_budgets": 0,
+                "avg_bootstrap": 99.0,
+                "avg_rescale": 99.0,
+                "min_bootstrap": 99.0,
+                "min_rescale": 99.0,
+                "max_bootstrap": 99.0,
+                "max_rescale": 99.0,
+            },
+        ]
+    )
+
+    assert summary["boundary_group_count"] == 2.0
+    assert summary["avg_bootstrap"] == 15.0
+    assert summary["frontier_bootstrap"] == 2.0
+    assert summary["frontier_rescale"] == 3.0
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

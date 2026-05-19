@@ -23,6 +23,7 @@ class QBPManager:
 
             self.ilp_worker = ILP_Worker(params, le)
         self.openevolve_diagnostics = []
+        self.openevolve_budget_tasks = []
     
     def save_qbps(self, dirpath: str):
         os.makedirs(dirpath, exist_ok=True)
@@ -195,6 +196,7 @@ class QBPManager:
         if len(io_budgets_list) == 0:
             return
         io_budgets_list = self._sample_openevolve_eval_budgets(pdag, io_budgets_list)
+        self._record_openevolve_budget_task("normal", pdag, io_budgets_list)
         io_to_assign, io_to_cost = self.ilp_worker.get_qbp(pdag, io_budgets_list)
         if getattr(self.params, "openevolve_evaluating_candidate", False):
             self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
@@ -242,6 +244,7 @@ class QBPManager:
         if len(io_budgets_list) == 0:
             return
         io_budgets_list = self._sample_openevolve_eval_budgets(bypass_pdag, io_budgets_list)
+        self._record_openevolve_budget_task("bypass", bypass_pdag, io_budgets_list)
         
         bypass_io_to_assign, _ = self.ilp_worker.get_qbp(bypass_pdag, io_budgets_list)
         if getattr(self.params, "openevolve_evaluating_candidate", False):
@@ -412,6 +415,24 @@ class QBPManager:
                 add(budget)
             sampled = [budget for key in sampled_groups for budget in groups[key]]
         return sampled or io_budgets_list[:1]
+
+    def _record_openevolve_budget_task(
+        self,
+        kind: str,
+        pdag: Tdag,
+        io_budgets_list: list[dict],
+    ) -> None:
+        if not getattr(self.params, "openevolve_evaluating_candidate", False):
+            return
+        if getattr(self.params, "openevolve_eval_suite", "polybert-sampled") == "polybert-full":
+            return
+        self.openevolve_budget_tasks.append(
+            {
+                "kind": kind,
+                "pdag": pdag,
+                "io_budgets": [dict(item) for item in io_budgets_list],
+            }
+        )
     
     def get_qbp_cost(self, pdag_name: str) -> dict:
         assert pdag_name in self.pdag_name_to_qbp, f"QBP for PDAG #{pdag_name} not found in manager."

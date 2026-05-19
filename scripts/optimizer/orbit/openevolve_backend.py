@@ -11,7 +11,7 @@ import tempfile
 import time
 import traceback
 from collections import Counter
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -750,6 +750,8 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         "rescale_count": reference.get("rescale_count"),
         "valid": reference.get("valid", False),
     }
+    if reference.get("sampled_budget_tasks"):
+        context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
     context["placement_profile"] = reference.get("bottleneck_summary", [])
     context["unit_hotspots"] = _unit_hotspots_from_profile(
         context.get("placement_units", []),
@@ -1055,12 +1057,15 @@ def evaluate_compile_candidate_program(
 def _evaluate_compile_hints(
     context: dict[str, Any], hints: dict[str, Any], *, suppress_output: bool
 ) -> dict[str, Any]:
+    eval_suite = context.get("harness", {}).get("eval_suite", "polybert-sampled")
+    if eval_suite != "polybert-full" and context.get("sampled_budget_tasks"):
+        return _evaluate_sampled_budget_tasks(context, hints, suppress_output=suppress_output)
+
     from .iterative_partition import solve_partition
     from .qbp_manager import QBPManager
 
     tdag = tdag_from_context(context)
     params = tdag.params
-    eval_suite = context.get("harness", {}).get("eval_suite", "polybert-sampled")
     params.openevolve_iterations = 0
     params.openevolve_harness = "compile"
     params.openevolve_compile_hints = _compile_hints_for_eval_suite(hints, eval_suite)
@@ -1135,6 +1140,10 @@ def _evaluate_compile_hints(
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
             "diagnostics": diagnostics,
+            "sampled_budget_tasks": _sampled_budget_tasks_from_qbp_manager(
+                qbp_manager,
+                params,
+            ),
             "log_tail": log_buffer.getvalue()[-3000:],
         }
     except Exception as exc:
@@ -1157,6 +1166,10 @@ def _evaluate_compile_hints(
                 diagnostics,
                 start,
                 log_buffer,
+                sampled_budget_tasks=_sampled_budget_tasks_from_qbp_manager(
+                    qbp_manager,
+                    params,
+                ),
             )
         count_summary = _assignment_count_summary(assignments)
         counts = {
@@ -1185,6 +1198,10 @@ def _evaluate_compile_hints(
                 "invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1},
                 "traceback": tb[-4000:],
             },
+            "sampled_budget_tasks": _sampled_budget_tasks_from_qbp_manager(
+                qbp_manager,
+                params,
+            ),
             "log_tail": (log_buffer.getvalue() + "\n" + tb)[-4000:],
         }
 
@@ -1196,6 +1213,7 @@ def _sampled_progress_compile_result(
     diagnostics: dict[str, Any],
     start: float,
     log_buffer: io.StringIO,
+    sampled_budget_tasks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return sampled-budget progress when sampled replay lacks a full DP path.
 
@@ -1240,7 +1258,209 @@ def _sampled_progress_compile_result(
         "rescale_locations": locations["rescale"],
         "bottleneck_summary": _bottleneck_summary(locations),
         "diagnostics": diagnostics,
+        "sampled_budget_tasks": sampled_budget_tasks or [],
         "log_tail": log_buffer.getvalue()[-3000:],
+    }
+
+
+def _sampled_budget_tasks_from_qbp_manager(
+    qbp_manager,
+    params: Params,
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for index, item in enumerate(getattr(qbp_manager, "openevolve_budget_tasks", [])):
+        pdag = item.get("pdag") if isinstance(item, dict) else None
+        budgets = item.get("io_budgets", []) if isinstance(item, dict) else []
+        if pdag is None or not budgets:
+            continue
+        tasks.append(
+            {
+                "index": index,
+                "kind": str(item.get("kind", "normal")),
+                "context": build_context(pdag, budgets, params),
+            }
+        )
+    return tasks
+
+
+def _evaluate_sampled_budget_tasks(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    *,
+    suppress_output: bool,
+) -> dict[str, Any]:
+    """Evaluate cached sampled QBP batches without rerunning partition replay."""
+
+    start = time.time()
+    eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
+    eval_hints = _compile_hints_for_eval_suite(hints, eval_suite)
+    total: dict[str, Any] = {
+        "requested_budgets": 0,
+        "solved_budgets": 0,
+        "candidate_solved_budgets": 0,
+        "fallback_solved_budgets": 0,
+        "fallback_selected_budgets": 0,
+        "candidate_improved_budgets": 0,
+        "candidate_invalid_reasons": {},
+        "invalid_reasons": {},
+        "candidate_costs": [],
+        "costs": [],
+        "assignments": [],
+        "selected_source_counts": {},
+        "sampled_task_count": 0,
+        "sampled_direct_budget_eval": True,
+    }
+    reserve_summaries: list[dict[str, Any]] = []
+    best_assign: Assign | None = None
+    best_cost = float("inf")
+    log_buffer = io.StringIO()
+    stdout_context = redirect_stdout(log_buffer) if suppress_output else nullcontext()
+    stderr_context = redirect_stderr(log_buffer) if suppress_output else nullcontext()
+
+    def merge_counts(key: str, item: dict[str, Any]) -> None:
+        total[key] += int(item.get(key, 0))
+
+    try:
+        with stdout_context, stderr_context:
+            for task in context.get("sampled_budget_tasks", []):
+                if not isinstance(task, dict) or not isinstance(task.get("context"), dict):
+                    continue
+                task_context = task["context"]
+                task_tdag = tdag_from_context(task_context)
+                task_params = task_tdag.params
+                task_params.openevolve_iterations = 0
+                task_params.openevolve_harness = "compile"
+                task_params.openevolve_compile_hints = eval_hints
+                task_params.openevolve_evaluating_candidate = True
+                task_params.openevolve_eval_suite = eval_suite
+                task_le = LatencyEstimator(task_params)
+                budgets = [
+                    _io_budget_from_json(item)
+                    for item in task_context.get("io_budgets", [])
+                    if isinstance(item, dict)
+                ]
+                if not budgets:
+                    continue
+                task_diag: dict[str, Any] = {}
+                solve_budget_batch(
+                    task_tdag,
+                    budgets,
+                    task_le,
+                    task_params,
+                    eval_hints,
+                    task_diag,
+                )
+                total["sampled_task_count"] += 1
+                for key in (
+                    "requested_budgets",
+                    "solved_budgets",
+                    "candidate_solved_budgets",
+                    "fallback_solved_budgets",
+                    "fallback_selected_budgets",
+                    "candidate_improved_budgets",
+                ):
+                    merge_counts(key, task_diag)
+                for key in ("costs", "candidate_costs", "assignments"):
+                    total[key].extend(task_diag.get(key, []))
+                for source, count in task_diag.get("selected_source_counts", {}).items():
+                    total["selected_source_counts"][source] = (
+                        total["selected_source_counts"].get(source, 0) + int(count)
+                    )
+                for reason_key in ("invalid_reasons", "candidate_invalid_reasons"):
+                    for reason, count in task_diag.get(reason_key, {}).items():
+                        total[reason_key][reason] = total[reason_key].get(reason, 0) + int(count)
+                task_assignments = list(task_diag.get("assignments", []))
+                if task_assignments:
+                    reserve_summaries.append(
+                        _aggregate_reserve_summary(task_assignments, task_tdag, task_params)
+                    )
+                task_costs = [float(item) for item in task_diag.get("costs", [])]
+                if task_costs and len(task_costs) == len(task_assignments):
+                    idx = min(range(len(task_costs)), key=lambda pos: task_costs[pos])
+                    if task_costs[idx] < best_cost:
+                        best_cost = task_costs[idx]
+                        best_assign = task_assignments[idx]
+
+        assignments = list(total["assignments"])
+        costs = [float(item) for item in total["costs"]]
+        count_summary = _assignment_count_summary(assignments)
+        total["assignment_count_summary"] = count_summary
+        locations = (
+            _maintenance_locations(best_assign)
+            if best_assign is not None
+            else {"bootstrap": {}, "rescale": {}}
+        )
+        params = tdag_from_context(context).params
+        reserve_summary = _merge_reserve_summaries(reserve_summaries)
+        requested = max(1, int(total.get("requested_budgets", 0) or 1))
+        solved = int(total.get("solved_budgets", 0) or 0)
+        return {
+            "valid": bool(solved),
+            "validity": float(solved / requested),
+            "sampled_progress_only": True,
+            "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
+            "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
+            "bootstrap_count": float(count_summary["avg_bootstrap"]),
+            "rescale_count": float(count_summary["avg_rescale"]),
+            "boundary_quality": 0.0,
+            "profile_risk": float(_profile_risk(assignments, params)) if assignments else 1.0,
+            "placement_runtime_sec": time.time() - start,
+            "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
+            "selected_output_state": {},
+            "reserve_summary": reserve_summary,
+            "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
+            "bootstrap_locations": locations["bootstrap"],
+            "rescale_locations": locations["rescale"],
+            "bottleneck_summary": _bottleneck_summary(locations),
+            "diagnostics": total,
+            "sampled_budget_tasks": [],
+            "log_tail": log_buffer.getvalue()[-3000:],
+        }
+    except Exception as exc:
+        total["invalid_reasons"] = {f"{type(exc).__name__}: {str(exc)[:240]}": 1}
+        total["traceback"] = traceback.format_exc()[-4000:]
+        return {
+            "valid": False,
+            "validity": 0.0,
+            "sampled_progress_only": True,
+            "final_latency_usec": float("inf"),
+            "aggregated_partition_cost_usec": float("inf"),
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "boundary_quality": 0.0,
+            "profile_risk": 1.0,
+            "placement_runtime_sec": time.time() - start,
+            "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
+            "selected_output_state": {},
+            "reserve_summary": {},
+            "assignment": {},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": total,
+            "sampled_budget_tasks": [],
+            "log_tail": (log_buffer.getvalue() + "\n" + traceback.format_exc())[-4000:],
+        }
+
+
+def _merge_reserve_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    if not summaries:
+        return {
+            "min_decryptability_reserve_bits": None,
+            "min_transition_reserve_bits": None,
+            "min_bootstrap_input_reserve_bits": None,
+        }
+
+    def min_present(key: str) -> int | float | None:
+        values = [item.get(key) for item in summaries if item.get(key) is not None]
+        return min(values) if values else None
+
+    return {
+        "assignment_count": sum(int(item.get("assignment_count", 0) or 0) for item in summaries),
+        "min_decryptability_reserve_bits": min_present("min_decryptability_reserve_bits"),
+        "min_transition_reserve_bits": min_present("min_transition_reserve_bits"),
+        "min_bootstrap_input_reserve_bits": min_present("min_bootstrap_input_reserve_bits"),
+        "first_assignment": summaries[0].get("first_assignment", {}),
     }
 
 

@@ -1124,6 +1124,46 @@ def test_sampled_compile_harness_scores_partial_budget_progress(
     assert result["bootstrap_count"] >= 0
 
 
+def test_sampled_compile_harness_uses_cached_budget_tasks(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json)
+    params.openevolve_eval_suite = "polybert-sampled"
+    graph = _toy_pdag(params)
+    context = build_compile_context(graph, params)
+    context["sampled_budget_tasks"] = [
+        {
+            "kind": "normal",
+            "context": build_context(
+                graph,
+                [{"in_lvl": -1, "in_scl": params.Sw}],
+                params,
+            ),
+        }
+    ]
+
+    def fake_solve_partition(*_args, **_kwargs):
+        raise AssertionError("cached sampled eval must not replay solve_partition")
+
+    monkeypatch.setattr(
+        "scripts.optimizer.orbit.iterative_partition.solve_partition",
+        fake_solve_partition,
+    )
+
+    result = oe_backend._evaluate_compile_hints(
+        context,
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        suppress_output=True,
+    )
+
+    assert result["valid"] is True
+    assert result["sampled_progress_only"] is True
+    assert result["diagnostics"]["sampled_direct_budget_eval"] is True
+    assert result["diagnostics"]["sampled_task_count"] == 1
+    assert result["diagnostics"]["solved_budgets"] == 1
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

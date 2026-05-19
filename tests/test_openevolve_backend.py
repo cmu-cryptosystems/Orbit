@@ -734,6 +734,8 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
     ]
     assert "budget_fulfillment_beam" in capped_names
+    assert sampled["mcts_action_cap"] <= 6
+    assert any(action["name"] == "latency_mcts_repair" for action in sampled["mcts_actions"])
 
 
 def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
@@ -860,7 +862,10 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
         for action in sampled["mcts_actions"]
         if action.get("policy", {}).get("strategy") == "latency_beam"
     ]
-    assert [action["name"] for action in sampled_latency_actions] == ["budget_fulfillment_beam"]
+    assert [action["name"] for action in sampled_latency_actions] == [
+        "budget_fulfillment_beam",
+        "latency_mcts_repair",
+    ]
     assert sampled_latency_actions[0]["policy"]["beam_width"] <= 2
     assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 4
     assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 8
@@ -926,8 +931,8 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 4
-    assert captured["mcts_action_cap"] <= 4
+    assert captured["mcts_rollout_budget"] <= 6
+    assert captured["mcts_action_cap"] <= 6
     assert captured["mcts_max_repair_bootstraps"] == 32
     assert captured["boundary_state_cap"] == 1
 

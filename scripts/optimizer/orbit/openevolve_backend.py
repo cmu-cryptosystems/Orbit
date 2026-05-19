@@ -1722,12 +1722,12 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 bounded.get("mcts_actions")
             )
         bounded["mcts_rollout_budget"] = min(
-            4 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_rollout_budget"), 4 if budget_aggressive else 2),
+            6 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_rollout_budget"), 6 if budget_aggressive else 2),
         )
         bounded["mcts_action_cap"] = min(
-            4 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_action_cap"), 4 if budget_aggressive else 2),
+            6 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_action_cap"), 6 if budget_aggressive else 2),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
             32 if budget_aggressive else 4,
@@ -1773,6 +1773,7 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
             # no QBP groups directly and only survive through seed fallback.
             if (
                 str(item.get("name", "")) == "budget_fulfillment_beam"
+                or str(item.get("name", "")) == "latency_mcts_repair"
                 or _bool_hint(policy.get("direct_budget_policy"), False)
             ):
                 cheap = dict(item)

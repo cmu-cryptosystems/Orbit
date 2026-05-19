@@ -3571,6 +3571,33 @@ def _boundary_mcts_group_attempts(
         hints,
     ):
         return attempts_by_budget
+    if _bool_hint(hints.get("include_seed_repair_actions"), False) or _bool_hint(
+        policy.get("include_seed_repair_actions"), False
+    ):
+        for label, repair_policy in _seed_fallback_attempts(params):
+            for budget_idx, budget in enumerate(budgets):
+                try:
+                    attempts_by_budget[budget_idx].append(
+                        _solve_one_budget_attempt(
+                            pdag,
+                            params,
+                            budget,
+                            le,
+                            f"candidate:seed_repair:{label}",
+                            repair_policy,
+                        )
+                    )
+                except Exception as exc:
+                    if diagnostics is not None:
+                        _record_invalid_reason(diagnostics, "candidate_invalid_reasons", exc)
+        candidate_attempts = [
+            attempt
+            for attempts in attempts_by_budget.values()
+            for attempt in attempts
+            if attempt.source.startswith("candidate:")
+        ]
+        if _boundary_mcts_group_target_met(candidate_attempts, len(budgets), params, hints):
+            return attempts_by_budget
 
     for step in range(rollout_budget):
         idx = _select_mcts_action(actions, stats, step, exploration)
@@ -6247,6 +6274,7 @@ class PlacementMCTS:
                 "mcts_max_repair_bootstraps": int(max_repair_bootstraps),
                 "mcts_action_cap": int(action_cap),
                 "enable_direct_budget_beam": False,
+                "include_seed_repair_actions": True,
                 "mcts_actions": candidate_actions(
                     self.context,
                     target_bootstraps=int(target_bootstraps),
@@ -7445,6 +7473,7 @@ _PATCHABLE_POLICY_KEYS = {
     "mcts_max_repair_bootstraps",
     "mcts_action_cap",
     "enable_direct_budget_beam",
+    "include_seed_repair_actions",
     "enable_sampled_latency_beam",
     "boundary_scale_policy",
     "boundary_state_cap",

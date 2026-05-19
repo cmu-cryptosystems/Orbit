@@ -721,6 +721,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
+    assert hints["include_seed_repair_actions"] is True
     assert hints["mcts_rollout_budget"] == 24
     assert hints["mcts_exploration_weight"] == 1.15
     raw_budget_beams = [

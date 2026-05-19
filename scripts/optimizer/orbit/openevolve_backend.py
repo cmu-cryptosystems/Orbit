@@ -1281,12 +1281,12 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
         bounded["mcts_rollout_budget"] = min(
-            3 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_rollout_budget"), 3 if budget_aggressive else 2),
+            4 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_rollout_budget"), 4 if budget_aggressive else 2),
         )
         bounded["mcts_action_cap"] = min(
-            3 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_action_cap"), 3 if budget_aggressive else 2),
+            4 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_action_cap"), 4 if budget_aggressive else 2),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
             32 if budget_aggressive else 4,

@@ -798,9 +798,13 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     assert hints["strategy"] == "bootstrap_mcts"
     assert hints["target_bootstrap_count"] == 9
     assert len(hints["mcts_actions"]) >= 4
-    assert hints["mcts_actions"][0]["name"] == "budget_fulfillment_beam"
-    assert hints["mcts_actions"][0]["policy"]["strategy"] == "latency_beam"
-    assert hints["mcts_actions"][0]["policy"]["direct_budget_policy"] is True
+    assert hints["mcts_actions"][0]["name"] == "strict_no_bootstrap"
+    assert any(
+        action["name"] == "budget_fulfillment_beam"
+        and action["policy"]["strategy"] == "latency_beam"
+        and action["policy"]["direct_budget_policy"] is True
+        for action in hints["mcts_actions"]
+    )
     assert any(action["policy"].get("forbid_bootstrap") for action in hints["mcts_actions"])
     assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
     assert sampled["mcts_rollout_budget"] <= 2
@@ -1159,12 +1163,13 @@ def test_sampled_compile_harness_uses_cached_budget_tasks(
 
     assert result["valid"] is True
     assert result["sampled_progress_only"] is True
-    assert result["diagnostics"]["sampled_direct_budget_eval"] is True
+    assert result["diagnostics"]["sampled_direct_budget_eval"] is False
+    assert result["diagnostics"]["sampled_qbp_group_eval"] is True
     assert result["diagnostics"]["sampled_task_count"] == 1
     assert result["diagnostics"]["solved_budgets"] == 1
 
 
-def test_bootstrap_mcts_sampled_budget_sampler_can_use_individual_records(
+def test_bootstrap_mcts_sampled_budget_sampler_preserves_boundary_groups(
     toy_cost_json: str,
 ):
     params = _params(
@@ -1183,8 +1188,42 @@ def test_bootstrap_mcts_sampled_budget_sampler_can_use_individual_records(
 
     sampled = manager._sample_openevolve_eval_budgets(_toy_pdag(params), budgets)
 
-    assert 1 <= len(sampled) <= 4
-    assert len({int(item["out_lvl"]) for item in sampled}) == len(sampled)
+    assert len(sampled) == params.lvl_ub
+    assert {int(item["out_lvl"]) for item in sampled} == set(range(1, params.lvl_ub + 1))
+
+
+def test_bootstrap_mcts_returns_complete_qbp_boundary_group(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budgets = [
+        {"in_lvl": -1, "in_scl": params.Sw, "out_lvl": out_lvl}
+        for out_lvl in range(1, params.lvl_ub + 1)
+    ]
+    diagnostics = {}
+
+    io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        budgets,
+        le,
+        params,
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        diagnostics,
+    )
+
+    assert io_to_assign
+    assert io_to_cost
+    out_levels = {
+        out_lvl
+        for out_to_cost in io_to_cost.values()
+        for out_lvl, _out_scl in out_to_cost
+    }
+    assert out_levels == set(range(1, params.lvl_ub + 1))
+    assert diagnostics["requested_boundary_groups"] == 1
+    assert diagnostics["solved_boundary_groups"] == 1
+    assert diagnostics["candidate_solved_boundary_groups"] == 1
+    assert diagnostics["boundary_group_summaries"][0]["complete"] is True
 
 
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):

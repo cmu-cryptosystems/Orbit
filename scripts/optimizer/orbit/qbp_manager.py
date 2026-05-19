@@ -278,7 +278,8 @@ class QBPManager:
             and getattr(self.params, "openevolve_search_mode", "") == "bootstrap-mcts"
             and suite != "polybert-full"
         ):
-            return self._sample_individual_openevolve_eval_budgets(
+            return self._sample_boundary_group_openevolve_eval_budgets(
+                pdag,
                 io_budgets_list,
                 min(len(io_budgets_list), max(1, max_sample_hint)),
             )
@@ -426,14 +427,27 @@ class QBPManager:
             sampled = [budget for key in sampled_groups for budget in groups[key]]
         return sampled or io_budgets_list[:1]
 
-    def _sample_individual_openevolve_eval_budgets(
+    def _sample_boundary_group_openevolve_eval_budgets(
         self,
+        pdag: Tdag | None,
         io_budgets_list: list[dict],
-        max_sample: int,
+        max_groups: int,
     ) -> list[dict]:
-        if len(io_budgets_list) <= max_sample:
+        groups: dict[tuple, list[dict]] = {}
+        for budget in io_budgets_list:
+            key = (
+                int(budget.get("in_lvl", -1)),
+                int(budget.get("in_scl", -1)),
+                str(budget.get("maino_v", "")),
+                int(budget.get("main_dag_size", 0) or 0),
+            )
+            groups.setdefault(key, []).append(budget)
+        for budgets in groups.values():
+            budgets.sort(key=lambda item: int(item.get("out_lvl", -1)))
+        if len(groups) <= max_groups:
             return io_budgets_list
-        selected: list[dict] = []
+
+        selected_keys: list[tuple] = []
         seen = set()
         keep_levels = {
             1,
@@ -442,23 +456,27 @@ class QBPManager:
             self.params.lvl_ub,
         }
 
-        def key_for(budget: dict) -> tuple:
-            return (
-                int(budget.get("in_lvl", -1)),
-                int(budget.get("in_scl", -1)),
-                int(budget.get("out_lvl", -1)),
-                str(budget.get("maino_v", "")),
-                int(budget.get("main_dag_size", 0) or 0),
-            )
-
-        def add(budget: dict) -> None:
-            if len(selected) >= max_sample:
+        def add_key(key: tuple) -> None:
+            if len(selected_keys) >= max_groups:
                 return
-            key = key_for(budget)
             if key in seen:
                 return
             seen.add(key)
-            selected.append(budget)
+            selected_keys.append(key)
+
+        def group_cost(key: tuple) -> float:
+            costs = [
+                budget_cost(budget)
+                for budget in groups[key]
+            ]
+            return min(costs) if costs else 0.0
+
+        def group_size(key: tuple) -> float:
+            sizes = [
+                budget_size(budget)
+                for budget in groups[key]
+            ]
+            return max(sizes) if sizes else float(pdag.get_full_size() if pdag is not None else 0.0)
 
         def budget_cost(budget: dict) -> float:
             costs = budget.get("main_qbp_cost")
@@ -472,17 +490,17 @@ class QBPManager:
             except (TypeError, ValueError):
                 return 0.0
 
-        def add_quantiles(budgets: list[dict], key_fn, limit: int) -> None:
-            if not budgets or len(selected) >= max_sample:
+        def add_group_quantiles(keys: list[tuple], key_fn, limit: int) -> None:
+            if not keys or len(selected_keys) >= max_groups:
                 return
             ordered = sorted(
-                budgets,
+                keys,
                 key=lambda item: (
                     key_fn(item),
-                    int(item.get("out_lvl", -1)),
-                    int(item.get("in_lvl", -1)),
-                    int(item.get("in_scl", -1)),
-                    str(item.get("maino_v", "")),
+                    item[0],
+                    item[1],
+                    item[2],
+                    item[3],
                 ),
             )
             indexes = {
@@ -494,29 +512,33 @@ class QBPManager:
             }
             for idx in sorted(indexes)[:limit]:
                 if 0 <= idx < len(ordered):
-                    add(ordered[idx])
+                    add_key(ordered[idx])
 
-        bypass_budgets = [budget for budget in io_budgets_list if "maino_v" in budget]
-        add_quantiles(bypass_budgets, budget_cost, max(1, max_sample // 3))
-        add_quantiles(bypass_budgets, budget_size, max(1, max_sample // 3))
+        group_keys = list(groups)
+        bypass_keys = [key for key in group_keys if key[2]]
+        add_group_quantiles(bypass_keys, group_cost, max(1, max_groups // 3))
+        add_group_quantiles(bypass_keys, group_size, max(1, max_groups // 3))
 
-        by_level: dict[int, list[dict]] = {}
-        for budget in io_budgets_list:
-            by_level.setdefault(int(budget.get("out_lvl", -1)), []).append(budget)
+        by_level: dict[int, list[tuple]] = {}
+        for key, budgets in groups.items():
+            for budget in budgets:
+                out_lvl = int(budget.get("out_lvl", -1))
+                by_level.setdefault(out_lvl, []).append(key)
         for level in sorted(keep_levels):
-            add_quantiles(by_level.get(level, []), budget_cost, 1)
-            if len(selected) >= max_sample:
+            add_group_quantiles(sorted(set(by_level.get(level, []))), group_cost, 1)
+            if len(selected_keys) >= max_groups:
                 break
 
-        add_quantiles(io_budgets_list, budget_cost, max_sample)
-        add_quantiles(io_budgets_list, budget_size, max_sample)
-        if len(selected) < max_sample:
-            stride = max(1, len(io_budgets_list) // max_sample)
-            for budget in io_budgets_list[::stride]:
-                add(budget)
-                if len(selected) >= max_sample:
+        add_group_quantiles(group_keys, group_cost, max_groups)
+        add_group_quantiles(group_keys, group_size, max_groups)
+        if len(selected_keys) < max_groups:
+            stride = max(1, len(group_keys) // max_groups)
+            for key in group_keys[::stride]:
+                add_key(key)
+                if len(selected_keys) >= max_groups:
                     break
-        return selected or io_budgets_list[:1]
+        selected = [budget for key in selected_keys for budget in groups[key]]
+        return selected or groups[group_keys[0]]
 
     def _record_openevolve_budget_task(
         self,

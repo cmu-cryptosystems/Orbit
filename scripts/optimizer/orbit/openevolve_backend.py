@@ -60,6 +60,7 @@ class _BudgetAttempt:
     cost: float
     in_key: tuple[int, int]
     out_key: tuple[int, int]
+    actual_cost: float | None = None
 
 
 @dataclass(frozen=True)
@@ -849,6 +850,13 @@ def evaluate_compile_candidate_program(
         solved_budgets = int(diagnostics.get("solved_budgets", requested_budgets if result["valid"] else 0))
         candidate_validity = candidate_solved / requested_budgets
         effective_validity = solved_budgets / requested_budgets
+        requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+        solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
+        candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+        fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
+        invalid_groups = int(diagnostics.get("invalid_boundary_groups", 0) or 0)
+        boundary_group_validity = solved_groups / requested_groups
+        candidate_qbp_coverage = candidate_groups / requested_groups
         repair_count = _repair_count(eval_hints)
         unit_coverage = _unit_coverage(context, eval_hints)
         reference = context.get("reference", {})
@@ -869,7 +877,9 @@ def evaluate_compile_candidate_program(
         )
         risk_score = 1.0 / (1.0 + result["profile_risk"])
         runtime_score = 1.0 / (1.0 + result["placement_runtime_sec"])
-        fallback_score = 1.0 / (1.0 + result["fallback_selected_budgets"])
+        fallback_score = 1.0 / (
+            1.0 + result["fallback_selected_budgets"] + fallback_groups
+        )
         repair_score = 1.0 / (1.0 + repair_count)
         boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
         target_bootstrap_count = _context_target_bootstrap_count(context)
@@ -893,22 +903,23 @@ def evaluate_compile_candidate_program(
             + 0.04 * fallback_score
             + 0.04 * runtime_score
         )
-        if not result["valid"]:
+        if not result["valid"] or boundary_group_validity < 1.0:
             bootstrap_frontier = target_bootstrap_score if candidate_validity > 0.0 else 0.0
             combined_score = min(
                 0.999,
-                0.18 * effective_validity
-                + 0.07 * candidate_validity
-                + 0.60 * bootstrap_frontier
+                0.14 * effective_validity
+                + 0.18 * boundary_group_validity
+                + 0.14 * candidate_qbp_coverage
+                + 0.44 * bootstrap_frontier
                 + 0.10 * quality_score
-                + 0.05 * unit_coverage,
             )
-        elif result["fallback_selected_budgets"] > 0 or repair_count > 0:
+        elif result["fallback_selected_budgets"] > 0 or fallback_groups > 0 or repair_count > 0:
             if _context_budget_aggressive(context):
                 combined_score = min(
                     0.999,
                     0.10 * effective_validity
-                    + 0.62 * candidate_validity
+                    + 0.22 * boundary_group_validity
+                    + 0.34 * candidate_qbp_coverage
                     + 0.14 * quality_score
                     + 0.08 * unit_coverage
                     + 0.06 * repair_score,
@@ -923,13 +934,15 @@ def evaluate_compile_candidate_program(
                     + 0.08 * repair_score,
                 )
         else:
-            combined_score = 1.0 + quality_score + 0.05 * unit_coverage
+            combined_score = 1.0 + quality_score + 0.05 * unit_coverage + 0.02 * candidate_qbp_coverage
         evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
                 "validity": float(result["validity"]),
                 "effective_validity": float(effective_validity),
                 "candidate_validity": float(candidate_validity),
+                "boundary_group_validity": float(boundary_group_validity),
+                "candidate_qbp_coverage": float(candidate_qbp_coverage),
                 "repair_count": float(repair_count),
                 "unit_coverage": float(unit_coverage),
                 "latency_score": float(latency_score),
@@ -946,6 +959,11 @@ def evaluate_compile_candidate_program(
                 "profile_risk": float(result["profile_risk"]),
                 "placement_runtime_sec": float(result["placement_runtime_sec"]),
                 "fallback_selected_budgets": float(result["fallback_selected_budgets"]),
+                "requested_boundary_groups": float(requested_groups),
+                "solved_boundary_groups": float(solved_groups),
+                "candidate_solved_boundary_groups": float(candidate_groups),
+                "fallback_selected_groups": float(fallback_groups),
+                "invalid_boundary_groups": float(invalid_groups),
                 "estimated_precision_bits": float(noise_estimate.get("estimated_precision_bits", 0.0)),
                 "output_margin_bits": float(noise_estimate.get("output_margin_bits", 0.0)),
                 "reserve_score": float(reserve_score),
@@ -997,6 +1015,10 @@ def evaluate_compile_candidate_program(
                 "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
                 "bottleneck_summary": json.dumps(result.get("bottleneck_summary", []), sort_keys=True),
                 "selected_output_state": json.dumps(result["selected_output_state"], sort_keys=True),
+                "boundary_group_validity": f"{solved_groups}/{requested_groups}",
+                "candidate_qbp_coverage": f"{candidate_groups}/{requested_groups}",
+                "fallback_selected_groups": f"{fallback_groups}/{requested_groups}",
+                "invalid_boundary_groups": f"{invalid_groups}/{requested_groups}",
                 "invalid_reasons": _compact_invalid_reasons(result["diagnostics"]),
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": result["diagnostics"].get("candidate_invalid_reasons", {})}
@@ -1011,6 +1033,10 @@ def evaluate_compile_candidate_program(
                 ),
                 "assignment_count_summary": json.dumps(
                     result["diagnostics"].get("assignment_count_summary", {}),
+                    sort_keys=True,
+                ),
+                "boundary_group_count_summary": json.dumps(
+                    result["diagnostics"].get("boundary_group_count_summary", {}),
                     sort_keys=True,
                 ),
                 "policy_summary": _compact_policy_summary(eval_hints),
@@ -1117,9 +1143,17 @@ def _evaluate_compile_hints(
         locations = _maintenance_locations(assign)
         reserve_summary = _assignment_reserve_summary(assign, tdag, params)
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
+        requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
         return {
             "valid": True,
             "validity": 1.0,
+            "boundary_group_validity": float(
+                int(diagnostics.get("solved_boundary_groups", 0) or 0) / requested_groups
+            ),
+            "candidate_qbp_coverage": float(
+                int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+                / requested_groups
+            ),
             "final_latency_usec": float(estimate_assign(assign, le)),
             "aggregated_partition_cost_usec": float(final_cost),
             "bootstrap_count": int(counts["bootstrap"]),
@@ -1128,6 +1162,10 @@ def _evaluate_compile_hints(
             "profile_risk": float(_profile_risk([assign], params)),
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": int(diagnostics.get("fallback_selected_budgets", 0)),
+            "fallback_selected_groups": int(
+                diagnostics.get("fallback_selected_boundary_groups", 0)
+            ),
+            "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
             "selected_output_state": {
                 "in_lvl": final_io_choice[0],
                 "in_scl": final_io_choice[1],
@@ -1180,6 +1218,8 @@ def _evaluate_compile_hints(
         return {
             "valid": False,
             "validity": 0.0,
+            "boundary_group_validity": 0.0,
+            "candidate_qbp_coverage": 0.0,
             "final_latency_usec": float("inf"),
             "aggregated_partition_cost_usec": float("inf"),
             "bootstrap_count": float(counts["bootstrap"]),
@@ -1188,6 +1228,10 @@ def _evaluate_compile_hints(
             "profile_risk": 1.0,
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": int(diagnostics.get("fallback_selected_budgets", 0)),
+            "fallback_selected_groups": int(
+                diagnostics.get("fallback_selected_boundary_groups", 0)
+            ),
+            "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
             "selected_output_state": {},
             "reserve_summary": {},
             "assignment": {},
@@ -1228,6 +1272,19 @@ def _sampled_progress_compile_result(
     assignments = list(diagnostics.get("assignments", []))
     costs = [float(item) for item in diagnostics.get("costs", [])]
     count_summary = _assignment_count_summary(assignments)
+    group_summary = _boundary_group_count_summary(
+        list(diagnostics.get("boundary_group_summaries", []))
+    )
+    sampled_bootstrap_count = (
+        group_summary["avg_bootstrap"]
+        if group_summary["boundary_group_count"]
+        else count_summary["avg_bootstrap"]
+    )
+    sampled_rescale_count = (
+        group_summary["avg_rescale"]
+        if group_summary["boundary_group_count"]
+        else count_summary["avg_rescale"]
+    )
     best_assign = None
     if assignments:
         if costs and len(costs) == len(assignments):
@@ -1239,18 +1296,27 @@ def _sampled_progress_compile_result(
     reserve_summary = _aggregate_reserve_summary(assignments, tdag, params)
     requested = max(1, int(diagnostics.get("requested_budgets", len(assignments)) or 1))
     solved = int(diagnostics.get("solved_budgets", len(assignments)) or 0)
+    requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+    solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
+    candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
     return {
         "valid": bool(solved),
         "validity": float(solved / requested),
+        "boundary_group_validity": float(solved_groups / requested_groups),
+        "candidate_qbp_coverage": float(candidate_groups / requested_groups),
         "sampled_progress_only": True,
         "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
         "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
-        "bootstrap_count": float(count_summary["avg_bootstrap"]),
-        "rescale_count": float(count_summary["avg_rescale"]),
+        "bootstrap_count": float(sampled_bootstrap_count),
+        "rescale_count": float(sampled_rescale_count),
         "boundary_quality": 0.0,
         "profile_risk": float(_profile_risk(assignments, params)) if assignments else 1.0,
         "placement_runtime_sec": time.time() - start,
         "fallback_selected_budgets": int(diagnostics.get("fallback_selected_budgets", 0)),
+        "fallback_selected_groups": int(
+            diagnostics.get("fallback_selected_boundary_groups", 0)
+        ),
+        "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
         "selected_output_state": {},
         "reserve_summary": reserve_summary,
         "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
@@ -1300,6 +1366,12 @@ def _evaluate_sampled_budget_tasks(
         "candidate_solved_budgets": 0,
         "fallback_solved_budgets": 0,
         "fallback_selected_budgets": 0,
+        "requested_boundary_groups": 0,
+        "solved_boundary_groups": 0,
+        "partial_boundary_groups": 0,
+        "candidate_solved_boundary_groups": 0,
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
         "candidate_improved_budgets": 0,
         "candidate_invalid_reasons": {},
         "invalid_reasons": {},
@@ -1307,8 +1379,10 @@ def _evaluate_sampled_budget_tasks(
         "costs": [],
         "assignments": [],
         "selected_source_counts": {},
+        "boundary_group_summaries": [],
         "sampled_task_count": 0,
-        "sampled_direct_budget_eval": True,
+        "sampled_direct_budget_eval": False,
+        "sampled_qbp_group_eval": True,
     }
     reserve_summaries: list[dict[str, Any]] = []
     best_assign: Assign | None = None
@@ -1357,9 +1431,20 @@ def _evaluate_sampled_budget_tasks(
                     "candidate_solved_budgets",
                     "fallback_solved_budgets",
                     "fallback_selected_budgets",
+                    "requested_boundary_groups",
+                    "solved_boundary_groups",
+                    "partial_boundary_groups",
+                    "candidate_solved_boundary_groups",
+                    "fallback_selected_boundary_groups",
+                    "invalid_boundary_groups",
                     "candidate_improved_budgets",
                 ):
                     merge_counts(key, task_diag)
+                if len(total["boundary_group_summaries"]) < 512:
+                    remaining = 512 - len(total["boundary_group_summaries"])
+                    total["boundary_group_summaries"].extend(
+                        list(task_diag.get("boundary_group_summaries", []))[:remaining]
+                    )
                 for key in ("costs", "candidate_costs", "assignments"):
                     total[key].extend(task_diag.get(key, []))
                 for source, count in task_diag.get("selected_source_counts", {}).items():
@@ -1384,7 +1469,21 @@ def _evaluate_sampled_budget_tasks(
         assignments = list(total["assignments"])
         costs = [float(item) for item in total["costs"]]
         count_summary = _assignment_count_summary(assignments)
+        group_summary = _boundary_group_count_summary(
+            list(total.get("boundary_group_summaries", []))
+        )
         total["assignment_count_summary"] = count_summary
+        total["boundary_group_count_summary"] = group_summary
+        sampled_bootstrap_count = (
+            group_summary["avg_bootstrap"]
+            if group_summary["boundary_group_count"]
+            else count_summary["avg_bootstrap"]
+        )
+        sampled_rescale_count = (
+            group_summary["avg_rescale"]
+            if group_summary["boundary_group_count"]
+            else count_summary["avg_rescale"]
+        )
         locations = (
             _maintenance_locations(best_assign)
             if best_assign is not None
@@ -1394,18 +1493,25 @@ def _evaluate_sampled_budget_tasks(
         reserve_summary = _merge_reserve_summaries(reserve_summaries)
         requested = max(1, int(total.get("requested_budgets", 0) or 1))
         solved = int(total.get("solved_budgets", 0) or 0)
+        requested_groups = max(1, int(total.get("requested_boundary_groups", 0) or 1))
+        solved_groups = int(total.get("solved_boundary_groups", 0) or 0)
+        candidate_groups = int(total.get("candidate_solved_boundary_groups", 0) or 0)
         return {
             "valid": bool(solved),
             "validity": float(solved / requested),
+            "boundary_group_validity": float(solved_groups / requested_groups),
+            "candidate_qbp_coverage": float(candidate_groups / requested_groups),
             "sampled_progress_only": True,
             "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
             "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
-            "bootstrap_count": float(count_summary["avg_bootstrap"]),
-            "rescale_count": float(count_summary["avg_rescale"]),
+            "bootstrap_count": float(sampled_bootstrap_count),
+            "rescale_count": float(sampled_rescale_count),
             "boundary_quality": 0.0,
             "profile_risk": float(_profile_risk(assignments, params)) if assignments else 1.0,
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
+            "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
+            "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
             "selected_output_state": {},
             "reserve_summary": reserve_summary,
             "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
@@ -1422,6 +1528,8 @@ def _evaluate_sampled_budget_tasks(
         return {
             "valid": False,
             "validity": 0.0,
+            "boundary_group_validity": 0.0,
+            "candidate_qbp_coverage": 0.0,
             "sampled_progress_only": True,
             "final_latency_usec": float("inf"),
             "aggregated_partition_cost_usec": float("inf"),
@@ -1431,6 +1539,8 @@ def _evaluate_sampled_budget_tasks(
             "profile_risk": 1.0,
             "placement_runtime_sec": time.time() - start,
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
+            "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
+            "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
             "selected_output_state": {},
             "reserve_summary": {},
             "assignment": {},
@@ -1786,6 +1896,8 @@ def _run_full_bundle_finalists(
                         "bootstrap_count": result["bootstrap_count"],
                         "rescale_count": result["rescale_count"],
                         "fallback_selected_budgets": result["fallback_selected_budgets"],
+                        "fallback_selected_groups": result.get("fallback_selected_groups", 0),
+                        "candidate_qbp_coverage": result.get("candidate_qbp_coverage", 0.0),
                         "selected_output_state": result["selected_output_state"],
                         "reserve_summary": result.get("reserve_summary", {}),
                         "bootstrap_locations": result.get("bootstrap_locations", {}),
@@ -1863,7 +1975,10 @@ def _run_full_bundle_finalists(
                         int(noise_warning_reject),
                         noise_reject,
                         margin_reject,
-                        int(result["fallback_selected_budgets"] > 0),
+                        int(
+                            result["fallback_selected_budgets"] > 0
+                            or int(result.get("fallback_selected_groups", 0) or 0) > 0
+                        ),
                         bootstrap_reject,
                         latency_reject,
                         bootstrap_excess,
@@ -1910,13 +2025,20 @@ def _run_full_bundle_finalists(
     )
     if best is None:
         return _bounded_fail_open_hints(initial_hints)
-    if best[0] or best[1] or ((best[2] or best[3]) and params.noise_estimator == "finalists"):
+    fallback_reject = bool(best[5])
+    if (
+        best[0]
+        or best[1]
+        or fallback_reject
+        or ((best[2] or best[3]) and params.noise_estimator == "finalists")
+    ):
         _write_finalist_rejection_summary(
             finalist_dir,
             best[13],
             {
                 "plaintext_quality_reject": bool(best[0]),
                 "profile_noise_reject": bool(best[1]),
+                "fallback_selected_reject": fallback_reject,
                 "noise_warning_reject": bool(best[2]),
                 "noise_estimator_reject": bool(best[3]),
                 "selected_index": best[11],
@@ -2328,14 +2450,32 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         "solved_budgets": 0,
         "candidate_solved_budgets": 0,
         "fallback_selected_budgets": 0,
+        "requested_boundary_groups": 0,
+        "solved_boundary_groups": 0,
+        "partial_boundary_groups": 0,
+        "candidate_solved_boundary_groups": 0,
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
         "candidate_invalid_reasons": {},
         "candidate_costs": [],
         "costs": [],
         "assignments": [],
         "selected_source_counts": {},
+        "boundary_group_summaries": [],
     }
     for item in getattr(qbp_manager, "openevolve_diagnostics", []):
-        for key in ("requested_budgets", "solved_budgets", "candidate_solved_budgets", "fallback_selected_budgets"):
+        for key in (
+            "requested_budgets",
+            "solved_budgets",
+            "candidate_solved_budgets",
+            "fallback_selected_budgets",
+            "requested_boundary_groups",
+            "solved_boundary_groups",
+            "partial_boundary_groups",
+            "candidate_solved_boundary_groups",
+            "fallback_selected_boundary_groups",
+            "invalid_boundary_groups",
+        ):
             totals[key] += int(item.get(key, 0))
         totals["candidate_costs"].extend(item.get("candidate_costs", []))
         for source, count in item.get("selected_source_counts", {}).items():
@@ -2346,6 +2486,11 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         totals["assignments"].extend(item.get("assignments", []))
         for reason, count in item.get("candidate_invalid_reasons", {}).items():
             totals["candidate_invalid_reasons"][reason] = totals["candidate_invalid_reasons"].get(reason, 0) + int(count)
+        if len(totals["boundary_group_summaries"]) < 512:
+            remaining = 512 - len(totals["boundary_group_summaries"])
+            totals["boundary_group_summaries"].extend(
+                list(item.get("boundary_group_summaries", []))[:remaining]
+            )
     return totals
 
 
@@ -2477,6 +2622,10 @@ def _invalid_compile_result(stage: str, reasons: list[str]) -> dict[str, Any]:
             "profile_risk": 1.0,
             "placement_runtime_sec": 0.0,
             "fallback_selected_budgets": 0.0,
+            "boundary_group_validity": 0.0,
+            "candidate_qbp_coverage": 0.0,
+            "fallback_selected_groups": 0.0,
+            "invalid_boundary_groups": 0.0,
             "estimated_precision_bits": 0.0,
             "output_margin_bits": 0.0,
         },
@@ -2598,6 +2747,9 @@ def _record_compile_trace(
                 "repair_summary",
                 "per_unit_score_table",
                 "selected_source_counts",
+                "candidate_qbp_coverage",
+                "boundary_group_validity",
+                "fallback_selected_groups",
             }
         },
     }
@@ -2630,10 +2782,17 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         solved = int(diagnostics.get("solved_budgets", len(costs)))
         candidate_solved = int(diagnostics.get("candidate_solved_budgets", solved))
         fallback_selected = int(diagnostics.get("fallback_selected_budgets", 0))
+        requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+        solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
+        candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+        fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
+        invalid_groups = int(diagnostics.get("invalid_boundary_groups", 0) or 0)
         candidate_improved = int(diagnostics.get("candidate_improved_budgets", 0))
         requested = max(1, len(io_budgets))
         effective_validity = solved / requested
         validity = candidate_solved / requested
+        boundary_group_validity = solved_groups / requested_groups
+        candidate_qbp_coverage = candidate_groups / requested_groups
         repair_count = _repair_count(hints)
         unit_coverage = _unit_coverage(context, hints)
         avg_cost = sum(costs) / solved if costs else float("inf")
@@ -2671,20 +2830,24 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
             + 0.13 * risk_score
             + 0.12 * reserve_score
         )
-        if effective_validity < 1.0:
+        if effective_validity < 1.0 or boundary_group_validity < 1.0:
             bootstrap_frontier = target_bootstrap_score if validity > 0.0 else 0.0
             combined_score = min(
                 0.999,
-                0.36 * effective_validity
-                + 0.18 * validity
-                + 0.34 * bootstrap_frontier
-                + 0.12 * quality_score
+                0.28 * effective_validity
+                + 0.20 * boundary_group_validity
+                + 0.18 * candidate_qbp_coverage
+                + 0.24 * bootstrap_frontier
+                + 0.10 * quality_score
             )
-        elif candidate_solved == 0 or fallback_selected > 0:
+        elif candidate_solved == 0 or fallback_selected > 0 or fallback_groups > 0:
             if _context_budget_aggressive(context):
                 combined_score = min(
                     0.999,
-                    0.64 * validity + 0.18 * quality_score + 0.08 * unit_coverage
+                    0.48 * validity
+                    + 0.22 * candidate_qbp_coverage
+                    + 0.18 * quality_score
+                    + 0.08 * unit_coverage
                 )
             else:
                 combined_score = min(0.999, 0.40 * validity + 0.30 * quality_score)
@@ -2694,7 +2857,7 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 1.0
                 + quality_score
                 + 0.05 * improvement_fraction
-                + 0.02 * validity
+                + 0.02 * candidate_qbp_coverage
             )
         return {
             "metrics": {
@@ -2702,6 +2865,8 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "validity": float(validity),
                 "effective_validity": float(effective_validity),
                 "candidate_validity": float(validity),
+                "boundary_group_validity": float(boundary_group_validity),
+                "candidate_qbp_coverage": float(candidate_qbp_coverage),
                 "repair_count": float(repair_count),
                 "unit_coverage": float(unit_coverage),
                 "latency_score": float(latency_score),
@@ -2717,6 +2882,11 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "solved_budgets": float(solved),
                 "candidate_solved_budgets": float(candidate_solved),
                 "fallback_selected_budgets": float(fallback_selected),
+                "requested_boundary_groups": float(requested_groups),
+                "solved_boundary_groups": float(solved_groups),
+                "candidate_solved_boundary_groups": float(candidate_groups),
+                "fallback_selected_groups": float(fallback_groups),
+                "invalid_boundary_groups": float(invalid_groups),
                 "candidate_improved_budgets": float(candidate_improved),
                 "reserve_score": float(reserve_score),
                 "min_decryptability_reserve_bits": float(
@@ -2733,6 +2903,10 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "solved_budgets": f"{solved}/{len(io_budgets)}",
                 "candidate_solved_budgets": f"{candidate_solved}/{len(io_budgets)}",
                 "fallback_selected_budgets": f"{fallback_selected}/{len(io_budgets)}",
+                "boundary_group_validity": f"{solved_groups}/{requested_groups}",
+                "candidate_qbp_coverage": f"{candidate_groups}/{requested_groups}",
+                "fallback_selected_groups": f"{fallback_groups}/{requested_groups}",
+                "invalid_boundary_groups": f"{invalid_groups}/{requested_groups}",
                 "candidate_improved_budgets": f"{candidate_improved}/{len(io_budgets)}",
                 "reference_avg_latency_usec": f"{reference_avg:.3f}",
                 "latency_delta_usec": (
@@ -2926,11 +3100,18 @@ def _init_budget_diagnostics(diagnostics: dict[str, Any], requested_budgets: int
     diagnostics["candidate_solved_budgets"] = 0
     diagnostics["fallback_solved_budgets"] = 0
     diagnostics["fallback_selected_budgets"] = 0
+    diagnostics["requested_boundary_groups"] = 0
+    diagnostics["solved_boundary_groups"] = 0
+    diagnostics["partial_boundary_groups"] = 0
+    diagnostics["candidate_solved_boundary_groups"] = 0
+    diagnostics["fallback_selected_boundary_groups"] = 0
+    diagnostics["invalid_boundary_groups"] = 0
     diagnostics["candidate_improved_budgets"] = 0
     diagnostics["costs"] = []
     diagnostics["candidate_costs"] = []
     diagnostics["assignments"] = []
     diagnostics["selected_source_counts"] = {}
+    diagnostics["boundary_group_summaries"] = []
 
 
 def _record_selected_attempt(
@@ -2940,11 +3121,11 @@ def _record_selected_attempt(
     fallback_attempt: _BudgetAttempt | None,
 ) -> None:
     diagnostics["solved_budgets"] += 1
-    diagnostics["costs"].append(best_attempt.cost)
+    diagnostics["costs"].append(_attempt_actual_cost(best_attempt))
     diagnostics["assignments"].append(best_attempt.assign)
     if candidate_attempt is not None:
         diagnostics["candidate_solved_budgets"] += 1
-        diagnostics["candidate_costs"].append(candidate_attempt.cost)
+        diagnostics["candidate_costs"].append(_attempt_actual_cost(candidate_attempt))
     if fallback_attempt is not None:
         diagnostics["fallback_solved_budgets"] += 1
     if best_attempt.source.startswith("seed_fallback"):
@@ -2957,6 +3138,65 @@ def _record_selected_attempt(
         and candidate_attempt.cost + 1e-9 < fallback_attempt.cost
     ):
         diagnostics["candidate_improved_budgets"] += 1
+
+
+def _attempt_actual_cost(attempt: _BudgetAttempt) -> float:
+    return float(attempt.actual_cost if attempt.actual_cost is not None else attempt.cost)
+
+
+def _record_boundary_group_result(
+    diagnostics: dict[str, Any],
+    group_key: tuple,
+    budgets: list[dict],
+    selected_attempts: list[_BudgetAttempt],
+    candidate_solved_count: int,
+    fallback_selected_count: int,
+) -> None:
+    requested = len(budgets)
+    solved = len(selected_attempts)
+    diagnostics["requested_boundary_groups"] += 1
+    if solved == requested and requested > 0:
+        diagnostics["solved_boundary_groups"] += 1
+    elif solved > 0:
+        diagnostics["partial_boundary_groups"] += 1
+    else:
+        diagnostics["invalid_boundary_groups"] += 1
+    if requested > 0 and candidate_solved_count == requested:
+        diagnostics["candidate_solved_boundary_groups"] += 1
+    if fallback_selected_count > 0:
+        diagnostics["fallback_selected_boundary_groups"] += 1
+
+    selected_counts = _assignment_count_summary([attempt.assign for attempt in selected_attempts])
+    summary = {
+        "group_key": {
+            "in_lvl": int(group_key[0]),
+            "in_scl": int(group_key[1]),
+            "maino_v": str(group_key[2]),
+            "main_dag_size": int(group_key[3]),
+        },
+        "requested_output_levels": sorted(
+            {
+                int(budget.get("out_lvl", -1))
+                for budget in budgets
+                if int(budget.get("out_lvl", -1)) >= 0
+            }
+        ),
+        "requested_budgets": requested,
+        "solved_budgets": solved,
+        "candidate_solved_budgets": int(candidate_solved_count),
+        "fallback_selected_budgets": int(fallback_selected_count),
+        "complete": bool(requested > 0 and solved == requested),
+        "candidate_complete": bool(requested > 0 and candidate_solved_count == requested),
+        "avg_bootstrap": float(selected_counts["avg_bootstrap"]),
+        "min_bootstrap": float(selected_counts["min_bootstrap"]),
+        "max_bootstrap": float(selected_counts["max_bootstrap"]),
+        "avg_rescale": float(selected_counts["avg_rescale"]),
+        "min_rescale": float(selected_counts["min_rescale"]),
+        "max_rescale": float(selected_counts["max_rescale"]),
+    }
+    summaries = diagnostics.setdefault("boundary_group_summaries", [])
+    if len(summaries) < 256:
+        summaries.append(summary)
 
 
 def _solve_budget_batch_boundary_mcts(
@@ -2974,6 +3214,9 @@ def _solve_budget_batch_boundary_mcts(
     io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
     for _group_key, budgets in _budget_boundary_groups(io_budgets_list).items():
         group_attempts = _boundary_mcts_group_attempts(pdag, params, budgets, le, hints, diagnostics)
+        selected_attempts: list[_BudgetAttempt] = []
+        group_candidate_solved = 0
+        group_fallback_selected = 0
         for index, io_budget in enumerate(budgets):
             attempts = list(group_attempts.get(index, []))
             last_error = None
@@ -3008,12 +3251,26 @@ def _solve_budget_batch_boundary_mcts(
             best_attempt = _best_attempt(attempts)
             if best_attempt is None:
                 continue
+            if candidate_attempt is not None:
+                group_candidate_solved += 1
+            if best_attempt.source.startswith("seed_fallback"):
+                group_fallback_selected += 1
+            selected_attempts.append(best_attempt)
             if diagnostics is not None:
                 _record_selected_attempt(diagnostics, best_attempt, candidate_attempt, fallback_attempt)
             current = io_to_cost.get(best_attempt.in_key, {}).get(best_attempt.out_key)
             if current is None or best_attempt.cost < current:
                 io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
                 io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
+        if diagnostics is not None:
+            _record_boundary_group_result(
+                diagnostics,
+                _group_key,
+                budgets,
+                selected_attempts,
+                group_candidate_solved,
+                group_fallback_selected,
+            )
     return io_to_assign, io_to_cost
 
 
@@ -3281,7 +3538,15 @@ def _solve_one_budget_attempt(
         raise PlacementError("input scale mismatch")
     if io_budget.get("out_lvl", -1) >= 0 and out_key[0] != io_budget["out_lvl"]:
         raise PlacementError("output level mismatch")
-    return _BudgetAttempt(source, assign, estimate_assign(assign, le), in_key, out_key)
+    actual_cost = estimate_assign(assign, le)
+    return _BudgetAttempt(
+        source,
+        assign,
+        _policy_assignment_score(assign, le, policy_hints, params),
+        in_key,
+        out_key,
+        actual_cost,
+    )
 
 
 def _solve_one_record_attempt(
@@ -3303,7 +3568,8 @@ def _solve_one_record_attempt(
         raise PlacementError("record input scale mismatch")
     if io_budget.get("out_lvl", -1) >= 0 and out_key[0] != io_budget["out_lvl"]:
         raise PlacementError("record output level mismatch")
-    return _BudgetAttempt("candidate_record", assign, estimate_assign(assign, le), in_key, out_key)
+    actual_cost = estimate_assign(assign, le)
+    return _BudgetAttempt("candidate_record", assign, actual_cost, in_key, out_key, actual_cost)
 
 
 def _best_attempt(attempts) -> _BudgetAttempt | None:
@@ -3755,19 +4021,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
     target = max(0, _int_hint(base.get("target_bootstrap_count"), 0))
     variants = [
         (
-            "budget_fulfillment_beam",
-            {
-                **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
-                "direct_budget_policy": True,
-                "selection_bootstrap_penalty": max(
-                    500_000_000.0,
-                    _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
-                ),
-            },
-            0.35,
-        ),
-        (
             "strict_no_bootstrap",
             {
                 **base,
@@ -3807,6 +4060,19 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "bootstrap_anchor_count": max(1, min(4, target or 2)),
             },
             0.10,
+        ),
+        (
+            "budget_fulfillment_beam",
+            {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "selection_bootstrap_penalty": max(
+                    1_250_000_000.0,
+                    _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
+                ),
+            },
+            0.05,
         ),
         (
             "latency_mcts_repair",
@@ -3914,9 +4180,7 @@ def _policy_assignment_score(
     selection_bootstrap_penalty = _float_hint(hints.get("selection_bootstrap_penalty"), 0.0)
     if selection_bootstrap_penalty > 0.0:
         counts = _aggregate_counts([assign])
-        target = max(0, int(getattr(params, "openevolve_target_bootstrap_count", 0)))
-        excess = max(0, counts["bootstrap"] - target) if target > 0 else counts["bootstrap"]
-        score += selection_bootstrap_penalty * excess
+        score += selection_bootstrap_penalty * counts["bootstrap"]
     return score
 
 
@@ -5545,15 +5809,6 @@ def candidate_actions(
     }
     actions: list[dict[str, Any]] = [
         {
-            "name": "budget_fulfillment_beam",
-            "prior": 0.35,
-            "policy": {
-                **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
-                "direct_budget_policy": True,
-            },
-        },
-        {
             "name": "strict_no_bootstrap",
             "prior": 0.30,
             "policy": {
@@ -5582,6 +5837,16 @@ def candidate_actions(
                 "allow_bootstrap": True,
                 "boundary_scale_policy": "frontier",
                 "bootstrap_anchor_count": max(1, min(4, target or 2)),
+            },
+        },
+        {
+            "name": "budget_fulfillment_beam",
+            "prior": 0.05,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "selection_bootstrap_penalty": 1_250_000_000.0,
             },
         },
         {
@@ -6989,6 +7254,47 @@ def _assignment_count_summary(assignments: list[Assign]) -> dict[str, float]:
         "min_rescale": float(min(rescales)),
         "max_bootstrap": float(max(bootstraps)),
         "max_rescale": float(max(rescales)),
+    }
+
+
+def _boundary_group_count_summary(summaries: list[dict[str, Any]]) -> dict[str, float]:
+    """Summarize complete QBP boundary groups without summing alternatives.
+
+    Each group represents the Orbit object that DP consumes: all output states
+    for one partition input boundary. The representative bootstrap/rescale
+    count is the average within each group, then averaged across groups.
+    """
+
+    usable = [
+        item
+        for item in summaries
+        if isinstance(item, dict) and int(item.get("solved_budgets", 0) or 0) > 0
+    ]
+    if not usable:
+        return {
+            "boundary_group_count": 0.0,
+            "avg_bootstrap": 0.0,
+            "avg_rescale": 0.0,
+            "min_bootstrap": 0.0,
+            "min_rescale": 0.0,
+            "max_bootstrap": 0.0,
+            "max_rescale": 0.0,
+        }
+    avg_bootstraps = [float(item.get("avg_bootstrap", 0.0) or 0.0) for item in usable]
+    avg_rescales = [float(item.get("avg_rescale", 0.0) or 0.0) for item in usable]
+    min_bootstraps = [float(item.get("min_bootstrap", 0.0) or 0.0) for item in usable]
+    min_rescales = [float(item.get("min_rescale", 0.0) or 0.0) for item in usable]
+    max_bootstraps = [float(item.get("max_bootstrap", 0.0) or 0.0) for item in usable]
+    max_rescales = [float(item.get("max_rescale", 0.0) or 0.0) for item in usable]
+    count = len(usable)
+    return {
+        "boundary_group_count": float(count),
+        "avg_bootstrap": float(sum(avg_bootstraps) / count),
+        "avg_rescale": float(sum(avg_rescales) / count),
+        "min_bootstrap": float(min(min_bootstraps)),
+        "min_rescale": float(min(min_rescales)),
+        "max_bootstrap": float(max(max_bootstraps)),
+        "max_rescale": float(max(max_rescales)),
     }
 
 

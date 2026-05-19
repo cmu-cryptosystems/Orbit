@@ -4,6 +4,8 @@ from ..resilience import ResilienceProfile
 
 DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_OPENEVOLVE_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_OPENEVOLVE_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_OPENEVOLVE_OPENAI_API_BASE = "https://api.openai.com/v1"
 DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS = 2048
 
 DEFAULT_RESILIENCE_ERROR_MODEL = {
@@ -53,10 +55,22 @@ class Params:
         openevolve_model=None,
         openevolve_api_base=None,
         openevolve_api_key_env=None,
+        openevolve_primary_weight=None,
+        openevolve_secondary_provider=None,
+        openevolve_secondary_model=None,
+        openevolve_secondary_api_base=None,
+        openevolve_secondary_api_key_env=None,
+        openevolve_secondary_weight=None,
         openevolve_harness="compile",
+        openevolve_search_mode=None,
+        openevolve_granularity=None,
+        openevolve_leniency=None,
+        openevolve_max_unit_samples=None,
         openevolve_eval_suite="polybert-sampled",
         openevolve_reference_json=None,
         openevolve_finalists=3,
+        openevolve_budget_aggressive=True,
+        openevolve_target_bootstrap_count=0,
         openevolve_llm_timeout_sec=180,
         openevolve_llm_retries=1,
         openevolve_llm_retry_delay_sec=2,
@@ -146,6 +160,8 @@ class Params:
         provider_default_api_base = (
             DEFAULT_OPENEVOLVE_GEMINI_API_BASE
             if self.openevolve_provider == "gemini"
+            else DEFAULT_OPENEVOLVE_OPENAI_API_BASE
+            if self.openevolve_provider == "openai"
             else None
         )
         self.openevolve_api_base = (
@@ -158,6 +174,58 @@ class Params:
             if openevolve_api_key_env is not None
             else json_parsed.get("openevolve_api_key_env", "OPENAI_API_KEY")
         )
+        self.openevolve_primary_weight = max(
+            0.0,
+            float(
+                openevolve_primary_weight
+                if openevolve_primary_weight is not None
+                else json_parsed.get("openevolve_primary_weight", 1.0)
+            ),
+        )
+        self.openevolve_secondary_provider = (
+            openevolve_secondary_provider
+            if openevolve_secondary_provider is not None
+            else json_parsed.get("openevolve_secondary_provider", "none")
+        )
+        if self.openevolve_secondary_provider not in ("none", "gemini", "openai", "custom"):
+            raise ValueError(
+                "openevolve_secondary_provider must be 'none', 'gemini', 'openai', or 'custom', "
+                f"got {self.openevolve_secondary_provider!r}"
+            )
+        secondary_default_api_base = (
+            DEFAULT_OPENEVOLVE_GEMINI_API_BASE
+            if self.openevolve_secondary_provider == "gemini"
+            else DEFAULT_OPENEVOLVE_OPENAI_API_BASE
+            if self.openevolve_secondary_provider == "openai"
+            else None
+        )
+        self.openevolve_secondary_model = (
+            openevolve_secondary_model
+            if openevolve_secondary_model is not None
+            else json_parsed.get("openevolve_secondary_model", DEFAULT_OPENEVOLVE_OPENAI_MODEL)
+        )
+        self.openevolve_secondary_api_base = (
+            openevolve_secondary_api_base
+            if openevolve_secondary_api_base is not None
+            else json_parsed.get("openevolve_secondary_api_base", secondary_default_api_base)
+        )
+        self.openevolve_secondary_api_key_env = (
+            openevolve_secondary_api_key_env
+            if openevolve_secondary_api_key_env is not None
+            else json_parsed.get("openevolve_secondary_api_key_env", "OPENAI_API_KEY")
+        )
+        self.openevolve_secondary_weight = max(
+            0.0,
+            float(
+                openevolve_secondary_weight
+                if openevolve_secondary_weight is not None
+                else json_parsed.get("openevolve_secondary_weight", 0.25)
+            ),
+        )
+        if self.openevolve_secondary_provider == "custom" and not self.openevolve_secondary_api_base:
+            raise ValueError(
+                "openevolve_secondary_api_base is required when openevolve_secondary_provider is 'custom'"
+            )
         self.openevolve_harness = (
             openevolve_harness
             if openevolve_harness is not None
@@ -168,6 +236,44 @@ class Params:
                 "openevolve_harness must be 'compile' or 'partition', "
                 f"got {self.openevolve_harness!r}"
             )
+        self.openevolve_search_mode = (
+            openevolve_search_mode
+            if openevolve_search_mode is not None
+            else json_parsed.get("openevolve_search_mode", "bootstrap-mcts")
+        )
+        if self.openevolve_search_mode not in ("legacy", "beam", "bootstrap-mcts"):
+            raise ValueError(
+                "openevolve_search_mode must be 'legacy', 'beam', or 'bootstrap-mcts', "
+                f"got {self.openevolve_search_mode!r}"
+            )
+        self.openevolve_granularity = (
+            openevolve_granularity
+            if openevolve_granularity is not None
+            else json_parsed.get("openevolve_granularity", "layer-nonlinear")
+        )
+        if self.openevolve_granularity not in ("compile", "layer-nonlinear"):
+            raise ValueError(
+                "openevolve_granularity must be 'compile' or 'layer-nonlinear', "
+                f"got {self.openevolve_granularity!r}"
+            )
+        self.openevolve_leniency = (
+            openevolve_leniency
+            if openevolve_leniency is not None
+            else json_parsed.get("openevolve_leniency", "repair")
+        )
+        if self.openevolve_leniency not in ("repair", "strict"):
+            raise ValueError(
+                "openevolve_leniency must be 'repair' or 'strict', "
+                f"got {self.openevolve_leniency!r}"
+            )
+        self.openevolve_max_unit_samples = max(
+            1,
+            int(
+                openevolve_max_unit_samples
+                if openevolve_max_unit_samples is not None
+                else json_parsed.get("openevolve_max_unit_samples", 64)
+            ),
+        )
         self.openevolve_eval_suite = (
             openevolve_eval_suite
             if openevolve_eval_suite is not None
@@ -187,6 +293,19 @@ class Params:
             openevolve_finalists
             if openevolve_finalists is not None
             else json_parsed.get("openevolve_finalists", 3)
+        )
+        self.openevolve_budget_aggressive = bool(
+            openevolve_budget_aggressive
+            if openevolve_budget_aggressive is not None
+            else json_parsed.get("openevolve_budget_aggressive", True)
+        )
+        self.openevolve_target_bootstrap_count = max(
+            0,
+            int(
+                openevolve_target_bootstrap_count
+                if openevolve_target_bootstrap_count is not None
+                else json_parsed.get("openevolve_target_bootstrap_count", 0)
+            ),
         )
         self.openevolve_llm_timeout_sec = max(
             1,

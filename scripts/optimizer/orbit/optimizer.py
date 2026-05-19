@@ -198,9 +198,33 @@ def main():
                         help='OpenAI-compatible API base for OpenEvolve generated config')
     parser.add_argument('--openevolve-api-key-env', type=str, default='OPENAI_API_KEY',
                         help='Environment variable containing the OpenEvolve API key')
+    parser.add_argument('--openevolve-primary-weight', type=float, default=1.0,
+                        help='Sampling weight for the primary OpenEvolve model')
+    parser.add_argument('--openevolve-secondary-provider', type=str, default='none',
+                        choices=['none', 'gemini', 'openai', 'custom'],
+                        help='Optional secondary OpenEvolve provider for multi-model ensembles')
+    parser.add_argument('--openevolve-secondary-model', type=str, default='gpt-5.5',
+                        help='Secondary model used when --openevolve-secondary-provider is set')
+    parser.add_argument('--openevolve-secondary-api-base', type=str, default=None,
+                        help='OpenAI-compatible API base for the secondary OpenEvolve model')
+    parser.add_argument('--openevolve-secondary-api-key-env', type=str, default='OPENAI_API_KEY',
+                        help='Environment variable containing the secondary provider API key')
+    parser.add_argument('--openevolve-secondary-weight', type=float, default=0.25,
+                        help='Sampling weight for the secondary OpenEvolve model')
     parser.add_argument('--openevolve-harness', type=str, default='compile',
                         choices=['compile', 'partition'],
                         help='OpenEvolve harness scope for positive iterations')
+    parser.add_argument('--openevolve-search-mode', type=str, default='bootstrap-mcts',
+                        choices=['legacy', 'beam', 'bootstrap-mcts'],
+                        help='OpenEvolve placement search mode for positive iterations')
+    parser.add_argument('--openevolve-granularity', type=str, default='layer-nonlinear',
+                        choices=['compile', 'layer-nonlinear'],
+                        help='OpenEvolve placement context granularity for positive iterations')
+    parser.add_argument('--openevolve-leniency', type=str, default='repair',
+                        choices=['repair', 'strict'],
+                        help='OpenEvolve candidate handling: repair invalid hints or reject strictly')
+    parser.add_argument('--openevolve-max-unit-samples', type=int, default=64,
+                        help='Maximum layer/nonlinear units to expose in sampled OpenEvolve contexts')
     parser.add_argument('--openevolve-eval-suite', type=str, default='polybert-sampled',
                         choices=['toy', 'polybert-sampled', 'polybert-full'],
                         help='Evaluation bundle used inside the OpenEvolve harness')
@@ -208,6 +232,18 @@ def main():
                         help='Optional precomputed reference metrics; never triggers an ILP solve')
     parser.add_argument('--openevolve-finalists', type=int, default=3,
                         help='Number of top candidates to rerun on full OpenEvolve bundle')
+    parser.add_argument(
+        '--openevolve-budget-aggressive',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Bias OpenEvolve scoring toward candidates that directly solve more budget records',
+    )
+    parser.add_argument(
+        '--openevolve-target-bootstrap-count',
+        type=int,
+        default=0,
+        help='Soft target for final bootstrap count; 0 disables the target',
+    )
     parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
     parser.add_argument('--openevolve-llm-retries', type=int, default=1)
     parser.add_argument('--openevolve-llm-retry-delay-sec', type=int, default=2)
@@ -325,10 +361,22 @@ def main():
                     openevolve_model=args.openevolve_model,
                     openevolve_api_base=args.openevolve_api_base,
                     openevolve_api_key_env=args.openevolve_api_key_env,
+                    openevolve_primary_weight=args.openevolve_primary_weight,
+                    openevolve_secondary_provider=args.openevolve_secondary_provider,
+                    openevolve_secondary_model=args.openevolve_secondary_model,
+                    openevolve_secondary_api_base=args.openevolve_secondary_api_base,
+                    openevolve_secondary_api_key_env=args.openevolve_secondary_api_key_env,
+                    openevolve_secondary_weight=args.openevolve_secondary_weight,
                     openevolve_harness=args.openevolve_harness,
+                    openevolve_search_mode=args.openevolve_search_mode,
+                    openevolve_granularity=args.openevolve_granularity,
+                    openevolve_leniency=args.openevolve_leniency,
+                    openevolve_max_unit_samples=args.openevolve_max_unit_samples,
                     openevolve_eval_suite=args.openevolve_eval_suite,
                     openevolve_reference_json=args.openevolve_reference_json,
                     openevolve_finalists=args.openevolve_finalists,
+                    openevolve_budget_aggressive=args.openevolve_budget_aggressive,
+                    openevolve_target_bootstrap_count=args.openevolve_target_bootstrap_count,
                     openevolve_llm_timeout_sec=args.openevolve_llm_timeout_sec,
                     openevolve_llm_retries=args.openevolve_llm_retries,
                     openevolve_llm_retry_delay_sec=args.openevolve_llm_retry_delay_sec,

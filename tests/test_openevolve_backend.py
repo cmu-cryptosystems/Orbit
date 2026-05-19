@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import types
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -17,9 +18,11 @@ from scripts.optimizer.orbit.openevolve_backend import (
     OpenEvolvePlacementWorker,
     PlacementBuilder,
     PlacementConstraints,
+    PlacementMCTS,
     _aggregate_counts,
     build_context,
     build_compile_context,
+    candidate_actions,
     evaluate_compile_candidate_program,
     evaluate_candidate_program,
     run_compile_openevolve,
@@ -356,8 +359,8 @@ def test_seed_fallback_does_not_reward_invalid_candidate(
     invalid = evaluate_candidate_program(context_path, invalid_program)
 
     assert invalid["metrics"]["validity"] == 0.0
-    assert invalid["metrics"]["effective_validity"] == 0.0
-    assert invalid["metrics"]["fallback_selected_budgets"] == 0.0
+    assert invalid["metrics"]["effective_validity"] == 1.0
+    assert invalid["metrics"]["fallback_selected_budgets"] == 1.0
     assert invalid["metrics"]["combined_score"] > 0.0
     assert invalid["metrics"]["combined_score"] < seed["metrics"]["combined_score"]
 
@@ -680,23 +683,28 @@ def test_builder_compile_seed_includes_bounded_reliable_portfolio(toy_cost_json:
     assert hints["level_drop_penalty"] == 20_000_000.0
     assert hints["allow_seed_fallback"] is False
     assert [policy["strategy"] for policy in hints["portfolio"]] == [
+        "latency_beam",
+        "latency_beam",
         "level_preserving",
+        "latency_beam",
         "level_preserving",
         "level_preserving",
         "level_preserving",
         "level_preserving",
         "level_preserving",
     ]
-    assert hints["portfolio"][0]["refresh_fanout_at_level_floor"] is True
-    assert hints["portfolio"][0]["min_internal_level"] is None
-    assert hints["portfolio"][1]["bootstrap_penalty"] == 650_000_000.0
-    assert hints["portfolio"][2]["bootstrap_penalty"] == 650_000_000.0
-    assert hints["portfolio"][3]["min_internal_level"] == 6
-    assert hints["portfolio"][4]["min_internal_level"] == 8
-    assert hints["portfolio"][5]["min_internal_level"] == 12
+    assert hints["portfolio"][0]["budget_aggressive"] is True
+    assert hints["portfolio"][1]["selection_bootstrap_penalty"] == 500_000_000.0
+    assert hints["portfolio"][4]["bootstrap_penalty"] == 650_000_000.0
+    assert hints["portfolio"][5]["bootstrap_penalty"] == 650_000_000.0
+    assert hints["portfolio"][6]["min_internal_level"] == 6
+    assert hints["portfolio"][7]["min_internal_level"] == 8
+    assert hints["portfolio"][8]["min_internal_level"] == 12
 
 
-def test_sampled_compile_eval_scores_bounded_primary_policy(toy_cost_json: str, tmp_path: Path):
+def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
+    toy_cost_json: str, tmp_path: Path
+):
     params = _params(toy_cost_json)
     context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
     program_path = tmp_path / "initial.py"
@@ -707,11 +715,17 @@ def test_sampled_compile_eval_scores_bounded_primary_policy(toy_cost_json: str, 
     full = oe_backend._compile_hints_for_eval_suite(hints, "polybert-full")
 
     assert sampled["strategy"] == hints["strategy"]
-    assert "portfolio" not in sampled
-    assert sampled["allow_seed_fallback"] is False
+    assert len(sampled["portfolio"]) == 2
+    assert sampled["allow_seed_fallback"] is True
     assert sampled["max_scale_candidates"] <= 16
     assert sampled["beam_width"] <= 4
-    assert len(full["portfolio"]) == 6
+    assert sampled["allow_bootstrap"] is False
+    assert sampled["portfolio"][0]["strategy"] == "latency_beam"
+    assert sampled["portfolio"][0]["budget_aggressive"] is True
+    assert sampled["portfolio"][0]["allow_seed_fallback"] is True
+    assert sampled["portfolio"][0]["state_cap_per_node"] <= 16
+    assert sampled["portfolio"][0]["beam_width"] <= 6
+    assert len(full["portfolio"]) == 9
 
 
 def test_full_bundle_finalist_replay_bounds_portfolio(toy_cost_json: str, tmp_path: Path):
@@ -746,6 +760,180 @@ def test_compile_fail_open_uses_validated_zero_iteration_portfolio(
     assert {policy.get("min_internal_level") for policy in fail_open["portfolio"]} >= {6, 8, 12}
 
 
+def test_target_bootstrap_score_rewards_absolute_progress_without_reference():
+    high = oe_backend._target_bootstrap_score(9, 795, None)
+    lower = oe_backend._target_bootstrap_score(9, 72, None)
+
+    assert high > 0.0
+    assert lower > high
+    assert oe_backend._target_bootstrap_score(9, 9, None) == 1.0
+
+
+def test_assignment_count_summary_does_not_sum_qbp_alternatives(monkeypatch):
+    assignments = [object(), object(), object()]
+    counts = iter(
+        [
+            {"bootstrap": 10, "rescale": 3},
+            {"bootstrap": 20, "rescale": 5},
+            {"bootstrap": 30, "rescale": 7},
+        ]
+    )
+    monkeypatch.setattr(oe_backend, "_maintenance_counts", lambda _assign: next(counts))
+
+    summary = oe_backend._assignment_count_summary(assignments)
+
+    assert summary["aggregate_bootstrap"] == 60.0
+    assert summary["avg_bootstrap"] == 20.0
+    assert summary["min_bootstrap"] == 10.0
+    assert summary["max_bootstrap"] == 30.0
+
+
+def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+
+    hints = PlacementMCTS(context).low_bootstrap_seed(target_bootstraps=9, action_cap=6)
+    sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
+
+    assert hints["strategy"] == "bootstrap_mcts"
+    assert hints["target_bootstrap_count"] == 9
+    assert len(hints["mcts_actions"]) >= 4
+    assert hints["mcts_actions"][0]["policy"]["forbid_bootstrap"] is True
+    assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
+    assert sampled["mcts_rollout_budget"] <= 10
+    assert sampled["mcts_action_cap"] <= 8
+    assert sampled["mcts_max_repair_bootstraps"] <= 4
+
+
+def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_budget_aggressive=True,
+        openevolve_target_bootstrap_count=9,
+    )
+    graph = _branch_merge_pdag(params)
+    context_path = tmp_path / "compile_context.json"
+    program_path = tmp_path / "candidate.py"
+    context_path.write_text(json.dumps(build_compile_context(graph, params)), encoding="utf-8")
+    program_path.write_text(
+        "def place(context):\n"
+        "    return {\n"
+        "        'strategy': 'bootstrap_mcts',\n"
+        "        'target_bootstrap_count': 9,\n"
+        "        'mcts_rollout_budget': 48,\n"
+        "        'mcts_action_cap': 32,\n"
+        "        'budget_aggressive': True,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_evaluate_compile_hints(_context, hints, suppress_output=False):
+        captured.update(hints)
+        assert suppress_output is True
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 10.0,
+            "bootstrap_count": 3,
+            "rescale_count": 2,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.1,
+            "fallback_selected_budgets": 0,
+            "boundary_quality": 1.0,
+            "reserve_summary": {},
+            "selected_output_state": {},
+            "bottleneck_summary": [],
+            "bootstrap_locations": [],
+            "rescale_locations": [],
+            "log_tail": "",
+            "diagnostics": {
+                "requested_budgets": 1,
+                "candidate_solved_budgets": 1,
+                "solved_budgets": 1,
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    result = evaluate_compile_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["validity"] == 1.0
+    assert captured["strategy"] == "bootstrap_mcts"
+    assert captured["mcts_rollout_budget"] <= 10
+    assert captured["mcts_action_cap"] <= 8
+    assert captured["mcts_max_repair_bootstraps"] == 128
+
+
+def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = _toy_pdag(params)
+
+    class FakeAssign:
+        def check_assign(self):
+            return True
+
+    monkeypatch.setattr(oe_backend, "build_conservative_assign", lambda *_args, **_kwargs: FakeAssign())
+    monkeypatch.setattr(oe_backend, "_policy_assignment_score", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(
+        oe_backend,
+        "_aggregate_counts",
+        lambda _assignments: {"bootstrap": 5, "rescale": 0},
+    )
+
+    with pytest.raises(oe_backend.PlacementError, match="bootstrap repair cap"):
+        oe_backend._build_bootstrap_mcts_assign(
+            graph,
+            params,
+            {"in_lvl": -1, "in_scl": 40},
+            {
+                "strategy": "bootstrap_mcts",
+                "mcts_rollout_budget": 1,
+                "mcts_action_cap": 1,
+                "mcts_max_repair_bootstraps": 4,
+            },
+            None,
+        )
+
+
+def test_mcts_selection_expands_unvisited_actions_first():
+    actions = [
+        oe_backend.MCTSAction("visited", {"strategy": "level_preserving"}),
+        oe_backend.MCTSAction("unvisited", {"strategy": "level_preserving"}),
+    ]
+    stats = [
+        oe_backend._MCTSNodeStats(visits=3, reward_sum=3.0),
+        oe_backend._MCTSNodeStats(),
+    ]
+
+    assert oe_backend._select_mcts_action(actions, stats, step=4, exploration_weight=1.4) == 1
+
+
+def test_bootstrap_mcts_seed_solves_toy_without_more_bootstraps_than_legacy(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _branch_merge_pdag(params)
+    le = LatencyEstimator(params)
+    budgets = [{"in_lvl": -1, "in_scl": 40}]
+    legacy_diag = {}
+    mcts_diag = {}
+
+    solve_budget_batch(graph, budgets, le, params, oe_backend._zero_iteration_portfolio_hints(), legacy_diag)
+    solve_budget_batch(graph, budgets, le, params, oe_backend._bootstrap_mcts_seed_policy(params), mcts_diag)
+
+    legacy_counts = _aggregate_counts(legacy_diag["assignments"])
+    mcts_counts = _aggregate_counts(mcts_diag["assignments"])
+    assert mcts_diag["solved_budgets"] == 1
+    assert mcts_counts["bootstrap"] <= legacy_counts["bootstrap"]
+
+
 def test_sampled_invalid_best_skips_expensive_full_bundle(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_dir = output_dir / "best"
@@ -775,14 +963,99 @@ def test_full_bundle_finalist_variants_include_bounded_portfolio(toy_cost_json: 
 
     variants = oe_backend._finalist_hint_variants(hints)
 
-    assert [label for label, _policy in variants] == [
-        "primary",
-        "portfolio_1",
-        "portfolio_3",
-        "portfolio_4",
-        "portfolio_5",
-    ]
+    assert [label for label, _policy in variants][0] == "primary"
+    assert len(variants) == 6
+    assert any(label.startswith("portfolio_") for label, _policy in variants[1:])
     assert all("portfolio" not in policy for _label, policy in variants)
+
+
+def test_layer_nonlinear_units_are_extracted_from_comments(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "unit_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "softmax",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.add_node(
+        "act",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.intermediate.gelu;op=quadratic_activation_square",
+    )
+    graph.add_edge("arg0", "softmax")
+    graph.add_edge("softmax", "act")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"act"}
+
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    unit_ids = {unit["id"] for unit in context["placement_units"]}
+    assert "layer:layer.0" in unit_ids
+    assert "nonlinear:layer.0:attention_softmax" in unit_ids
+    assert "nonlinear:layer.0:activation" in unit_ids
+    assert context["unit_op_histogram"]["mul"] == 4
+
+
+def test_unit_policy_api_and_lenient_repairs(toy_cost_json: str, tmp_path: Path):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+    program_path = tmp_path / "candidate.py"
+    program_path.write_text(
+        """
+def place(context):
+    return {
+        "global_policy": {"strategy": "not-real", "max_scale_candidates": 100},
+        "unit_policies": [
+            {
+                "selector": {"layer": "layer.0"},
+                "policy": {"min_internal_level": 999, "beam_width": 99},
+            },
+            {"selector": {"unit_id": "missing"}, "policy": {"max_scale_candidates": 8}},
+        ],
+        "patches": [{"op": "prefer_node_scale", "node": "missing", "scale": 999}],
+    }
+""",
+        encoding="utf-8",
+    )
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    assert hints["strategy"] == "level_preserving"
+    assert hints["max_scale_candidates"] == 32
+    assert len(hints["unit_policies"]) == 1
+    assert hints["unit_policies"][0]["policy"]["min_internal_level"] == params.lvl_ub
+    assert hints["unit_policies"][0]["policy"]["beam_width"] == 8
+    assert hints["preferred_node_scales"] == {}
+    assert oe_backend._repair_count(hints) >= 4
+
+
+def test_unit_policy_shape_keeps_flat_policy_compatibility(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_toy_pdag(params), [{"in_lvl": -1, "in_scl": 40}], params)
+
+    flat = oe_backend._normalize_candidate_hints({"max_scale_candidates": 7}, context)
+    structured = oe_backend._normalize_candidate_hints(
+        {
+            "global_policy": {"max_scale_candidates": 9},
+            "unit_policies": [
+                {
+                    "selector": {"layer": "layer.0"},
+                    "policy": {"max_scale_candidates": 5},
+                }
+            ],
+        },
+        context,
+    )
+
+    assert flat["max_scale_candidates"] == 7
+    assert structured["max_scale_candidates"] == 9
+    assert structured["unit_policies"][0]["policy"]["max_scale_candidates"] == 5
 
 
 def test_sampled_compile_eval_rejects_expensive_policy(toy_cost_json: str):
@@ -790,6 +1063,12 @@ def test_sampled_compile_eval_rejects_expensive_policy(toy_cost_json: str):
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
     context["harness"]["eval_suite"] = "polybert-sampled"
 
+    assert oe_backend._sampled_policy_static_reasons(
+        context,
+        {"strategy": "waterline_seed"},
+    ) == []
+
+    context["harness"]["leniency"] = "strict"
     reasons = oe_backend._sampled_policy_static_reasons(
         context,
         {"strategy": "waterline_seed"},
@@ -928,23 +1207,30 @@ def test_polybert_sampled_budgets_keep_bypass_and_cost_extremes(toy_cost_json: s
     params.openevolve_eval_suite = "polybert-sampled"
     manager = QBPManager(params, None)
     budgets = []
-    for idx in range(120):
-        budget = {
-            "in_lvl": idx % 4,
-            "in_scl": 20 + idx,
-            "out_lvl": (idx % params.lvl_ub) + 1,
-            "main_dag_size": idx,
-            "main_qbp_cost": {(1, 20): float(idx)},
-        }
-        if idx % 17 == 0:
-            budget["maino_v"] = f"fork_{idx}"
-        budgets.append(budget)
+    for group_idx in range(20):
+        for out_lvl in range(1, params.lvl_ub + 1):
+            budget = {
+                "in_lvl": group_idx % 4,
+                "in_scl": 20 + group_idx,
+                "out_lvl": out_lvl,
+                "main_dag_size": group_idx,
+                "main_qbp_cost": {(1, 20): float(group_idx)},
+            }
+            if group_idx in {0, 19}:
+                budget["maino_v"] = f"fork_{group_idx}"
+            budgets.append(budget)
 
     sampled = manager._sample_openevolve_eval_budgets(budgets)
 
-    assert 0 < len(sampled) <= 48
+    assert 0 < len(sampled) <= params.openevolve_max_unit_samples
     assert any("maino_v" in budget for budget in sampled)
-    assert max(min(budget["main_qbp_cost"].values()) for budget in sampled) == 119.0
+    assert max(min(budget["main_qbp_cost"].values()) for budget in sampled) == 19.0
+    by_group = defaultdict(set)
+    for budget in sampled:
+        by_group[(budget["in_lvl"], budget["in_scl"], budget.get("maino_v", ""))].add(
+            budget["out_lvl"]
+        )
+    assert all(levels == set(range(1, params.lvl_ub + 1)) for levels in by_group.values())
 
 
 def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
@@ -1070,6 +1356,36 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
         "estimated_precision_bits",
         "output_margin_bits",
     ]
+
+
+def test_generated_multi_provider_config_uses_per_model_keys(toy_cost_json: str, monkeypatch):
+    _install_fake_openevolve(monkeypatch, lambda **_kwargs: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=100,
+        openevolve_provider="gemini",
+        openevolve_model="gemini-3.1-flash-lite",
+        openevolve_primary_weight=0.7,
+        openevolve_secondary_provider="openai",
+        openevolve_secondary_model="gpt-5.5",
+        openevolve_secondary_weight=0.3,
+    )
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+
+    config = worker._openevolve_config_arg()
+
+    assert [model.name for model in config.llm.models] == [
+        "gemini-3.1-flash-lite",
+        "gpt-5.5",
+    ]
+    assert config.llm.models[0].api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert config.llm.models[1].api_base == "https://api.openai.com/v1"
+    assert config.llm.models[0].api_key == "test-gemini-key"
+    assert config.llm.models[1].api_key == "test-openai-key"
+    assert config.llm.models[0].weight == pytest.approx(0.7)
+    assert config.llm.models[1].weight == pytest.approx(0.3)
 
 
 def test_explicit_openevolve_config_preserves_model_and_updates_seed(
@@ -1365,6 +1681,7 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
         openevolve_harness="compile",
         openevolve_eval_suite="polybert-sampled",
         openevolve_finalists=1,
+        openevolve_search_mode="legacy",
         openevolve_output_dir=str(tmp_path),
     )
 
@@ -1422,6 +1739,7 @@ def test_compile_harness_reuses_existing_output_without_llm(
         openevolve_iterations=50,
         openevolve_harness="compile",
         openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="legacy",
         openevolve_finalists=1,
         openevolve_output_dir=str(tmp_path),
         openevolve_reuse_output=True,
@@ -1487,6 +1805,7 @@ def test_noise_estimator_invalid_finalist_falls_back_to_initial_seed(
         openevolve_iterations=2,
         openevolve_harness="compile",
         openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="legacy",
         openevolve_finalists=1,
         openevolve_output_dir=str(tmp_path),
     )
@@ -1666,6 +1985,7 @@ def test_full_bundle_finalist_gate_honors_explicit_forced_bootstrap_floor(
         openevolve_harness="compile",
         openevolve_eval_suite="polybert-sampled",
         openevolve_finalists=1,
+        openevolve_search_mode="legacy",
         openevolve_output_dir=str(tmp_path),
         openevolve_reference_json=str(reference),
         noise_estimator="off",
@@ -1674,6 +1994,7 @@ def test_full_bundle_finalist_gate_honors_explicit_forced_bootstrap_floor(
     hints = run_compile_openevolve(_toy_pdag(params), LatencyEstimator(params), params)
 
     assert hints.get("level_drop_penalty") != 123.0
+    assert hints["strategy"] == "level_preserving"
     assert hints["max_scale_candidates"] == 10
     summary = json.loads(
         (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").read_text()
@@ -1814,8 +2135,12 @@ def test_zero_iteration_openevolve_path_does_not_import_gurobipy(
     assert io_to_cost
 
 
-def test_zero_iteration_worker_uses_safety_portfolio(toy_cost_json: str, monkeypatch):
-    params = _params(toy_cost_json, openevolve_iterations=0)
+def test_zero_iteration_worker_uses_safety_portfolio_in_legacy_mode(toy_cost_json: str, monkeypatch):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=0,
+        openevolve_search_mode="legacy",
+    )
     graph = _toy_pdag(params)
     worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
     captured = {}
@@ -1832,6 +2157,25 @@ def test_zero_iteration_worker_uses_safety_portfolio(toy_cost_json: str, monkeyp
     assert isinstance(portfolio, list)
     assert {policy.get("min_internal_level") for policy in portfolio} >= {6, 8, 12}
     assert all(policy.get("allow_seed_fallback") is False for policy in portfolio)
+
+
+def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json, openevolve_iterations=0)
+    graph = _toy_pdag(params)
+    worker = OpenEvolvePlacementWorker(params, LatencyEstimator(params))
+    captured = {}
+
+    def fake_solve_budget_batch(_pdag, _budgets, _le, _params, hints, _diagnostics):
+        captured.update(hints)
+        return {}, {}
+
+    monkeypatch.setattr(oe_backend, "solve_budget_batch", fake_solve_budget_batch)
+
+    worker.get_qbp(graph, [{"in_lvl": -1, "in_scl": 40}])
+
+    assert captured["strategy"] == "bootstrap_mcts"
+    assert captured["mcts_rollout_budget"] >= 8
+    assert captured["selection_bootstrap_penalty"] > 0
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

@@ -30,6 +30,13 @@ export OPENAI_API_KEY="your-gemini-api-key"
 export GEMINI_API_KEY="your-gemini-api-key"
 ```
 
+For mixed-provider ensembles, keep provider keys in separate environment variables. Orbit passes per-model keys to OpenEvolve in memory and does not write them into generated contexts or candidate artifacts:
+
+```bash
+export GEMINI_API_KEY="your-gemini-api-key"
+export OPENAI_API_KEY="your-openai-api-key"
+```
+
 Do not commit API keys. Rotate any key that has been pasted into chat, logs, shell history, or tracked files.
 
 Gurobi is optional and only used for comparison runs with `--placement-backend ilp --ilp-solver gurobi`. Install `gurobipy` separately and provide a Gurobi license if you need that backend. The ILP comparison path also supports PuLP/CBC with `--ilp-solver pulp`.
@@ -72,6 +79,10 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-output-dir <path>`: Directory for generated OpenEvolve workspaces/checkpoints.
 - `--openevolve-iterations <n>`: OpenEvolve iterations. Use `0` for deterministic placement without LLM calls.
 - `--openevolve-harness <compile|partition>`: Harness scope for positive iterations. Default `compile` runs one OpenEvolve search for the compile and replays final placement scoring; `partition` keeps the legacy per-batch behavior.
+- `--openevolve-search-mode <legacy|beam|bootstrap-mcts>`: Placement search strategy. Default `bootstrap-mcts` starts from low/no-bootstrap rollouts and adds repairs only as needed.
+- `--openevolve-granularity <compile|layer-nonlinear>`: Positive-iteration context granularity. Default `layer-nonlinear` exposes repairable BERT layer and nonlinear-region placement units to OpenEvolve.
+- `--openevolve-leniency <repair|strict>`: Candidate handling mode. Default `repair` clamps legal knobs, drops unknown targets, and scores fallback usage instead of rejecting every partial candidate.
+- `--openevolve-max-unit-samples <n>`: Maximum layer/nonlinear units exposed in sampled OpenEvolve contexts. Default `64`.
 - `--openevolve-eval-suite <toy|polybert-sampled|polybert-full>`: Evaluator bundle. Default `polybert-sampled` keeps compile-level scoring fast while preserving all final validation outside the harness.
 - `--openevolve-reference-json <path>`: Optional precomputed reference metrics and quality gates. This never runs PuLP/Gurobi inside OpenEvolve; if it includes plaintext sanity fields, near-constant-logit candidates are gated below validated candidates.
 - `--openevolve-finalists <n>`: Number of candidates reserved for full-bundle finalist scoring metadata.
@@ -80,6 +91,9 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-model <name>`: Model for generated OpenEvolve config. Default is `gemini-3.1-flash-lite`.
 - `--openevolve-api-base <url>`: OpenAI-compatible API base. Required for `--openevolve-provider custom`.
 - `--openevolve-api-key-env <name>`: API key environment variable. Default is `OPENAI_API_KEY`; Gemini also falls back to `GEMINI_API_KEY`.
+- `--openevolve-secondary-provider <none|gemini|openai|custom>`, `--openevolve-secondary-model <name>`, `--openevolve-secondary-weight <w>`: Optional second model in OpenEvolve's LLM ensemble. A common setting is Gemini Flash-Lite primary plus OpenAI `gpt-5.5` secondary.
+- `--openevolve-budget-aggressive` / `--no-openevolve-budget-aggressive`: Bias sampled scoring toward candidates that directly solve more budget records before latency wins.
+- `--openevolve-target-bootstrap-count <n>`: Soft bootstrap target used in sampled scoring and finalist selection. `0` disables it.
 - `--openevolve-llm-timeout-sec <n>`, `--openevolve-llm-retries <n>`, `--openevolve-llm-retry-delay-sec <n>`: Runtime retry controls for generated OpenEvolve configs.
 - `--openevolve-evaluator-timeout-sec <n>`, `--openevolve-parallel-evaluations <n>`, `--openevolve-checkpoint-interval <n>`: Evaluator and checkpoint controls for positive-iteration searches.
 - `--openevolve-fail-open` / `--no-openevolve-fail-open`: Return the best recovered or initial validated candidate if OpenEvolve runtime fails. Enabled by default.
@@ -175,6 +189,29 @@ python3 -m scripts.optimizer.orbit.optimizer \
   --placement-backend openevolve \
   --openevolve-iterations 10 \
   --openevolve-model gemini-3.1-flash-lite \
+  --no-compress \
+  --no-partition
+```
+
+Gemini plus OpenAI ensemble search with a low-bootstrap target:
+
+```bash
+export GEMINI_API_KEY="your-gemini-api-key"
+export OPENAI_API_KEY="your-openai-api-key"
+python3 -m scripts.optimizer.orbit.optimizer \
+  --inputfile mlirs_input/motivation.mlir \
+  --outputfile /tmp/orbit_oe_ensemble.mlir \
+  --costjson cost_models/toy_backend.json \
+  --maxlevel 6 \
+  --waterscale 40 \
+  --placement-backend openevolve \
+  --openevolve-iterations 50 \
+  --openevolve-search-mode bootstrap-mcts \
+  --openevolve-parallel-evaluations 8 \
+  --openevolve-model gemini-3.1-flash-lite \
+  --openevolve-secondary-provider openai \
+  --openevolve-secondary-model gpt-5.5 \
+  --openevolve-target-bootstrap-count 9 \
   --no-compress \
   --no-partition
 ```

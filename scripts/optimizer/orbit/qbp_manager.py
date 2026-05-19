@@ -194,7 +194,7 @@ class QBPManager:
         print(f"  QBP Manager: Reusing Ratio: {1-num_remaining_tasks/num_total_tasks:.3f}.\n    Need to solve {num_remaining_tasks} / {num_total_tasks} placement tasks for PDAG #{pdag.name}")
         if len(io_budgets_list) == 0:
             return
-        io_budgets_list = self._sample_openevolve_eval_budgets(io_budgets_list)
+        io_budgets_list = self._sample_openevolve_eval_budgets(pdag, io_budgets_list)
         io_to_assign, io_to_cost = self.ilp_worker.get_qbp(pdag, io_budgets_list)
         if getattr(self.params, "openevolve_evaluating_candidate", False):
             self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
@@ -239,7 +239,7 @@ class QBPManager:
         
         if len(io_budgets_list) == 0:
             return
-        io_budgets_list = self._sample_openevolve_eval_budgets(io_budgets_list)
+        io_budgets_list = self._sample_openevolve_eval_budgets(bypass_pdag, io_budgets_list)
         
         bypass_io_to_assign, _ = self.ilp_worker.get_qbp(bypass_pdag, io_budgets_list)
         if getattr(self.params, "openevolve_evaluating_candidate", False):
@@ -254,7 +254,12 @@ class QBPManager:
         qbp_io_to_assign = self._assign_biject(io_to_assign, bj_qbp, bj_label)
         bj_qbp.append_io_results(io_to_cost, qbp_io_to_assign)
 
-    def _sample_openevolve_eval_budgets(self, io_budgets_list: list[dict]) -> list[dict]:
+    def _sample_openevolve_eval_budgets(
+        self, pdag: Tdag | list[dict], io_budgets_list: list[dict] | None = None
+    ) -> list[dict]:
+        if io_budgets_list is None:
+            io_budgets_list = pdag  # Backward-compatible direct test/helper call.
+            pdag = None
         if not getattr(self.params, "openevolve_evaluating_candidate", False):
             return io_budgets_list
         suite = getattr(self.params, "openevolve_eval_suite", "polybert-sampled")
@@ -264,29 +269,57 @@ class QBPManager:
             return io_budgets_list[: min(len(io_budgets_list), 8)]
         if len(io_budgets_list) <= 64:
             return io_budgets_list
-        max_sample = 48
+        max_sample = min(
+            len(io_budgets_list),
+            max(8, int(getattr(self.params, "openevolve_max_unit_samples", 64))),
+        )
         keep_levels = {
             1,
             max(1, self.params.bts_lb + 1),
             max(1, self.params.lvl_ub // 2),
             self.params.lvl_ub,
         }
-        sampled = []
-        seen = set()
-
-        def add(budget: dict) -> None:
-            if len(sampled) >= max_sample:
-                return
+        groups: dict[tuple, list[dict]] = {}
+        for budget in io_budgets_list:
             key = (
                 int(budget.get("in_lvl", -1)),
                 int(budget.get("in_scl", -1)),
-                int(budget.get("out_lvl", -1)),
                 str(budget.get("maino_v", "")),
+                int(budget.get("main_dag_size", 0) or 0),
             )
-            if key in seen:
+            groups.setdefault(key, []).append(budget)
+        for grouped in groups.values():
+            grouped.sort(key=lambda item: int(item.get("out_lvl", -1)))
+
+        sampled_groups: list[tuple] = []
+        seen_groups = set()
+
+        def sampled_len() -> int:
+            return sum(len(groups[item]) for item in sampled_groups)
+
+        def group_cost(group_key: tuple) -> float:
+            return min(budget_cost(budget) for budget in groups[group_key])
+
+        def group_size(group_key: tuple) -> float:
+            return max(budget_size(budget) for budget in groups[group_key])
+
+        def add(budget: dict) -> None:
+            key = (
+                int(budget.get("in_lvl", -1)),
+                int(budget.get("in_scl", -1)),
+                str(budget.get("maino_v", "")),
+                int(budget.get("main_dag_size", 0) or 0),
+            )
+            if key in seen_groups:
                 return
-            seen.add(key)
-            sampled.append(budget)
+            # Keep every output-level task for a sampled input boundary. Orbit's
+            # partition DP expects complete output-state choices; sampling
+            # individual out_lvl records distorts the QBP and can make valid
+            # placements look impossible.
+            if sampled_groups and sampled_len() + len(groups[key]) > max_sample:
+                return
+            seen_groups.add(key)
+            sampled_groups.append(key)
 
         def budget_cost(budget: dict) -> float:
             costs = budget.get("main_qbp_cost")
@@ -338,16 +371,44 @@ class QBPManager:
                 add_quantiles(budgets, budget_size, limit=3)
             else:
                 add_quantiles(budgets, budget_cost, limit=3)
-            if len(sampled) >= max_sample:
+            if sampled_len() >= max_sample:
                 break
 
-        if len(sampled) < max_sample:
+        if sampled_len() < max_sample:
             add_quantiles(io_budgets_list, budget_cost, limit=8)
             add_quantiles(io_budgets_list, budget_size, limit=8)
+        sampled = [budget for key in sampled_groups for budget in groups[key]]
+        if len(sampled) < max_sample:
+            group_keys = list(groups)
+
+            def add_group_key(group_key: tuple) -> None:
+                first = groups[group_key][0]
+                add(first)
+
+            def add_group_quantiles(key_fn, limit: int = 8) -> None:
+                ordered = sorted(
+                    group_keys,
+                    key=lambda item: (
+                        key_fn(item),
+                        item[0],
+                        item[1],
+                        item[2],
+                        item[3],
+                    ),
+                )
+                indexes = {0, len(ordered) // 4, len(ordered) // 2, (3 * len(ordered)) // 4, len(ordered) - 1}
+                for idx in sorted(indexes)[:limit]:
+                    if 0 <= idx < len(ordered):
+                        add_group_key(ordered[idx])
+
+            add_group_quantiles(group_cost, limit=8)
+            add_group_quantiles(group_size, limit=8)
+            sampled = [budget for key in sampled_groups for budget in groups[key]]
         if len(sampled) < max_sample:
             stride = max(1, len(io_budgets_list) // max_sample)
             for budget in io_budgets_list[::stride]:
                 add(budget)
+            sampled = [budget for key in sampled_groups for budget in groups[key]]
         return sampled or io_budgets_list[:1]
     
     def get_qbp_cost(self, pdag_name: str) -> dict:

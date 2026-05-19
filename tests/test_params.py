@@ -19,10 +19,22 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.openevolve_model == "gemini-3.1-flash-lite"
     assert p.openevolve_api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert p.openevolve_api_key_env == "OPENAI_API_KEY"
+    assert p.openevolve_primary_weight == 1.0
+    assert p.openevolve_secondary_provider == "none"
+    assert p.openevolve_secondary_model == "gpt-5.5"
+    assert p.openevolve_secondary_api_base is None
+    assert p.openevolve_secondary_api_key_env == "OPENAI_API_KEY"
+    assert p.openevolve_secondary_weight == 0.25
     assert p.openevolve_harness == "compile"
+    assert p.openevolve_search_mode == "bootstrap-mcts"
+    assert p.openevolve_granularity == "layer-nonlinear"
+    assert p.openevolve_leniency == "repair"
+    assert p.openevolve_max_unit_samples == 64
     assert p.openevolve_eval_suite == "polybert-sampled"
     assert p.openevolve_reference_json is None
     assert p.openevolve_finalists == 3
+    assert p.openevolve_budget_aggressive is True
+    assert p.openevolve_target_bootstrap_count == 0
     assert p.openevolve_llm_timeout_sec == 180
     assert p.openevolve_llm_retries == 1
     assert p.openevolve_llm_retry_delay_sec == 2
@@ -66,9 +78,29 @@ def test_params_rejects_bad_openevolve_provider(toy_cost_json: str):
         Params(toy_cost_json, "Orbit", "compile", openevolve_provider="not_a_provider")
 
 
+def test_params_rejects_bad_openevolve_secondary_provider(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_secondary_provider"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_secondary_provider="bogus")
+
+
+def test_params_rejects_bad_openevolve_search_mode(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_search_mode"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_search_mode="bogus")
+
+
 def test_params_rejects_bad_openevolve_harness(toy_cost_json: str):
     with pytest.raises(ValueError, match="openevolve_harness"):
         Params(toy_cost_json, "Orbit", "compile", openevolve_harness="batch")
+
+
+def test_params_rejects_bad_openevolve_granularity(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_granularity"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_granularity="node")
+
+
+def test_params_rejects_bad_openevolve_leniency(toy_cost_json: str):
+    with pytest.raises(ValueError, match="openevolve_leniency"):
+        Params(toy_cost_json, "Orbit", "compile", openevolve_leniency="unsafe")
 
 
 def test_params_rejects_bad_openevolve_eval_suite(toy_cost_json: str):

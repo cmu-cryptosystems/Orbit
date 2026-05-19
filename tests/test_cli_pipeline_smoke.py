@@ -66,6 +66,7 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
     assert "--openevolve-provider" in cmd
     assert "--openevolve-model" in cmd
     assert "gemini-3.1-flash-lite" in cmd
+    assert "--openevolve-search-mode" in cmd
     assert "--openevolve-api-key-env" in cmd
     assert "--openevolve-llm-timeout-sec" in cmd
     assert "--openevolve-fail-open" in cmd
@@ -177,6 +178,12 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
             "gemini-3.1-pro-preview",
             "--openevolve-api-key-env",
             "GEMINI_API_KEY",
+            "--openevolve-granularity",
+            "layer-nonlinear",
+            "--openevolve-leniency",
+            "repair",
+            "--openevolve-max-unit-samples",
+            "32",
         ],
     )
 
@@ -200,6 +207,16 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["openevolve_provider"] == "gemini"
     assert init["openevolve_model"] == "gemini-3.1-pro-preview"
     assert init["openevolve_api_key_env"] == "GEMINI_API_KEY"
+    assert init["openevolve_primary_weight"] == 1.0
+    assert init["openevolve_secondary_provider"] == "none"
+    assert init["openevolve_secondary_model"] == "gpt-5.5"
+    assert init["openevolve_secondary_api_base"] is None
+    assert init["openevolve_secondary_api_key_env"] == "OPENAI_API_KEY"
+    assert init["openevolve_secondary_weight"] == 0.25
+    assert init["openevolve_search_mode"] == "bootstrap-mcts"
+    assert init["openevolve_granularity"] == "layer-nonlinear"
+    assert init["openevolve_leniency"] == "repair"
+    assert init["openevolve_max_unit_samples"] == 32
     assert init["openevolve_llm_timeout_sec"] == 180
     assert init["openevolve_llm_retries"] == 1
     assert init["openevolve_llm_retry_delay_sec"] == 2
@@ -207,6 +224,8 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["openevolve_parallel_evaluations"] == 1
     assert init["openevolve_checkpoint_interval"] == 5
     assert init["openevolve_fail_open"] is True
+    assert init["openevolve_budget_aggressive"] is True
+    assert init["openevolve_target_bootstrap_count"] == 0
     assert init["noise_estimator"] == "finalists"
     assert init["noise_estimator_timeout_sec"] == 30
     assert init["noise_estimator_min_output_margin_bits"] == 2.0

@@ -26,7 +26,17 @@ if __name__ == "__main__":
     parser.add_argument('--openevolve-model', type=str, default='gemini-3.1-flash-lite')
     parser.add_argument('--openevolve-api-base', type=str, default=None)
     parser.add_argument('--openevolve-api-key-env', type=str, default='OPENAI_API_KEY')
+    parser.add_argument('--openevolve-primary-weight', type=float, default=1.0)
+    parser.add_argument('--openevolve-secondary-provider', choices=['none', 'gemini', 'openai', 'custom'], default='none')
+    parser.add_argument('--openevolve-secondary-model', type=str, default='gpt-5.5')
+    parser.add_argument('--openevolve-secondary-api-base', type=str, default=None)
+    parser.add_argument('--openevolve-secondary-api-key-env', type=str, default='OPENAI_API_KEY')
+    parser.add_argument('--openevolve-secondary-weight', type=float, default=0.25)
     parser.add_argument('--openevolve-harness', choices=['compile', 'partition'], default='compile')
+    parser.add_argument('--openevolve-search-mode', choices=['legacy', 'beam', 'bootstrap-mcts'], default='bootstrap-mcts')
+    parser.add_argument('--openevolve-granularity', choices=['compile', 'layer-nonlinear'], default='layer-nonlinear')
+    parser.add_argument('--openevolve-leniency', choices=['repair', 'strict'], default='repair')
+    parser.add_argument('--openevolve-max-unit-samples', type=int, default=64)
     parser.add_argument(
         '--openevolve-eval-suite',
         choices=['toy', 'polybert-sampled', 'polybert-full'],
@@ -34,6 +44,8 @@ if __name__ == "__main__":
     )
     parser.add_argument('--openevolve-reference-json', type=str, default=None)
     parser.add_argument('--openevolve-finalists', type=int, default=3)
+    parser.add_argument('--openevolve-budget-aggressive', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--openevolve-target-bootstrap-count', type=int, default=0)
     parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
     parser.add_argument('--openevolve-llm-retries', type=int, default=1)
     parser.add_argument('--openevolve-llm-retry-delay-sec', type=int, default=2)
@@ -104,9 +116,20 @@ if __name__ == "__main__":
         cmds += ["--openevolve-provider", args.openevolve_provider]
         cmds += ["--openevolve-model", args.openevolve_model]
         cmds += ["--openevolve-api-key-env", args.openevolve_api_key_env]
+        cmds += ["--openevolve-primary-weight", str(args.openevolve_primary_weight)]
+        cmds += ["--openevolve-secondary-provider", args.openevolve_secondary_provider]
+        cmds += ["--openevolve-secondary-model", args.openevolve_secondary_model]
+        cmds += ["--openevolve-secondary-api-key-env", args.openevolve_secondary_api_key_env]
+        cmds += ["--openevolve-secondary-weight", str(args.openevolve_secondary_weight)]
         cmds += ["--openevolve-harness", args.openevolve_harness]
+        cmds += ["--openevolve-search-mode", args.openevolve_search_mode]
+        cmds += ["--openevolve-granularity", args.openevolve_granularity]
+        cmds += ["--openevolve-leniency", args.openevolve_leniency]
+        cmds += ["--openevolve-max-unit-samples", str(args.openevolve_max_unit_samples)]
         cmds += ["--openevolve-eval-suite", args.openevolve_eval_suite]
         cmds += ["--openevolve-finalists", str(args.openevolve_finalists)]
+        cmds.append("--openevolve-budget-aggressive" if args.openevolve_budget_aggressive else "--no-openevolve-budget-aggressive")
+        cmds += ["--openevolve-target-bootstrap-count", str(args.openevolve_target_bootstrap_count)]
         cmds += ["--openevolve-llm-timeout-sec", str(args.openevolve_llm_timeout_sec)]
         cmds += ["--openevolve-llm-retries", str(args.openevolve_llm_retries)]
         cmds += ["--openevolve-llm-retry-delay-sec", str(args.openevolve_llm_retry_delay_sec)]
@@ -135,6 +158,8 @@ if __name__ == "__main__":
             cmds += ["--openevolve-reference-json", args.openevolve_reference_json]
         if args.openevolve_api_base:
             cmds += ["--openevolve-api-base", args.openevolve_api_base]
+        if args.openevolve_secondary_api_base:
+            cmds += ["--openevolve-secondary-api-base", args.openevolve_secondary_api_base]
         if args.openevolve_config:
             cmds += ["--openevolve-config", args.openevolve_config]
         if args.openevolve_output_dir:

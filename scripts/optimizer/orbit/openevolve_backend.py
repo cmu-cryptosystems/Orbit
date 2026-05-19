@@ -1722,12 +1722,12 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 bounded.get("mcts_actions")
             )
         bounded["mcts_rollout_budget"] = min(
-            6 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_rollout_budget"), 6 if budget_aggressive else 2),
+            8 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_rollout_budget"), 8 if budget_aggressive else 2),
         )
         bounded["mcts_action_cap"] = min(
-            6 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_action_cap"), 6 if budget_aggressive else 2),
+            8 if budget_aggressive else 2,
+            _int_hint(bounded.get("mcts_action_cap"), 8 if budget_aggressive else 2),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
             32 if budget_aggressive else 4,
@@ -6080,6 +6080,16 @@ def candidate_actions(
             },
         },
         {
+            "name": "budget_fulfillment_beam",
+            "prior": 0.24,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "selection_bootstrap_penalty": 1_250_000_000.0,
+            },
+        },
+        {
             "name": "repair_without_planned_bootstrap",
             "prior": 0.20,
             "policy": {
@@ -6087,6 +6097,29 @@ def candidate_actions(
                 "forbid_bootstrap": False,
                 "allow_bootstrap": False,
                 "boundary_scale_policy": "waterline",
+            },
+        },
+        {
+            "name": "candidate_low_scale_frontier",
+            "prior": 0.18,
+            "policy": {
+                **_low_scale_frontier_policy(),
+                "allow_seed_fallback": False,
+                "target_bootstrap_count": target,
+                "selection_bootstrap_penalty": 900_000_000.0,
+            },
+        },
+        {
+            "name": "candidate_relaxed_frontier",
+            "prior": 0.16,
+            "policy": {
+                **_low_scale_frontier_policy(),
+                "allow_seed_fallback": False,
+                "refresh_fanout_at_level_floor": False,
+                "min_internal_level": int(ckks["lvl_lb"]),
+                "level_drop_penalty": 0.0,
+                "target_bootstrap_count": target,
+                "selection_bootstrap_penalty": 900_000_000.0,
             },
         },
         {
@@ -6109,16 +6142,6 @@ def candidate_actions(
                 "allow_seed_fallback": False,
                 "target_bootstrap_count": target,
                 "selection_bootstrap_penalty": 750_000_000.0,
-            },
-        },
-        {
-            "name": "budget_fulfillment_beam",
-            "prior": 0.05,
-            "policy": {
-                **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
-                "direct_budget_policy": True,
-                "selection_bootstrap_penalty": 1_250_000_000.0,
             },
         },
         {

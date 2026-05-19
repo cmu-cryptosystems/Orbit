@@ -734,8 +734,9 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
     ]
     assert "budget_fulfillment_beam" in capped_names
-    assert sampled["mcts_action_cap"] <= 6
+    assert sampled["mcts_action_cap"] <= 8
     assert any(action["name"] == "latency_mcts_repair" for action in sampled["mcts_actions"])
+    assert any(action["name"] == "candidate_relaxed_frontier" for action in sampled["mcts_actions"])
 
 
 def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
@@ -828,7 +829,7 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     params = _params(toy_cost_json)
     context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
 
-    hints = PlacementMCTS(context).low_bootstrap_seed(target_bootstraps=9, action_cap=6)
+    hints = PlacementMCTS(context).low_bootstrap_seed(target_bootstraps=9, action_cap=8)
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
@@ -931,8 +932,8 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 6
-    assert captured["mcts_action_cap"] <= 6
+    assert captured["mcts_rollout_budget"] <= 8
+    assert captured["mcts_action_cap"] <= 8
     assert captured["mcts_max_repair_bootstraps"] == 32
     assert captured["boundary_state_cap"] == 1
 

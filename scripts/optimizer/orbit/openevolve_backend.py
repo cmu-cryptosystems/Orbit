@@ -1680,6 +1680,29 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
         if not isinstance(policy, dict):
             continue
         if str(policy.get("strategy", "")) == "latency_beam":
+            # Keep one cheap direct budget-fulfillment beam in sampled MCTS.
+            # The expensive global direct-beam pre-pass is still opt-in, but
+            # without any beam-shaped action sampled candidates tend to solve
+            # no QBP groups directly and only survive through seed fallback.
+            if (
+                str(item.get("name", "")) == "budget_fulfillment_beam"
+                or _bool_hint(policy.get("direct_budget_policy"), False)
+            ):
+                cheap = dict(item)
+                cheap_policy = dict(policy)
+                cheap_policy["beam_width"] = min(2, _int_hint(cheap_policy.get("beam_width"), 2))
+                cheap_policy["state_cap_per_node"] = min(
+                    4, _int_hint(cheap_policy.get("state_cap_per_node"), 4)
+                )
+                cheap_policy["max_scale_candidates"] = min(
+                    8, _int_hint(cheap_policy.get("max_scale_candidates"), 8)
+                )
+                cheap_policy["selection_bootstrap_penalty"] = max(
+                    1_500_000_000.0,
+                    _float_hint(cheap_policy.get("selection_bootstrap_penalty"), 0.0),
+                )
+                cheap["policy"] = cheap_policy
+                filtered.append(cheap)
             continue
         filtered.append(item)
     return filtered or raw_actions
@@ -2149,6 +2172,16 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
     combined_score = _finite_float(metrics.get("combined_score"), 0.0)
     if validity <= 0.0 and effective_validity <= 0.0 and combined_score < 1.0:
         return "sampled_best_solved_no_budgets"
+    candidate_qbp_coverage = _finite_float(metrics.get("candidate_qbp_coverage"), 0.0)
+    candidate_groups = _finite_float(metrics.get("candidate_solved_boundary_groups"), 0.0)
+    fallback_budgets = _finite_float(metrics.get("fallback_selected_budgets"), 0.0)
+    fallback_groups = _finite_float(metrics.get("fallback_selected_groups"), 0.0)
+    if (
+        candidate_qbp_coverage <= 0.0
+        and candidate_groups <= 0.0
+        and (fallback_budgets > 0.0 or fallback_groups > 0.0)
+    ):
+        return "sampled_best_has_no_direct_qbp_coverage"
     return None
 
 

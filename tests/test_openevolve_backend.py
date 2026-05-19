@@ -816,10 +816,15 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     assert sampled["mcts_rollout_budget"] <= 2
     assert sampled["mcts_action_cap"] <= 2
     assert sampled["mcts_max_repair_bootstraps"] <= 4
-    assert all(
-        action.get("policy", {}).get("strategy") != "latency_beam"
+    sampled_latency_actions = [
+        action
         for action in sampled["mcts_actions"]
-    )
+        if action.get("policy", {}).get("strategy") == "latency_beam"
+    ]
+    assert [action["name"] for action in sampled_latency_actions] == ["budget_fulfillment_beam"]
+    assert sampled_latency_actions[0]["policy"]["beam_width"] <= 2
+    assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 4
+    assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 8
 
 
 def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
@@ -1323,6 +1328,33 @@ def test_sampled_invalid_best_skips_expensive_full_bundle(tmp_path: Path):
     )
 
     assert oe_backend._sampled_best_invalid_reason(output_dir) == "sampled_best_solved_no_budgets"
+
+
+def test_sampled_fallback_only_best_skips_expensive_full_bundle(tmp_path: Path):
+    output_dir = tmp_path / "openevolve_output"
+    best_dir = output_dir / "best"
+    best_dir.mkdir(parents=True)
+    (best_dir / "best_program_info.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "combined_score": 0.39,
+                    "validity": 0.40,
+                    "effective_validity": 0.40,
+                    "candidate_qbp_coverage": 0.0,
+                    "candidate_solved_boundary_groups": 0,
+                    "fallback_selected_budgets": 34,
+                    "fallback_selected_groups": 11,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        oe_backend._sampled_best_invalid_reason(output_dir)
+        == "sampled_best_has_no_direct_qbp_coverage"
+    )
 
 
 def test_full_bundle_finalist_variants_include_bounded_portfolio(toy_cost_json: str, tmp_path: Path):

@@ -983,7 +983,11 @@ def test_bootstrap_mcts_batch_keeps_complete_boundary_group(
         budgets,
         le,
         params,
-        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
+        {
+            **oe_backend._bootstrap_mcts_seed_policy(params),
+            "enable_direct_budget_beam": True,
+            "allow_seed_fallback": False,
+        },
         diagnostics,
     )
 
@@ -1029,7 +1033,11 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
         budgets,
         le,
         params,
-        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
+        {
+            **oe_backend._bootstrap_mcts_seed_policy(params),
+            "enable_direct_budget_beam": True,
+            "allow_seed_fallback": False,
+        },
         diagnostics,
     )
 
@@ -1051,7 +1059,11 @@ def test_bootstrap_mcts_can_opt_into_direct_budget_beam_before_actions(toy_cost_
         [{"in_lvl": -1, "in_scl": params.Sw}],
         le,
         params,
-        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
+        {
+            **oe_backend._bootstrap_mcts_seed_policy(params),
+            "enable_direct_budget_beam": True,
+            "allow_seed_fallback": False,
+        },
         diagnostics,
     )
 
@@ -1087,7 +1099,7 @@ def test_sampled_seed_fallback_skips_latency_beam(toy_cost_json: str):
     sources = [source for source, _policy in oe_backend._seed_fallback_attempts(params)]
 
     assert "seed_fallback_latency_beam" not in sources
-    assert sources == ["seed_fallback", "seed_fallback_relaxed"]
+    assert sources == ["seed_fallback", "seed_fallback_relaxed", "seed_fallback_waterline"]
 
 
 def test_compile_harness_retries_bypass_replay_without_bypass(

@@ -3358,6 +3358,7 @@ def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
         return [
             ("seed_fallback", seed),
             ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),
+            ("seed_fallback_waterline", _waterline_seed_policy()),
         ]
     return [
         ("seed_fallback", seed),

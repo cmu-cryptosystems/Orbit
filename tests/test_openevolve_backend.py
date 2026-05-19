@@ -1031,6 +1031,27 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
     assert io_to_cost
 
 
+def test_bootstrap_mcts_uses_direct_budget_beam_before_actions(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    diagnostics = {}
+
+    solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": params.Sw}],
+        le,
+        params,
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        diagnostics,
+    )
+
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert diagnostics["selected_source_counts"] == {"candidate:direct_budget_beam": 1}
+
+
 def test_compile_harness_retries_bypass_replay_without_bypass(
     toy_cost_json: str,
     monkeypatch,

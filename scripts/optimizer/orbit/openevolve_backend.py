@@ -2863,6 +2863,23 @@ def _boundary_mcts_group_attempts(
     stats = [_MCTSNodeStats() for _ in actions]
     attempts_by_budget: dict[int, list[_BudgetAttempt]] = {idx: [] for idx in range(len(budgets))}
     seen_actions: set[str] = set()
+    direct_attempts = _direct_budget_beam_group_attempts(
+        pdag,
+        params,
+        budgets,
+        le,
+        hints,
+        diagnostics,
+    )
+    for budget_idx, attempt in direct_attempts.items():
+        attempts_by_budget[budget_idx].append(attempt)
+    if _boundary_mcts_group_target_met(
+        list(direct_attempts.values()),
+        len(budgets),
+        params,
+        hints,
+    ):
+        return attempts_by_budget
 
     for step in range(rollout_budget):
         idx = _select_mcts_action(actions, stats, step, exploration)
@@ -2922,6 +2939,56 @@ def _boundary_mcts_group_attempts(
         if _boundary_mcts_group_target_met(action_attempts, len(budgets), params, hints):
             break
     return attempts_by_budget
+
+
+def _direct_budget_beam_group_attempts(
+    pdag: Tdag,
+    params: Params,
+    budgets: list[dict],
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> dict[int, _BudgetAttempt]:
+    policy = _direct_budget_beam_policy_from_hints(hints)
+    attempts: dict[int, _BudgetAttempt] = {}
+    for budget_idx, budget in enumerate(budgets):
+        try:
+            attempts[budget_idx] = _solve_one_budget_attempt(
+                pdag,
+                params,
+                budget,
+                le,
+                "candidate:direct_budget_beam",
+                policy,
+            )
+        except Exception as exc:
+            if diagnostics is not None:
+                _record_invalid_reason(diagnostics, "candidate_invalid_reasons", exc)
+    return attempts
+
+
+def _direct_budget_beam_policy_from_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    policy = _budget_fulfillment_beam_policy()
+    for key in (
+        "bootstrap_penalty",
+        "selection_bootstrap_penalty",
+        "rescale_penalty",
+        "level_drop_penalty",
+        "scale_penalty",
+        "boundary_scale_penalty",
+        "beam_width",
+        "state_cap_per_node",
+        "max_scale_candidates",
+        "scale_lattice",
+        "min_internal_level",
+    ):
+        if key in hints:
+            policy[key] = hints[key]
+    policy["strategy"] = "latency_beam"
+    policy["allow_bootstrap"] = True
+    policy["budget_aggressive"] = True
+    policy["allow_seed_fallback"] = False
+    return _with_default_policy(policy)
 
 
 def _budget_policy_attempts(

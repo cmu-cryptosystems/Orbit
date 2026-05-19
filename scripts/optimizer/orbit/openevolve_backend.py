@@ -3522,7 +3522,7 @@ def _solve_budget_batch_boundary_mcts(
             fallback_attempt = _best_attempt(
                 attempt for attempt in attempts if attempt.source.startswith("seed_fallback")
             )
-            best_attempt = _best_attempt(attempts)
+            best_attempt = candidate_attempt or fallback_attempt or _best_attempt(attempts)
             if best_attempt is None:
                 continue
             if candidate_attempt is not None:

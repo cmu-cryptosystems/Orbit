@@ -1056,6 +1056,55 @@ def test_bootstrap_mcts_batch_keeps_complete_boundary_group(
     assert io_to_cost
 
 
+def test_bootstrap_mcts_prefers_candidate_attempt_over_cheaper_fallback(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {"in_lvl": -1, "in_scl": 40, "out_lvl": 1}
+
+    def fake_group_attempts(pdag, params_arg, group_budgets, le_arg, hints, diagnostics):
+        attempt = oe_backend._solve_one_budget_attempt(
+            pdag,
+            params_arg,
+            group_budgets[0],
+            le_arg,
+            "candidate:boundary_mcts:expensive",
+            oe_backend._default_policy_hints(),
+        )
+        return {
+            0: [
+                oe_backend._BudgetAttempt(
+                    attempt.source,
+                    attempt.assign,
+                    attempt.cost + 1e30,
+                    attempt.in_key,
+                    attempt.out_key,
+                    attempt.actual_cost,
+                )
+            ]
+        }
+
+    monkeypatch.setattr(oe_backend, "_boundary_mcts_group_attempts", fake_group_attempts)
+    diagnostics = {}
+
+    solve_budget_batch(
+        graph,
+        [budget],
+        le,
+        params,
+        {**oe_backend._bootstrap_mcts_seed_policy(params), "allow_seed_fallback": True},
+        diagnostics,
+    )
+
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert diagnostics["selected_source_counts"] == {"candidate:boundary_mcts:expensive": 1}
+
+
 def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
     toy_cost_json: str,
     monkeypatch,

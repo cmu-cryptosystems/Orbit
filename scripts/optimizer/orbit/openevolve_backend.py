@@ -2877,9 +2877,12 @@ def _boundary_mcts_group_attempts(
         invalid_reasons: Counter = Counter()
         for budget_idx, budget in enumerate(budgets):
             best_for_budget = None
-            for variant_idx, variant in enumerate(
-                _boundary_policy_variants(pdag, params, budget, hints, action.policy)
-            ):
+            variants = (
+                [action.policy]
+                if _bool_hint(action.policy.get("direct_budget_policy"), False)
+                else _boundary_policy_variants(pdag, params, budget, hints, action.policy)
+            )
+            for variant_idx, variant in enumerate(variants):
                 source = f"candidate:boundary_mcts:{action.name}:{variant_idx}"
                 try:
                     attempt = _solve_one_budget_attempt(pdag, params, budget, le, source, variant)
@@ -3469,6 +3472,7 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             {
                 **_budget_fulfillment_beam_policy(),
                 "target_bootstrap_count": target,
+                "direct_budget_policy": True,
                 "selection_bootstrap_penalty": max(
                     500_000_000.0,
                     _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
@@ -5259,6 +5263,7 @@ def candidate_actions(
             "policy": {
                 **_budget_fulfillment_beam_policy(),
                 "target_bootstrap_count": target,
+                "direct_budget_policy": True,
             },
         },
         {

@@ -219,15 +219,17 @@ class QBPManager:
         io_budgets_list = []
         for in_lvl, in_scl_to_cost in in_budgets.items():
             for in_scl in in_scl_to_cost.keys():
-                if (in_lvl, in_scl) not in dag_qbp.io_to_cost:
-                    main_o_costs = main_qbp.get_i_costs((in_lvl, in_scl))
+                for main_in_key in _main_qbp_input_keys(main_qbp, in_lvl, in_scl):
+                    if main_in_key in dag_qbp.io_to_cost:
+                        continue
+                    main_o_costs = main_qbp.get_i_costs(main_in_key)
                     if main_o_costs is None:
                         # not belong to current budget
                         continue
                     for dag_o_lvl in range(1, self.params.lvl_ub + 1):
                         io_budgets_list.append({
-                            'in_lvl': in_lvl,
-                            'in_scl': in_scl,
+                            'in_lvl': main_in_key[0],
+                            'in_scl': main_in_key[1],
                             'out_lvl': dag_o_lvl,
                             'maino_v': maino_v,
                             'main_dag_size': main_pdag_size,
@@ -424,3 +426,16 @@ class QBPManager:
         rev_qbp = QBP(pdag)
         rev_io_to_assign = self._assign_biject(io_to_assign, rev_qbp, rev_bj_label)
         return rev_io_to_assign
+
+
+def _main_qbp_input_keys(main_qbp: QBP, in_lvl: int, in_scl: int) -> list[tuple[int, int]]:
+    """Expand wildcard input levels through concrete main-QBP boundary states."""
+    if int(in_lvl) >= 0:
+        key = (int(in_lvl), int(in_scl))
+        return [key] if main_qbp.get_i_costs(key) is not None else []
+    keys = [
+        (int(key[0]), int(key[1]))
+        for key in main_qbp.get_all_costs().keys()
+        if int(key[1]) == int(in_scl)
+    ]
+    return sorted(set(keys))

@@ -107,11 +107,15 @@ def _optimize_and_emit_mlir_with_bypass_retry(
             dict(timestamps),
         )
         return
-    except AssertionError as exc:
-        if params.bpsdepth is None or "QBP not found" not in str(exc):
+    except (AssertionError, RuntimeError) as exc:
+        retryable = (
+            "QBP not found" in str(exc)
+            or "No placement solution found for the whole DAG" in str(exc)
+        )
+        if params.bpsdepth is None or not retryable:
             raise
         print(
-            "Bypass QBP registration failed; retrying compile with bypass disabled. "
+            "Bypass placement failed; retrying compile with bypass disabled. "
             f"Original error: {exc}"
         )
 

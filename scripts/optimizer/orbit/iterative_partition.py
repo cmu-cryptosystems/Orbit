@@ -36,7 +36,8 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
                 qbp_manager.add_qbp(dag, prev_cost)
             else:
                 print(f"PDAG #{dag.name} with Bypass, Main PDAG size: {len(main_pdag.nodes)} nodes, Bypass PDAG size: {len(bypass_pdag.nodes)} nodes")
-                solve_partition(main_pdag, qbp_manager, prev_cost, le, params)
+                main_partition_result = solve_partition(main_pdag, qbp_manager, prev_cost, le, params)
+                _register_partition_result(qbp_manager, main_pdag, main_partition_result)
                 qbp_manager.add_qbp_bypass(dag, main_pdag, bypass_pdag, prev_cost)
         print(f"Partition solving time for PDAG #{dag.name}: {time.time() - start_time:.2f} seconds")
         # orbit_core unpacks this pair; a bare return here used to yield None and crash.
@@ -166,3 +167,15 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
     else:
         # for whole dag, no need to add to qbp_manager
         return dag_io_to_assign, dag_io_to_cost
+
+
+def _register_partition_result(qbp_manager: QBPManager, pdag: Tdag, partition_result):
+    """Register whole-subgraph partition results needed by enclosing bypass merges."""
+    if pdag.name in qbp_manager.pdag_name_to_qbp:
+        return
+    if partition_result is None:
+        return
+    io_to_assign, io_to_cost = partition_result
+    if io_to_assign is None or io_to_cost is None:
+        return
+    qbp_manager.add_qbp_existing(pdag, io_to_cost, io_to_assign)

@@ -435,6 +435,7 @@ def place(context):
         "level_drop_penalty": 20000000.0,
         "min_internal_level": None,
         "scale_penalty": 0.0,
+        "boundary_scale_penalty": 0.2,
         "beam_width": 4,
         "state_cap_per_node": 8,
         "scale_lattice": "default",
@@ -1196,6 +1197,10 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 128 if budget_aggressive else 4,
             ),
         )
+        bounded["boundary_state_cap"] = min(
+            3 if budget_aggressive else 2,
+            _int_hint(bounded.get("boundary_state_cap"), 3 if budget_aggressive else 2),
+        )
     if isinstance(portfolio, list) and portfolio:
         sampled_portfolio = [
             _bounded_sampled_policy(item)
@@ -1250,6 +1255,10 @@ def _finalist_hints_for_full_bundle(hints: dict[str, Any]) -> dict[str, Any]:
         bounded["mcts_max_repair_bootstraps"] = min(
             16 if budget_aggressive else 8,
             _int_hint(bounded.get("mcts_max_repair_bootstraps"), 12 if budget_aggressive else 6),
+        )
+        bounded["boundary_state_cap"] = min(
+            4 if budget_aggressive else 3,
+            _int_hint(bounded.get("boundary_state_cap"), 4 if budget_aggressive else 3),
         )
     return bounded
 
@@ -2472,16 +2481,28 @@ def solve_budget_batch(
     io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
     hints = _with_default_policy(hints)
     if diagnostics is not None:
-        diagnostics["requested_budgets"] = len(io_budgets_list)
-        diagnostics["solved_budgets"] = 0
-        diagnostics["candidate_solved_budgets"] = 0
-        diagnostics["fallback_solved_budgets"] = 0
-        diagnostics["fallback_selected_budgets"] = 0
-        diagnostics["candidate_improved_budgets"] = 0
-        diagnostics["costs"] = []
-        diagnostics["candidate_costs"] = []
-        diagnostics["assignments"] = []
-        diagnostics["selected_source_counts"] = {}
+        _init_budget_diagnostics(diagnostics, len(io_budgets_list))
+    if str(hints.get("strategy")) == "bootstrap_mcts":
+        if (
+            not getattr(params, "openevolve_evaluating_candidate", False)
+            and int(getattr(params, "openevolve_iterations", 0) or 0) == 0
+            and not getattr(params, "openevolve_compile_hints", None)
+        ):
+            return _solve_budget_batch_fast_seed(
+                pdag,
+                io_budgets_list,
+                le,
+                params,
+                diagnostics,
+            )
+        return _solve_budget_batch_boundary_mcts(
+            pdag,
+            io_budgets_list,
+            le,
+            params,
+            hints,
+            diagnostics,
+        )
     for io_budget in io_budgets_list:
         attempts: list[_BudgetAttempt] = []
         last_error = None
@@ -2521,30 +2542,265 @@ def solve_budget_batch(
             continue
 
         if diagnostics is not None:
-            diagnostics["solved_budgets"] += 1
-            diagnostics["costs"].append(best_attempt.cost)
-            diagnostics["assignments"].append(best_attempt.assign)
-            if candidate_attempt is not None:
-                diagnostics["candidate_solved_budgets"] += 1
-                diagnostics["candidate_costs"].append(candidate_attempt.cost)
-            if fallback_attempt is not None:
-                diagnostics["fallback_solved_budgets"] += 1
-            if best_attempt.source.startswith("seed_fallback"):
-                diagnostics["fallback_selected_budgets"] += 1
-            source_counts = diagnostics["selected_source_counts"]
-            source_counts[best_attempt.source] = source_counts.get(best_attempt.source, 0) + 1
-            if (
-                candidate_attempt is not None
-                and fallback_attempt is not None
-                and candidate_attempt.cost + 1e-9 < fallback_attempt.cost
-            ):
-                diagnostics["candidate_improved_budgets"] += 1
+            _record_selected_attempt(diagnostics, best_attempt, candidate_attempt, fallback_attempt)
 
         current = io_to_cost.get(best_attempt.in_key, {}).get(best_attempt.out_key)
         if current is None or best_attempt.cost < current:
             io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
             io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
     return io_to_assign, io_to_cost
+
+
+def _solve_budget_batch_fast_seed(
+    pdag: Tdag,
+    io_budgets_list: list[dict],
+    le: LatencyEstimator,
+    params: Params,
+    diagnostics: dict[str, Any] | None,
+) -> tuple[
+    dict[tuple[int, int], dict[tuple[int, int], Assign]],
+    dict[tuple[int, int], dict[tuple[int, int], float]],
+]:
+    io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
+    io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
+    fallback_source, fallback_policy = _seed_fallback_attempts(params)[0]
+    for io_budget in io_budgets_list:
+        try:
+            best_attempt = _solve_one_budget_attempt(
+                pdag,
+                params,
+                io_budget,
+                le,
+                fallback_source,
+                fallback_policy,
+            )
+        except Exception as exc:
+            if diagnostics is not None:
+                _record_invalid_reason(diagnostics, "invalid_reasons", exc)
+            continue
+        if diagnostics is not None:
+            _record_selected_attempt(diagnostics, best_attempt, None, best_attempt)
+        current = io_to_cost.get(best_attempt.in_key, {}).get(best_attempt.out_key)
+        if current is None or best_attempt.cost < current:
+            io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
+            io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
+    return io_to_assign, io_to_cost
+
+
+def _init_budget_diagnostics(diagnostics: dict[str, Any], requested_budgets: int) -> None:
+    diagnostics["requested_budgets"] = requested_budgets
+    diagnostics["solved_budgets"] = 0
+    diagnostics["candidate_solved_budgets"] = 0
+    diagnostics["fallback_solved_budgets"] = 0
+    diagnostics["fallback_selected_budgets"] = 0
+    diagnostics["candidate_improved_budgets"] = 0
+    diagnostics["costs"] = []
+    diagnostics["candidate_costs"] = []
+    diagnostics["assignments"] = []
+    diagnostics["selected_source_counts"] = {}
+
+
+def _record_selected_attempt(
+    diagnostics: dict[str, Any],
+    best_attempt: _BudgetAttempt,
+    candidate_attempt: _BudgetAttempt | None,
+    fallback_attempt: _BudgetAttempt | None,
+) -> None:
+    diagnostics["solved_budgets"] += 1
+    diagnostics["costs"].append(best_attempt.cost)
+    diagnostics["assignments"].append(best_attempt.assign)
+    if candidate_attempt is not None:
+        diagnostics["candidate_solved_budgets"] += 1
+        diagnostics["candidate_costs"].append(candidate_attempt.cost)
+    if fallback_attempt is not None:
+        diagnostics["fallback_solved_budgets"] += 1
+    if best_attempt.source.startswith("seed_fallback"):
+        diagnostics["fallback_selected_budgets"] += 1
+    source_counts = diagnostics["selected_source_counts"]
+    source_counts[best_attempt.source] = source_counts.get(best_attempt.source, 0) + 1
+    if (
+        candidate_attempt is not None
+        and fallback_attempt is not None
+        and candidate_attempt.cost + 1e-9 < fallback_attempt.cost
+    ):
+        diagnostics["candidate_improved_budgets"] += 1
+
+
+def _solve_budget_batch_boundary_mcts(
+    pdag: Tdag,
+    io_budgets_list: list[dict],
+    le: LatencyEstimator,
+    params: Params,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> tuple[
+    dict[tuple[int, int], dict[tuple[int, int], Assign]],
+    dict[tuple[int, int], dict[tuple[int, int], float]],
+]:
+    io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
+    io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
+    for _group_key, budgets in _budget_boundary_groups(io_budgets_list).items():
+        group_attempts = _boundary_mcts_group_attempts(pdag, params, budgets, le, hints, diagnostics)
+        for index, io_budget in enumerate(budgets):
+            attempts = list(group_attempts.get(index, []))
+            last_error = None
+            record = _placement_record_for_budget(hints, pdag.name, io_budget)
+            if record is not None:
+                try:
+                    attempts.append(_solve_one_record_attempt(pdag, params, io_budget, le, record))
+                except Exception as exc:
+                    last_error = exc
+                    if diagnostics is not None:
+                        _record_invalid_reason(diagnostics, "candidate_invalid_reasons", exc)
+            if _should_use_seed_fallback(hints):
+                for source, policy_hints in _seed_fallback_attempts(params):
+                    try:
+                        attempts.append(_solve_one_budget_attempt(pdag, params, io_budget, le, source, policy_hints))
+                    except Exception as exc:
+                        last_error = exc
+            if not attempts:
+                if diagnostics is not None:
+                    _record_invalid_reason(
+                        diagnostics,
+                        "invalid_reasons",
+                        last_error or PlacementError("no feasible boundary-mcts placement policy"),
+                    )
+                continue
+            candidate_attempt = _best_attempt(
+                attempt for attempt in attempts if attempt.source.startswith("candidate")
+            )
+            fallback_attempt = _best_attempt(
+                attempt for attempt in attempts if attempt.source.startswith("seed_fallback")
+            )
+            best_attempt = _best_attempt(attempts)
+            if best_attempt is None:
+                continue
+            if diagnostics is not None:
+                _record_selected_attempt(diagnostics, best_attempt, candidate_attempt, fallback_attempt)
+            current = io_to_cost.get(best_attempt.in_key, {}).get(best_attempt.out_key)
+            if current is None or best_attempt.cost < current:
+                io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
+                io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
+    return io_to_assign, io_to_cost
+
+
+def _budget_boundary_groups(io_budgets_list: list[dict]) -> dict[tuple, list[dict]]:
+    groups: dict[tuple, list[dict]] = {}
+    for budget in io_budgets_list:
+        key = (
+            int(budget.get("in_lvl", -1)),
+            int(budget.get("in_scl", -1)),
+            str(budget.get("maino_v", "")),
+            int(budget.get("main_dag_size", 0) or 0),
+        )
+        groups.setdefault(key, []).append(budget)
+    for budgets in groups.values():
+        budgets.sort(key=lambda item: int(item.get("out_lvl", -1)))
+    return groups
+
+
+def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
+    seed = _default_policy_hints()
+    beam = _low_scale_frontier_policy()
+    beam.update(
+        {
+            "strategy": "latency_beam",
+            "allow_bootstrap": True,
+            "budget_aggressive": True,
+            "selection_bootstrap_penalty": 500_000_000.0,
+            "beam_width": 3,
+            "state_cap_per_node": 8,
+            "max_scale_candidates": 16,
+        }
+    )
+    if not getattr(params, "openevolve_evaluating_candidate", False):
+        return [("seed_fallback_latency_beam", beam)]
+    return [
+        ("seed_fallback", seed),
+        ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),
+        ("seed_fallback_latency_beam", beam),
+    ]
+
+
+def _boundary_mcts_group_attempts(
+    pdag: Tdag,
+    params: Params,
+    budgets: list[dict],
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> dict[int, list[_BudgetAttempt]]:
+    policy = _policy_options(hints, params)
+    actions = _mcts_actions_from_hints(hints, params)
+    rollout_budget = max(len(actions), int(policy["mcts_rollout_budget"]))
+    exploration = float(policy["mcts_exploration_weight"])
+    max_repair_bootstraps = int(policy["mcts_max_repair_bootstraps"])
+    if not getattr(params, "openevolve_evaluating_candidate", False):
+        selected = next(
+            (action for action in actions if _bool_hint(action.policy.get("allow_bootstrap"), False)),
+            actions[0],
+        )
+        actions = [selected]
+        rollout_budget = 1
+    stats = [_MCTSNodeStats() for _ in actions]
+    attempts_by_budget: dict[int, list[_BudgetAttempt]] = {idx: [] for idx in range(len(budgets))}
+    seen_actions: set[str] = set()
+
+    for step in range(rollout_budget):
+        idx = _select_mcts_action(actions, stats, step, exploration)
+        action = actions[idx]
+        action_digest = json.dumps(action.policy, sort_keys=True, default=str)
+        if action_digest in seen_actions and step >= len(actions):
+            stats[idx].visits += 1
+            stats[idx].reward_sum += _mcts_invalid_reward(action, step)
+            continue
+        seen_actions.add(action_digest)
+        action_attempts: list[_BudgetAttempt] = []
+        invalid_reasons: Counter = Counter()
+        for budget_idx, budget in enumerate(budgets):
+            best_for_budget = None
+            for variant_idx, variant in enumerate(
+                _boundary_policy_variants(pdag, params, budget, hints, action.policy)
+            ):
+                source = f"candidate:boundary_mcts:{action.name}:{variant_idx}"
+                try:
+                    attempt = _solve_one_budget_attempt(pdag, params, budget, le, source, variant)
+                    counts = _maintenance_counts(attempt.assign)
+                    if max_repair_bootstraps >= 0 and counts["bootstrap"] > max_repair_bootstraps:
+                        raise PlacementError(
+                            f"boundary-mcts rollout exceeded bootstrap repair cap "
+                            f"({counts['bootstrap']} > {max_repair_bootstraps})"
+                        )
+                    if best_for_budget is None or attempt.cost < best_for_budget.cost:
+                        best_for_budget = attempt
+                except Exception as exc:
+                    invalid_reasons[f"{type(exc).__name__}: {str(exc)[:160]}"] += 1
+            if best_for_budget is not None:
+                attempts_by_budget[budget_idx].append(best_for_budget)
+                action_attempts.append(best_for_budget)
+
+        reward = _boundary_mcts_group_reward(action_attempts, len(budgets), params, hints)
+        stats[idx].visits += 1
+        stats[idx].reward_sum += reward
+        if action_attempts:
+            best_cost = min(attempt.cost for attempt in action_attempts)
+            best_assign = min(action_attempts, key=lambda attempt: attempt.cost).assign
+            if reward > stats[idx].best_reward:
+                stats[idx].best_reward = reward
+                stats[idx].best_assign = best_assign
+                stats[idx].best_cost = best_cost
+        else:
+            stats[idx].reward_sum += _mcts_invalid_reward(action, step)
+            if diagnostics is not None:
+                for reason, count in invalid_reasons.most_common(3):
+                    diagnostics.setdefault("candidate_invalid_reasons", {})[
+                        f"{action.name}: {reason}"
+                    ] = diagnostics.setdefault("candidate_invalid_reasons", {}).get(
+                        f"{action.name}: {reason}", 0
+                    ) + count
+        if _boundary_mcts_group_target_met(action_attempts, len(budgets), params, hints):
+            break
+    return attempts_by_budget
 
 
 def _budget_policy_attempts(
@@ -2811,6 +3067,178 @@ def _latency_beam_variants(hints: dict[str, Any], params: Params) -> list[dict[s
     return [_with_default_policy(variant) for variant in variants[:width]]
 
 
+def _boundary_policy_variants(
+    tdag: Tdag,
+    params: Params,
+    io_budget: dict,
+    root_hints: dict[str, Any],
+    action_policy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    pdag_vout = list(tdag.outputs)[0]
+    base = _with_default_policy(action_policy)
+    if str(base.get("strategy")) == "bootstrap_mcts":
+        base["strategy"] = "level_preserving"
+    scales = _boundary_scale_candidates(tdag, params, io_budget, base)
+    if not scales:
+        scales = [params.scale_lower_bound(pdag_vout, tdag.nodes[pdag_vout], "out")]
+    state_cap = max(
+        1,
+        min(
+            8,
+            _int_hint(base.get("state_cap_per_node"), 8),
+            _int_hint(base.get("boundary_state_cap"), 3),
+        ),
+    )
+    scales = scales[:state_cap]
+    anchors = _bootstrap_anchor_nodes(tdag, params, root_hints, base)
+    variants: list[dict[str, Any]] = []
+    for scale in scales:
+        variant = dict(base)
+        node_levels = dict(_int_map(base.get("preferred_node_levels", {})))
+        node_scales = dict(_int_map(base.get("preferred_node_scales", {})))
+        node_scales[pdag_vout] = int(scale)
+        if int(io_budget.get("out_lvl", -1)) >= 0:
+            node_levels[pdag_vout] = int(io_budget["out_lvl"])
+        for anchor in anchors:
+            node_levels[anchor] = _anchor_output_level(params, base)
+            node_scales[anchor] = max(
+                params.scale_lower_bound(anchor, tdag.nodes[anchor], "out"),
+                min(params.Sf, params.Sw),
+            )
+        variant["preferred_node_levels"] = node_levels
+        variant["preferred_node_scales"] = node_scales
+        variants.append(_with_default_policy(variant))
+    return variants
+
+
+def _boundary_scale_candidates(
+    tdag: Tdag,
+    params: Params,
+    io_budget: dict,
+    policy: dict[str, Any],
+) -> list[int]:
+    pdag_vout = list(tdag.outputs)[0]
+    lower = params.scale_lower_bound(pdag_vout, tdag.nodes[pdag_vout], "out")
+    out_lvl = int(io_budget.get("out_lvl", -1))
+    upper = int(policy.get("max_scale", _max_scale(params)))
+    if out_lvl >= 0:
+        upper = min(upper, params.boundary_output_scale_bound(out_lvl))
+    if upper < lower:
+        return []
+    values = [
+        lower,
+        params.Sw,
+        params.Csw,
+        params.Sf,
+        policy.get("preferred_boundary_scale"),
+        policy.get("boundary_scale"),
+    ]
+    mode = str(policy.get("boundary_scale_policy", "frontier"))
+    if mode == "low":
+        values.extend([lower + params.Sf, lower + 2 * params.Sf])
+    elif mode == "waterline":
+        values.extend([params.Sw, params.Sw + params.Sf, max(lower, params.Sw - params.Sf)])
+    elif mode == "sf":
+        values.extend([params.Sf, params.Sf + params.Sw, params.Sf * 2])
+    else:
+        values.extend([lower, params.Sw, params.Sf, upper, max(lower, upper - params.Sf)])
+    return _scale_candidates(values, lower, upper, params, policy)
+
+
+def _bootstrap_anchor_nodes(
+    tdag: Tdag,
+    params: Params,
+    root_hints: dict[str, Any],
+    policy: dict[str, Any],
+) -> list[str]:
+    explicit = policy.get("bootstrap_anchors") or root_hints.get("bootstrap_anchors")
+    if isinstance(explicit, list):
+        anchors = [
+            str(node)
+            for node in explicit
+            if str(node) in tdag.nodes and tdag.nodes[str(node)].get("op") not in {"input", "constant"}
+        ]
+        if anchors:
+            return anchors[: max(0, _int_hint(policy.get("bootstrap_anchor_count"), len(anchors)))]
+    count = max(0, min(64, _int_hint(policy.get("bootstrap_anchor_count"), 0)))
+    if count == 0:
+        return []
+    depths = _node_depths(tdag)
+
+    def rank(node: str) -> tuple[float, int, int, str]:
+        attrs = dict(tdag.nodes[node])
+        nonlinear_bonus = 1 if _node_nonlinear_kind(attrs) else 0
+        op_bonus = 1 if attrs.get("op") == "mul" else 0
+        fanout = int(tdag.out_degree(node))
+        return (-(2 * nonlinear_bonus + op_bonus), -fanout, -depths.get(node, 0), node)
+
+    candidates = [
+        str(node)
+        for node in tdag.nodes
+        if tdag.nodes[node].get("op") not in {"input", "constant"}
+    ]
+    return sorted(candidates, key=rank)[:count]
+
+
+def _node_depths(tdag: Tdag) -> dict[str, int]:
+    depths: dict[str, int] = {}
+    for node in nx.topological_sort(tdag):
+        preds = list(tdag.predecessors(node))
+        depths[str(node)] = 0 if not preds else 1 + max(depths.get(str(pred), 0) for pred in preds)
+    return depths
+
+
+def _anchor_output_level(params: Params, policy: dict[str, Any]) -> int:
+    preferred = _int_hint(policy.get("bootstrap_anchor_level"), params.bts_ub)
+    return max(params.bts_lb + 1, min(params.lvl_ub, preferred))
+
+
+def _boundary_mcts_group_reward(
+    attempts: list[_BudgetAttempt],
+    requested: int,
+    params: Params,
+    hints: dict[str, Any],
+) -> float:
+    if requested <= 0:
+        return 0.0
+    coverage = len(attempts) / requested
+    if not attempts:
+        return -0.1
+    summary = _assignment_count_summary([attempt.assign for attempt in attempts])
+    target = max(
+        0,
+        _int_hint(
+            hints.get("target_bootstrap_count"),
+            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
+        ),
+    )
+    bootstrap_score = _target_bootstrap_score(target, summary["avg_bootstrap"], None)
+    rescale_score = 1.0 / (1.0 + summary["avg_rescale"] / 32.0)
+    cost_score = 1.0 / (1.0 + (sum(attempt.cost for attempt in attempts) / len(attempts)) / 1_000_000_000.0)
+    return 0.50 * coverage + 0.30 * bootstrap_score + 0.12 * rescale_score + 0.08 * cost_score
+
+
+def _boundary_mcts_group_target_met(
+    attempts: list[_BudgetAttempt],
+    requested: int,
+    params: Params,
+    hints: dict[str, Any],
+) -> bool:
+    if requested <= 0 or len(attempts) < requested:
+        return False
+    target = max(
+        0,
+        _int_hint(
+            hints.get("target_bootstrap_count"),
+            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
+        ),
+    )
+    if target <= 0:
+        return False
+    summary = _assignment_count_summary([attempt.assign for attempt in attempts])
+    return summary["avg_bootstrap"] <= target
+
+
 def _build_bootstrap_mcts_assign(
     tdag: Tdag,
     params: Params,
@@ -2911,8 +3339,12 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "rescale_penalty": max(0.0, _float_hint(base.get("rescale_penalty"), 0.0)),
             "level_drop_penalty": max(0.0, _float_hint(base.get("level_drop_penalty"), 0.0)),
             "scale_lattice": str(base.get("scale_lattice", "waterline_sf")),
+            "boundary_scale_policy": str(base.get("boundary_scale_policy", "frontier")),
+            "boundary_state_cap": max(1, min(8, _int_hint(base.get("boundary_state_cap"), 3))),
+            "bootstrap_anchor_count": max(0, _int_hint(base.get("bootstrap_anchor_count"), 0)),
         }
     )
+    target = max(0, _int_hint(base.get("target_bootstrap_count"), 0))
     variants = [
         (
             "strict_no_bootstrap",
@@ -2921,6 +3353,8 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "forbid_bootstrap": True,
                 "allow_bootstrap": False,
                 "max_scale_candidates": min(32, max(20, _int_hint(base.get("max_scale_candidates"), 24))),
+                "boundary_scale_policy": "low",
+                "bootstrap_anchor_count": 0,
             },
             0.30,
         ),
@@ -2931,6 +3365,8 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "forbid_bootstrap": False,
                 "allow_bootstrap": False,
                 "max_scale_candidates": min(32, max(24, _int_hint(base.get("max_scale_candidates"), 24))),
+                "boundary_scale_policy": "waterline",
+                "bootstrap_anchor_count": 0,
             },
             0.20,
         ),
@@ -2946,6 +3382,8 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 ),
                 "level_drop_penalty": 0.0,
                 "rescale_penalty": max(25_000.0, _float_hint(base.get("rescale_penalty"), 0.0)),
+                "boundary_scale_policy": "frontier",
+                "bootstrap_anchor_count": max(1, min(4, target or 2)),
             },
             0.10,
         ),
@@ -2962,6 +3400,8 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "selection_bootstrap_penalty": max(
                     300_000_000.0, _float_hint(base.get("selection_bootstrap_penalty"), 0.0)
                 ),
+                "boundary_scale_policy": "sf",
+                "bootstrap_anchor_count": max(1, min(6, target or 3)),
             },
             0.0,
         ),
@@ -2976,6 +3416,8 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "bootstrap_penalty": max(3_000_000_000.0, _float_hint(base.get("bootstrap_penalty"), 0.0)),
                 "reserve_penalty": max(100_000.0, _float_hint(base.get("reserve_penalty"), 0.0)),
                 "min_transition_reserve": max(2, _int_hint(base.get("min_transition_reserve"), 0)),
+                "boundary_scale_policy": "frontier",
+                "bootstrap_anchor_count": max(1, min(8, target or 4)),
             },
             -0.10,
         ),
@@ -3042,6 +3484,12 @@ def _policy_assignment_score(
     params: Params,
 ) -> float:
     score = _assignment_score(assign, le)
+    boundary_scale_penalty = _float_hint(hints.get("boundary_scale_penalty"), 0.2)
+    if boundary_scale_penalty > 0.0 and le is not None and assign.tdag.outputs:
+        pdag_vout = list(assign.tdag.outputs)[0]
+        output_scale = int(assign.v_scl_out.get(pdag_vout, 0))
+        rescale_cost = float(le.lin_op_lmaps["rescale_single"][1])
+        score += boundary_scale_penalty * rescale_cost * assign.tdag.get_full_size() * output_scale
     selection_bootstrap_penalty = _float_hint(hints.get("selection_bootstrap_penalty"), 0.0)
     if selection_bootstrap_penalty > 0.0:
         counts = _aggregate_counts([assign])
@@ -3181,7 +3629,7 @@ def _zero_iteration_portfolio_hints() -> dict[str, Any]:
 
 def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
     target = int(getattr(params, "openevolve_target_bootstrap_count", 0) or 0) if params else 0
-    rollout_budget = 48 if params is None else max(8, min(256, int(getattr(params, "openevolve_mcts_rollout_budget", 48))))
+    rollout_budget = 2 if params is None else max(2, min(16, int(getattr(params, "openevolve_mcts_rollout_budget", 2))))
     budget_aggressive = bool(getattr(params, "openevolve_budget_aggressive", False)) if params else False
     sampled_repair_cap = 128 if budget_aggressive else max(4, target)
     policy = _low_scale_frontier_policy()
@@ -3210,7 +3658,8 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
             "mcts_exploration_weight": 1.4,
             "mcts_max_repair_bootstraps": sampled_repair_cap,
             "target_bootstrap_count": target,
-            "mcts_action_cap": 24,
+            "mcts_action_cap": 2,
+            "boundary_state_cap": 1,
         }
     )
     return policy
@@ -3344,6 +3793,7 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
         "level_drop_penalty": max(0.0, _float_hint(hints.get("level_drop_penalty"), 20_000_000.0)),
         "min_internal_level": min_internal_level,
         "scale_penalty": max(0.0, _float_hint(hints.get("scale_penalty"), 0.0)),
+        "boundary_scale_penalty": max(0.0, _float_hint(hints.get("boundary_scale_penalty"), 0.2)),
         "reserve_penalty": max(0.0, _float_hint(hints.get("reserve_penalty"), 0.0)),
         "min_transition_reserve": max(
             0,
@@ -3361,7 +3811,7 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             0.0, min(8.0, _float_hint(hints.get("mcts_exploration_weight"), 1.4))
         ),
         "mcts_max_repair_bootstraps": max(
-            0, min(64, _int_hint(hints.get("mcts_max_repair_bootstraps"), 4))
+            0, min(1024, _int_hint(hints.get("mcts_max_repair_bootstraps"), 4))
         ),
         "max_scale": _max_scale(params),
     }
@@ -4292,6 +4742,14 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
         "mcts_rollout_budget",
         "mcts_exploration_weight",
         "mcts_max_repair_bootstraps",
+        "mcts_action_cap",
+        "boundary_scale_policy",
+        "boundary_state_cap",
+        "preferred_boundary_scale",
+        "boundary_scale",
+        "bootstrap_anchor_count",
+        "bootstrap_anchor_level",
+        "bootstrap_anchors",
     ]
     summary = {key: hints.get(key) for key in keys if key in hints}
     for key in ("preferred_node_levels", "preferred_node_scales", "preferred_edge_scales"):
@@ -4660,6 +5118,9 @@ def candidate_actions(
         "state_cap_per_node": 16,
         "scale_lattice": "waterline_sf",
         "target_bootstrap_count": target,
+        "boundary_scale_policy": "frontier",
+        "boundary_state_cap": 2,
+        "bootstrap_anchor_count": 0,
     }
     actions: list[dict[str, Any]] = [
         {
@@ -4669,6 +5130,7 @@ def candidate_actions(
                 **base,
                 "forbid_bootstrap": True,
                 "allow_bootstrap": False,
+                "boundary_scale_policy": "low",
             },
         },
         {
@@ -4678,6 +5140,7 @@ def candidate_actions(
                 **base,
                 "forbid_bootstrap": False,
                 "allow_bootstrap": False,
+                "boundary_scale_policy": "waterline",
             },
         },
         {
@@ -4687,6 +5150,8 @@ def candidate_actions(
                 **base,
                 "forbid_bootstrap": False,
                 "allow_bootstrap": True,
+                "boundary_scale_policy": "frontier",
+                "bootstrap_anchor_count": max(1, min(4, target or 2)),
             },
         },
         {
@@ -4697,6 +5162,8 @@ def candidate_actions(
                 "strategy": "latency_beam",
                 "forbid_bootstrap": False,
                 "allow_bootstrap": True,
+                "boundary_scale_policy": "sf",
+                "bootstrap_anchor_count": max(1, min(6, target or 3)),
             },
         },
     ]
@@ -5730,7 +6197,11 @@ def _sanitize_policy_values(
     clamp_int("beam_width", 1, 8)
     clamp_int("state_cap_per_node", 1, 32)
     clamp_int("mcts_rollout_budget", 1, 256)
-    clamp_int("mcts_max_repair_bootstraps", 0, 64)
+    clamp_int("mcts_max_repair_bootstraps", 0, 1024)
+    clamp_int("mcts_action_cap", 1, 64)
+    clamp_int("boundary_state_cap", 1, 8)
+    clamp_int("bootstrap_anchor_count", 0, 64)
+    clamp_int("bootstrap_anchor_level", int(ckks["lvl_lb"]), int(ckks["lvl_ub"]))
     if policy.get("min_internal_level") is not None:
         original = policy["min_internal_level"]
         value = max(int(ckks["lvl_lb"]), min(int(ckks["lvl_ub"]), _int_hint(original, int(ckks["lvl_lb"]))))
@@ -5969,6 +6440,7 @@ _PATCHABLE_POLICY_KEYS = {
     "level_drop_penalty",
     "min_internal_level",
     "scale_penalty",
+    "boundary_scale_penalty",
     "reserve_penalty",
     "min_transition_reserve",
     "min_decryptability_reserve",
@@ -5980,6 +6452,14 @@ _PATCHABLE_POLICY_KEYS = {
     "mcts_rollout_budget",
     "mcts_exploration_weight",
     "mcts_max_repair_bootstraps",
+    "mcts_action_cap",
+    "boundary_scale_policy",
+    "boundary_state_cap",
+    "preferred_boundary_scale",
+    "boundary_scale",
+    "bootstrap_anchor_count",
+    "bootstrap_anchor_level",
+    "bootstrap_anchors",
 }
 
 

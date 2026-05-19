@@ -205,7 +205,7 @@ python3 -m scripts.optimizer.orbit.optimizer \
   --maxlevel 6 \
   --waterscale 40 \
   --placement-backend openevolve \
-  --openevolve-iterations 50 \
+  --openevolve-iterations 100 \
   --openevolve-search-mode bootstrap-mcts \
   --openevolve-parallel-evaluations 8 \
   --openevolve-model gemini-3.1-flash-lite \

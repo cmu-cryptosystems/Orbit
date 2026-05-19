@@ -934,6 +934,77 @@ def test_bootstrap_mcts_seed_solves_toy_without_more_bootstraps_than_legacy(toy_
     assert mcts_counts["bootstrap"] <= legacy_counts["bootstrap"]
 
 
+def test_bootstrap_mcts_batch_keeps_complete_boundary_group(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budgets = [
+        {"in_lvl": -1, "in_scl": 40, "out_lvl": level}
+        for level in range(1, params.lvl_ub + 1)
+    ]
+    captured_groups = []
+
+    def fake_group_attempts(pdag, params_arg, group_budgets, le_arg, hints, diagnostics):
+        captured_groups.append([budget["out_lvl"] for budget in group_budgets])
+        attempts = {}
+        for idx, budget in enumerate(group_budgets):
+            attempt = oe_backend._solve_one_budget_attempt(
+                pdag,
+                params_arg,
+                budget,
+                le_arg,
+                "candidate:boundary_mcts:test",
+                oe_backend._default_policy_hints(),
+            )
+            attempts[idx] = [attempt]
+        return attempts
+
+    monkeypatch.setattr(oe_backend, "_boundary_mcts_group_attempts", fake_group_attempts)
+    diagnostics = {}
+
+    io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        budgets,
+        le,
+        params,
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        diagnostics,
+    )
+
+    assert captured_groups == [list(range(1, params.lvl_ub + 1))]
+    assert diagnostics["requested_budgets"] == params.lvl_ub
+    assert diagnostics["candidate_solved_budgets"] == params.lvl_ub
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert io_to_assign
+    assert io_to_cost
+
+
+def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    policy = oe_backend._with_default_policy(
+        {
+            "boundary_scale_policy": "sf",
+            "max_scale_candidates": 32,
+        }
+    )
+
+    candidates = oe_backend._boundary_scale_candidates(
+        graph,
+        params,
+        {"in_lvl": -1, "in_scl": 40, "out_lvl": 1},
+        policy,
+    )
+
+    assert candidates
+    assert all(scale <= params.boundary_output_scale_bound(1) for scale in candidates)
+    assert all(scale >= params.scale_lower_bound("0", graph.nodes["0"], "out") for scale in candidates)
+
+
 def test_sampled_invalid_best_skips_expensive_full_bundle(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_dir = output_dir / "best"
@@ -2174,7 +2245,9 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
     worker.get_qbp(graph, [{"in_lvl": -1, "in_scl": 40}])
 
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] >= 8
+    assert captured["mcts_rollout_budget"] >= 2
+    assert captured["mcts_action_cap"] <= 2
+    assert captured["boundary_state_cap"] == 1
     assert captured["selection_bootstrap_penalty"] > 0
 
 

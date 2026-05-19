@@ -43,9 +43,13 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
     ilp_times['QBP Manager Init Time'] = time.time() - start_time
     
     start_time = time.time()
-    io_to_assign, io_to_cost = solve_partition(dag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+    partition_result = solve_partition(dag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
     ilp_times['Placement-QBP Time'] = time.time() - start_time
     ilp_times['ILP-QBP Time'] = ilp_times['Placement-QBP Time']
+    if partition_result is None:
+        print("Error: No solution found for whole DAG", file=sys.stderr)
+        return None, ilp_times
+    io_to_assign, io_to_cost = partition_result
     
     if io_to_assign is None or io_to_cost is None:
         print("Error: No solution found for whole DAG", file=sys.stderr)

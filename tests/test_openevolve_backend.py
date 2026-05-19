@@ -713,7 +713,9 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     )
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
     program_path = tmp_path / "initial.py"
-    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+    source = oe_backend._initial_compile_program_source("bootstrap-mcts")
+    assert "builder.budget_fulfillment_beam" not in source
+    program_path.write_text(source, encoding="utf-8")
 
     hints = oe_backend._load_candidate_hints(program_path, context)
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")

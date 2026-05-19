@@ -448,7 +448,59 @@ def place(context):
 '''
 
 
-def _initial_compile_program_source() -> str:
+def _initial_compile_program_source(search_mode: str | None = None) -> str:
+    if search_mode == "bootstrap-mcts":
+        return '''"""Initial compile-level OpenEvolve bootstrap-MCTS placement algorithm."""
+
+from scripts.optimizer.orbit.openevolve_backend import PlacementMCTS
+
+
+# EVOLVE-BLOCK-START
+def place(context):
+    """Return an Orbit bootstrap-MCTS placement policy.
+
+    Mutate this active policy directly: action priors, beam settings, scale
+    candidates, repair aggressiveness, and exploration settings all affect
+    sampled and finalist scoring. Orbit validates and repairs every assignment.
+    """
+    target_bootstraps = context.get("harness", {}).get("target_bootstrap_count", 9)
+    mcts = PlacementMCTS(context)
+    actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=8)
+    for action in actions:
+        policy = action.get("policy", {})
+        name = action.get("name", "")
+        if name == "strict_no_bootstrap":
+            action["prior"] = 0.30
+            policy["boundary_scale_policy"] = "low"
+            policy["max_scale_candidates"] = 24
+        elif name == "budget_fulfillment_beam":
+            action["prior"] = 0.34
+            policy["beam_width"] = 4
+            policy["state_cap_per_node"] = 12
+            policy["max_scale_candidates"] = 20
+            policy["selection_bootstrap_penalty"] = 1_500_000_000.0
+        elif name == "minimal_bootstrap_repair":
+            action["prior"] = 0.18
+            policy["bootstrap_anchor_count"] = 2
+            policy["selection_bootstrap_penalty"] = 1_250_000_000.0
+        elif name == "waterline_budget_repair":
+            action["prior"] = 0.10
+            policy["selection_bootstrap_penalty"] = 1_750_000_000.0
+        action["policy"] = policy
+    policy = mcts.low_bootstrap_seed(
+        target_bootstraps=target_bootstraps,
+        rollout_budget=24,
+        exploration_weight=1.15,
+        max_repair_bootstraps=max(4, int(target_bootstraps or 0)),
+        action_cap=len(actions),
+    )
+    policy["mcts_actions"] = actions
+    policy["mcts_action_cap"] = len(actions)
+    policy["mcts_rollout_budget"] = 24
+    policy["mcts_exploration_weight"] = 1.15
+    return policy
+# EVOLVE-BLOCK-END
+'''
     return '''"""Initial compile-level OpenEvolve placement algorithm for Orbit."""
 
 from scripts.optimizer.orbit.openevolve_backend import PlacementBuilder, PlacementMCTS
@@ -779,7 +831,9 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     root = _compile_workspace_root(dag, params)
     root.mkdir(parents=True, exist_ok=True)
     context = build_compile_context(dag, params)
-    initial_source = _initial_compile_program_source()
+    initial_source = _initial_compile_program_source(
+        getattr(params, "openevolve_search_mode", None)
+    )
     initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
     reference = _evaluate_compile_hints(context, initial_hints, suppress_output=True)
     context["reference"] = {

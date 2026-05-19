@@ -3502,7 +3502,10 @@ def _solve_budget_batch_boundary_mcts(
                     last_error = exc
                     if diagnostics is not None:
                         _record_invalid_reason(diagnostics, "candidate_invalid_reasons", exc)
-            if _should_use_seed_fallback(hints):
+            has_candidate_attempt = any(
+                attempt.source.startswith("candidate") for attempt in attempts
+            )
+            if not has_candidate_attempt and _should_use_seed_fallback(hints):
                 for source, policy_hints in _seed_fallback_attempts(params):
                     try:
                         attempts.append(_solve_one_budget_attempt(pdag, params, io_budget, le, source, policy_hints))

@@ -1089,6 +1089,11 @@ def test_bootstrap_mcts_prefers_candidate_attempt_over_cheaper_fallback(
         }
 
     monkeypatch.setattr(oe_backend, "_boundary_mcts_group_attempts", fake_group_attempts)
+
+    def fail_seed_fallback(_params):
+        raise AssertionError("seed fallback should not run when candidate attempt exists")
+
+    monkeypatch.setattr(oe_backend, "_seed_fallback_attempts", fail_seed_fallback)
     diagnostics = {}
 
     solve_budget_batch(

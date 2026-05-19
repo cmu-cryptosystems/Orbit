@@ -702,6 +702,38 @@ def test_builder_compile_seed_includes_bounded_reliable_portfolio(toy_cost_json:
     assert hints["portfolio"][8]["min_internal_level"] == 12
 
 
+def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_budget_aggressive=True,
+        openevolve_target_bootstrap_count=9,
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    program_path = tmp_path / "initial.py"
+    program_path.write_text(oe_backend._initial_compile_program_source(), encoding="utf-8")
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+    sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
+
+    assert hints["strategy"] == "bootstrap_mcts"
+    assert hints["mcts_rollout_budget"] == 24
+    assert hints["mcts_exploration_weight"] == 1.15
+    raw_budget_beams = [
+        action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
+    ]
+    assert raw_budget_beams
+    assert raw_budget_beams[0]["prior"] == 0.34
+    assert raw_budget_beams[0]["policy"]["beam_width"] == 4
+    capped_names = [
+        action["name"]
+        for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
+    ]
+    assert "budget_fulfillment_beam" in capped_names
+
+
 def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
     toy_cost_json: str, tmp_path: Path
 ):

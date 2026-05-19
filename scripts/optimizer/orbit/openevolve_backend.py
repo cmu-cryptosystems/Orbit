@@ -1730,10 +1730,10 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
             _int_hint(bounded.get("mcts_action_cap"), 8 if budget_aggressive else 2),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
-            32 if budget_aggressive else 4,
+            128 if budget_aggressive else 4,
             _int_hint(
                 bounded.get("mcts_max_repair_bootstraps"),
-                32 if budget_aggressive else 4,
+                128 if budget_aggressive else 4,
             ),
         )
         bounded["boundary_state_cap"] = min(

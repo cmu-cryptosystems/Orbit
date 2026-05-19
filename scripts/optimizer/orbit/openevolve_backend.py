@@ -1072,11 +1072,32 @@ def _evaluate_compile_hints(
     start = time.time()
     try:
         stream = log_buffer if suppress_output else None
-        if stream is None:
-            partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
-        else:
-            with redirect_stdout(stream), redirect_stderr(stream):
+        try:
+            if stream is None:
                 partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+            else:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+        except (AssertionError, RuntimeError) as exc:
+            if params.bpsdepth is None or not _is_retryable_bypass_failure(exc):
+                raise
+            if stream is None:
+                print(
+                    "OpenEvolve compile replay bypass failed; retrying with bypass disabled. "
+                    f"Original error: {exc}"
+                )
+            else:
+                stream.write(
+                    "OpenEvolve compile replay bypass failed; retrying with bypass disabled. "
+                    f"Original error: {exc}\n"
+                )
+            params.bpsdepth = None
+            qbp_manager = QBPManager(params, le)
+            if stream is None:
+                partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+            else:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
         if partition_result is None:
             raise PlacementError("compile replay produced no valid final partitioning")
         io_to_assign, io_to_cost = partition_result
@@ -1149,6 +1170,11 @@ def _evaluate_compile_hints(
             },
             "log_tail": (log_buffer.getvalue() + "\n" + tb)[-4000:],
         }
+
+
+def _is_retryable_bypass_failure(exc: BaseException) -> bool:
+    text = str(exc)
+    return "QBP not found" in text or "No placement solution found for the whole DAG" in text
 
 
 def _compile_hints_for_eval_suite(hints: dict[str, Any], eval_suite: str) -> dict[str, Any]:

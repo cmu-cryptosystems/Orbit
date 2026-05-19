@@ -1028,6 +1028,42 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
     assert io_to_cost
 
 
+def test_compile_harness_retries_bypass_replay_without_bypass(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json, bpsdepth=15)
+    params.part = True
+    params.openevolve_eval_suite = "polybert-full"
+    graph = _toy_pdag(params)
+    context = build_compile_context(graph, params)
+    calls = []
+
+    def fake_solve_partition(tdag, qbp_manager, prev_cost, le, params_arg):
+        calls.append(params_arg.bpsdepth)
+        if params_arg.bpsdepth is not None:
+            raise AssertionError("Main PDAG #toy QBP not found in manager. Please add it first.")
+        return oe_backend.solve_budget_batch(
+            tdag,
+            [{"in_lvl": -1, "in_scl": params_arg.Sw}],
+            le,
+            params_arg,
+            oe_backend._low_scale_frontier_policy(),
+            {},
+        )
+
+    monkeypatch.setattr(
+        "scripts.optimizer.orbit.iterative_partition.solve_partition",
+        fake_solve_partition,
+    )
+
+    result = oe_backend._evaluate_compile_hints(context, {}, suppress_output=True)
+
+    assert result["valid"] is True
+    assert calls == [15, None]
+    assert "retrying with bypass disabled" in result["log_tail"]
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

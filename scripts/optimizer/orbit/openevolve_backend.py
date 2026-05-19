@@ -1141,6 +1141,23 @@ def _evaluate_compile_hints(
         tb = traceback.format_exc()
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
         assignments = list(diagnostics.get("assignments", []))
+        if (
+            eval_suite != "polybert-full"
+            and assignments
+            and isinstance(exc, PlacementError)
+            and "compile replay produced no valid final partitioning" in str(exc)
+        ):
+            diagnostics["sampled_progress_only"] = True
+            diagnostics["invalid_reasons"] = {f"{type(exc).__name__}: {str(exc)[:240]}": 1}
+            diagnostics["traceback"] = tb[-4000:]
+            return _sampled_progress_compile_result(
+                context,
+                tdag,
+                params,
+                diagnostics,
+                start,
+                log_buffer,
+            )
         count_summary = _assignment_count_summary(assignments)
         counts = {
             "bootstrap": count_summary["avg_bootstrap"],
@@ -1170,6 +1187,61 @@ def _evaluate_compile_hints(
             },
             "log_tail": (log_buffer.getvalue() + "\n" + tb)[-4000:],
         }
+
+
+def _sampled_progress_compile_result(
+    context: dict[str, Any],
+    tdag: Tdag,
+    params: Params,
+    diagnostics: dict[str, Any],
+    start: float,
+    log_buffer: io.StringIO,
+) -> dict[str, Any]:
+    """Return sampled-budget progress when sampled replay lacks a full DP path.
+
+    PolyBERT sampled mode intentionally evaluates a stratified subset of budget
+    records. That subset can be useful for OpenEvolve feedback while still being
+    insufficient for Orbit's final global DP path. Full-bundle finalist replay
+    remains strict; this path only makes sampled evolution score direct coverage
+    and repair/fallback pressure instead of flattening every candidate to an
+    invalid compile.
+    """
+
+    assignments = list(diagnostics.get("assignments", []))
+    costs = [float(item) for item in diagnostics.get("costs", [])]
+    count_summary = _assignment_count_summary(assignments)
+    best_assign = None
+    if assignments:
+        if costs and len(costs) == len(assignments):
+            best_idx = min(range(len(costs)), key=lambda idx: costs[idx])
+            best_assign = assignments[best_idx]
+        else:
+            best_assign = assignments[0]
+    locations = _maintenance_locations(best_assign) if best_assign is not None else {"bootstrap": {}, "rescale": {}}
+    reserve_summary = _aggregate_reserve_summary(assignments, tdag, params)
+    requested = max(1, int(diagnostics.get("requested_budgets", len(assignments)) or 1))
+    solved = int(diagnostics.get("solved_budgets", len(assignments)) or 0)
+    return {
+        "valid": bool(solved),
+        "validity": float(solved / requested),
+        "sampled_progress_only": True,
+        "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
+        "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
+        "bootstrap_count": float(count_summary["avg_bootstrap"]),
+        "rescale_count": float(count_summary["avg_rescale"]),
+        "boundary_quality": 0.0,
+        "profile_risk": float(_profile_risk(assignments, params)) if assignments else 1.0,
+        "placement_runtime_sec": time.time() - start,
+        "fallback_selected_budgets": int(diagnostics.get("fallback_selected_budgets", 0)),
+        "selected_output_state": {},
+        "reserve_summary": reserve_summary,
+        "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
+        "bootstrap_locations": locations["bootstrap"],
+        "rescale_locations": locations["rescale"],
+        "bottleneck_summary": _bottleneck_summary(locations),
+        "diagnostics": diagnostics,
+        "log_tail": log_buffer.getvalue()[-3000:],
+    }
 
 
 def _is_retryable_bypass_failure(exc: BaseException) -> bool:

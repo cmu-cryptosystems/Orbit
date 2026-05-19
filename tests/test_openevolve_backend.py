@@ -1064,6 +1064,42 @@ def test_compile_harness_retries_bypass_replay_without_bypass(
     assert "retrying with bypass disabled" in result["log_tail"]
 
 
+def test_sampled_compile_harness_scores_partial_budget_progress(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json)
+    params.openevolve_eval_suite = "polybert-sampled"
+    graph = _toy_pdag(params)
+    context = build_compile_context(graph, params)
+
+    def fake_solve_partition(tdag, qbp_manager, prev_cost, le, params_arg):
+        diagnostics = {}
+        oe_backend.solve_budget_batch(
+            tdag,
+            [{"in_lvl": -1, "in_scl": params_arg.Sw}],
+            le,
+            params_arg,
+            oe_backend._low_scale_frontier_policy(),
+            diagnostics,
+        )
+        qbp_manager.openevolve_diagnostics.append(diagnostics)
+        raise oe_backend.PlacementError("compile replay produced no valid final partitioning")
+
+    monkeypatch.setattr(
+        "scripts.optimizer.orbit.iterative_partition.solve_partition",
+        fake_solve_partition,
+    )
+
+    result = oe_backend._evaluate_compile_hints(context, {}, suppress_output=True)
+
+    assert result["valid"] is True
+    assert result["sampled_progress_only"] is True
+    assert result["validity"] == 1.0
+    assert result["diagnostics"]["sampled_progress_only"] is True
+    assert result["bootstrap_count"] >= 0
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

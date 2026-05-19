@@ -1079,6 +1079,17 @@ def test_bootstrap_mcts_skips_direct_budget_beam_by_default(toy_cost_json: str):
     assert "candidate:direct_budget_beam" not in diagnostics["selected_source_counts"]
 
 
+def test_sampled_seed_fallback_skips_latency_beam(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    params.openevolve_evaluating_candidate = True
+    params.openevolve_eval_suite = "polybert-sampled"
+
+    sources = [source for source, _policy in oe_backend._seed_fallback_attempts(params)]
+
+    assert "seed_fallback_latency_beam" not in sources
+    assert sources == ["seed_fallback", "seed_fallback_relaxed"]
+
+
 def test_compile_harness_retries_bypass_replay_without_bypass(
     toy_cost_json: str,
     monkeypatch,

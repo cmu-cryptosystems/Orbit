@@ -3354,6 +3354,11 @@ def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
     beam = _budget_fulfillment_beam_policy()
     if not getattr(params, "openevolve_evaluating_candidate", False):
         return [("seed_fallback_latency_beam", beam)]
+    if getattr(params, "openevolve_eval_suite", "polybert-sampled") != "polybert-full":
+        return [
+            ("seed_fallback", seed),
+            ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),
+        ]
     return [
         ("seed_fallback", seed),
         ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),

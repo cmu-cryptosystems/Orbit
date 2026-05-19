@@ -492,7 +492,7 @@ def place(context):
             policy["selection_objective"] = "component_budget_fit"
             policy["prefer_component_budget_fit"] = True
             policy["force_bootstrap_anchors"] = True
-            policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
+            policy["bootstrap_anchor_count"] = max(1, min(4, target_bootstraps))
             policy["bootstrap_penalty"] = 250_000_000.0
             policy["selection_bootstrap_penalty"] = 50_000_000.0
         elif name == "waterline_budget_repair":
@@ -566,7 +566,7 @@ def place(context):
                 policy["selection_objective"] = "component_budget_fit"
                 policy["prefer_component_budget_fit"] = True
                 policy["force_bootstrap_anchors"] = True
-                policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
+                policy["bootstrap_anchor_count"] = max(1, min(4, target_bootstraps))
                 policy["bootstrap_penalty"] = 250_000_000.0
                 policy["selection_bootstrap_penalty"] = 50_000_000.0
             elif name == "waterline_budget_repair":
@@ -4264,8 +4264,14 @@ def _boundary_policy_variants(
         variant["preferred_node_levels"] = node_levels
         variant["preferred_node_scales"] = node_scales
         if anchors and _bool_hint(base.get("force_bootstrap_anchors"), False):
-            variant["force_bootstrap_nodes"] = list(anchors)
-        variants.append(_with_default_policy(variant))
+            forced = dict(variant)
+            forced["force_bootstrap_nodes"] = list(anchors)
+            variants.append(_with_default_policy(forced))
+            soft = dict(variant)
+            soft["force_bootstrap_nodes"] = []
+            variants.append(_with_default_policy(soft))
+        else:
+            variants.append(_with_default_policy(variant))
     return variants
 
 
@@ -6609,7 +6615,7 @@ def candidate_actions(
     )
     component_targets = _context_unit_bootstrap_targets(context)
     component_target_total = sum(component_targets.values())
-    component_anchor_count = max(1, min(16, component_target_total or target or 3))
+    component_anchor_count = max(1, min(6, component_target_total or target or 3))
     base = {
         "strategy": "level_preserving",
         "prefer_level_preservation": True,

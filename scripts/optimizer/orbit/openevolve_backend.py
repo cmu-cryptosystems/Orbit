@@ -1019,9 +1019,10 @@ def evaluate_compile_candidate_program(
             if _context_budget_aggressive(context):
                 combined_score = min(
                     0.999,
-                    0.10 * effective_validity
-                    + 0.22 * boundary_group_validity
-                    + 0.34 * candidate_qbp_coverage
+                    0.08 * effective_validity
+                    + 0.18 * boundary_group_validity
+                    + 0.24 * candidate_qbp_coverage
+                    + 0.18 * fallback_score
                     + 0.14 * quality_score
                     + 0.08 * unit_coverage
                     + 0.06 * repair_score,
@@ -3065,6 +3066,7 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         )
         rescale_score = _relative_reduction(reference["rescale_count"], counts["rescale"])
         risk_score = 1.0 / (1.0 + profile_risk)
+        fallback_score = 1.0 / (1.0 + fallback_selected + fallback_groups)
         quality_score = (
             0.42 * latency_score
             + 0.12 * bootstrap_score
@@ -3087,8 +3089,9 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
             if _context_budget_aggressive(context):
                 combined_score = min(
                     0.999,
-                    0.48 * validity
-                    + 0.22 * candidate_qbp_coverage
+                    0.36 * validity
+                    + 0.18 * candidate_qbp_coverage
+                    + 0.20 * fallback_score
                     + 0.18 * quality_score
                     + 0.08 * unit_coverage
                 )

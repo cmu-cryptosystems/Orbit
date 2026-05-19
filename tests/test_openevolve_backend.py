@@ -259,7 +259,7 @@ def test_context_roundtrip_and_conservative_placement(toy_cost_json: str):
 
     assert restored.name == graph.name
     assert restored.nodes["0"]["op"] == "mul"
-    assert context["schema_version"] == "orbit-openevolve-placement-context-v2"
+    assert context["schema_version"] == "orbit-openevolve-placement-context-v3"
     assert context["tdag"]["topological_order"]
     assert context["graph_summary"]["max_scale"] == params.Sf + 2 * params.Sw
     assert context["budget_summary"]["count"] == 1
@@ -737,7 +737,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     assert "budget_fulfillment_beam" in capped_names
     assert sampled["mcts_action_cap"] <= 8
     assert any(action["name"] == "latency_mcts_repair" for action in sampled["mcts_actions"])
-    assert any(action["name"] == "candidate_relaxed_frontier" for action in sampled["mcts_actions"])
+    assert any(action["name"] == "component_budget_repair" for action in sampled["mcts_actions"])
 
 
 def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
@@ -1598,6 +1598,65 @@ def test_layer_nonlinear_units_are_extracted_from_comments(toy_cost_json: str):
     assert "nonlinear:layer.0:attention_softmax" in unit_ids
     assert "nonlinear:layer.0:activation" in unit_ids
     assert context["unit_op_histogram"]["mul"] == 4
+    budget = context["unit_bootstrap_budget"]
+    assert budget["unit_budgets"]["nonlinear:layer.0:attention_softmax"]["target"] == 3
+    assert budget["effective_target_bootstrap_count"] >= 3
+
+
+def test_component_bootstrap_alignment_scores_non_linear_budget(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "unit_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "softmax",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.add_edge("arg0", "softmax")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"softmax"}
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    aligned = oe_backend._component_bootstrap_alignment_score(
+        context,
+        {"layer=layer.0;op=qk_softmax_mul": 3},
+        3,
+    )
+    misplaced = oe_backend._component_bootstrap_alignment_score(
+        context,
+        {"layer=layer.0;op=plain_mul": 3},
+        3,
+    )
+
+    assert aligned > misplaced
+    assert aligned == 1.0
+
+
+def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "unit_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "softmax",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.add_edge("arg0", "softmax")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"softmax"}
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    actions = candidate_actions(context, action_cap=8)
+    component = next(action for action in actions if action["name"] == "component_budget_repair")
+
+    assert component["policy"]["component_bootstrap_budgets"] == {
+        "nonlinear:layer.0:attention_softmax": 3
+    }
+    assert component["policy"]["bootstrap_anchor_count"] >= 3
 
 
 def test_unit_policy_api_and_lenient_repairs(toy_cost_json: str, tmp_path: Path):

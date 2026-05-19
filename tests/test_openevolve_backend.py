@@ -1792,6 +1792,50 @@ def test_component_budget_mcts_does_not_stop_at_too_few_bootstraps(toy_cost_json
     assert oe_backend._policy_bootstrap_target_met(hints, params, 7)
 
 
+def test_context_includes_alphaevolve_guidance(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": params.Sw}], params)
+
+    guidance = context["evolution_guidance"]
+
+    assert guidance["source"].startswith("Adapting AlphaEvolve")
+    assert "strategy_pool" in guidance
+    assert any("execution-trace" in item or "trace" in item for item in guidance["principles"])
+    assert guidance["target_bootstraps"] >= 9
+
+
+def test_alphaevolve_feedback_suggests_component_action_when_under_budget(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": params.Sw}], params)
+    context["harness"] = {"target_bootstrap_count": 9}
+    feedback = oe_backend._alphaevolve_feedback(
+        context,
+        {"mcts_action_cap": 8, "mcts_rollout_budget": 12},
+        {
+            "bootstrap_count": 3,
+            "metrics": {
+                "bootstrap_count": 3,
+                "component_bootstrap_score": 0.5,
+                "candidate_qbp_coverage": 1.0,
+                "boundary_group_validity": 1.0,
+                "fallback_selected_groups": 0,
+            },
+            "diagnostics": {
+                "selected_source_counts": {"candidate:boundary_mcts:budget_fulfillment_beam:0": 8},
+                "candidate_invalid_reasons": {
+                    "component_budget_repair: PlacementError: no feasible incoming level/scale": 2
+                },
+            },
+        },
+    )
+
+    joined = " ".join(feedback["suggestions"])
+    assert "component_budget_repair" in joined
+    assert "force_bootstrap_anchors=False" in joined
+
+
 def test_unit_policy_api_and_lenient_repairs(toy_cost_json: str, tmp_path: Path):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)
@@ -2106,6 +2150,9 @@ def test_compile_invalid_metrics_cover_configured_feature_dimensions(
         "final_latency_usec",
         "boundary_quality",
         "bootstrap_count",
+        "component_bootstrap_score",
+        "candidate_qbp_coverage",
+        "boundary_group_validity",
         "rescale_count",
         "fallback_selected_budgets",
         "profile_risk",
@@ -2141,6 +2188,9 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
         "final_latency_usec",
         "boundary_quality",
         "bootstrap_count",
+        "component_bootstrap_score",
+        "candidate_qbp_coverage",
+        "boundary_group_validity",
         "rescale_count",
         "fallback_selected_budgets",
         "profile_risk",

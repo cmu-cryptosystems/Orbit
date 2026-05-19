@@ -215,6 +215,9 @@ class OpenEvolvePlacementWorker:
             "final_latency_usec",
             "boundary_quality",
             "bootstrap_count",
+            "component_bootstrap_score",
+            "candidate_qbp_coverage",
+            "boundary_group_validity",
             "rescale_count",
             "fallback_selected_budgets",
             "profile_risk",
@@ -463,6 +466,12 @@ def place(context):
     Mutate this active policy directly: action priors, beam settings, scale
     candidates, repair aggressiveness, and exploration settings all affect
     sampled and finalist scoring. Orbit validates and repairs every assignment.
+
+    Follow context["evolution_guidance"]: use evaluator artifacts as execution
+    trace feedback. If component_bootstrap_score is low, change the component
+    budget action; if candidate_qbp_coverage is low, change boundary-state
+    coverage; if candidate_invalid_reasons point to forced anchors, soften or
+    retarget anchors rather than deleting the component action.
     """
     target_bootstraps = max(
         int(context.get("harness", {}).get("target_bootstrap_count", 9) or 0),
@@ -525,6 +534,10 @@ def place(context):
     The candidate may either return explicit placement records or a policy
     built from Orbit's helper API. Orbit validates every assignment and owns
     final repair into Assign objects.
+
+    Follow context["evolution_guidance"]: use previous evaluator artifacts as
+    execution-trace feedback, keep CKKS legality intact, and mutate only the
+    high-impact policy surface rather than Orbit source code.
 
     During sampled evolution, Orbit first rewards candidates that directly solve
     complete QBP boundary groups. Candidate programs should reduce the final
@@ -686,6 +699,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "architecture": params.netname or pdag.name,
         },
         "graph_summary": graph_summary,
+        "evolution_guidance": _alphaevolve_guidance(params, unit_bootstrap_budget),
         "placement_units": placement_units,
         "unit_op_histogram": _unit_op_histogram(placement_units),
         "unit_budget_summary": _unit_budget_summary(placement_units, io_budgets_list),
@@ -1212,6 +1226,10 @@ def evaluate_compile_candidate_program(
                 "repair_summary": json.dumps(_unit_policy_summary(context, eval_hints), sort_keys=True),
                 "per_unit_score_table": json.dumps(
                     _per_unit_score_table(context, result.get("bottleneck_summary", []), eval_hints),
+                    sort_keys=True,
+                )[:4000],
+                "alphaevolve_feedback": json.dumps(
+                    _alphaevolve_feedback(context, eval_hints, result),
                     sort_keys=True,
                 )[:4000],
             },
@@ -3058,6 +3076,9 @@ def _record_compile_trace(
                 "boundary_group_validity",
                 "fallback_selected_groups",
                 "unreachable_boundary_groups",
+                "component_bootstrap_alignment",
+                "component_bootstrap_budget",
+                "alphaevolve_feedback",
             }
         },
     }
@@ -3068,6 +3089,118 @@ def _record_compile_trace(
             handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
     except Exception:
         pass
+
+
+def _alphaevolve_feedback(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Compact profiling feedback for the next OpenEvolve mutation.
+
+    This mirrors the paper's use of execution traces: it converts Orbit's
+    selected-action and invalid-action diagnostics into concrete policy moves.
+    """
+
+    metrics = result.get("metrics", result) if isinstance(result, dict) else {}
+    artifacts = result.get("artifacts", {}) if isinstance(result, dict) else {}
+    diagnostics = result.get("diagnostics", {}) if isinstance(result, dict) else {}
+    selected = _dict_from_jsonish(
+        artifacts.get("selected_source_counts", diagnostics.get("selected_source_counts", {}))
+    )
+    invalid = _dict_from_jsonish(
+        artifacts.get("candidate_invalid_reasons", diagnostics.get("candidate_invalid_reasons", {}))
+    )
+    component = result.get("component_bootstrap_alignment")
+    if not isinstance(component, dict):
+        component = _dict_from_jsonish(artifacts.get("component_bootstrap_alignment", {}))
+
+    target = _context_target_bootstrap_count(context)
+    bootstrap_count = _finite_float(
+        metrics.get("bootstrap_count", result.get("bootstrap_count", 0.0)),
+        0.0,
+    )
+    component_score = _finite_float(
+        metrics.get(
+            "component_bootstrap_score",
+            component.get("score") if isinstance(component, dict) else None,
+        ),
+        0.0,
+    )
+    qbp_coverage = _finite_float(metrics.get("candidate_qbp_coverage"), 0.0)
+    boundary_validity = _finite_float(metrics.get("boundary_group_validity"), 0.0)
+    fallback_groups = _finite_float(metrics.get("fallback_selected_groups"), 0.0)
+
+    selected_top = sorted(
+        selected.items(), key=lambda item: (-_safe_int(item[1], 0), item[0])
+    )[:5]
+    invalid_top = sorted(
+        invalid.items(), key=lambda item: (-_safe_int(item[1], 0), item[0])
+    )[:5]
+    suggestions: list[str] = []
+
+    if target > 0 and bootstrap_count < 0.65 * target:
+        suggestions.append(
+            "bootstrap_count is below the component budget; increase component_budget_repair priority, use selection_objective='component_budget_fit', and try 2-6 bootstrap anchors."
+        )
+    if component_score < 0.75 and target > 0:
+        suggestions.append(
+            "component_bootstrap_score is low; keep low-bootstrap actions but add/retarget nonlinear maintenance anchors instead of deleting component_budget_repair."
+        )
+    if any("component_budget_repair" in reason and "no feasible" in reason for reason, _count in invalid_top):
+        suggestions.append(
+            "component_budget_repair is too strict; lower bootstrap_anchor_count, set force_bootstrap_anchors=False for some variants, or increase boundary_state_cap."
+        )
+    if any("latency_beam found no feasible" in reason for reason, _count in invalid_top):
+        suggestions.append(
+            "latency_beam is missing legal boundary states; try boundary_scale_policy='waterline' or 'frontier' and increase max_scale_candidates before widening beam_width."
+        )
+    if qbp_coverage < 1.0 or boundary_validity < 1.0:
+        suggestions.append(
+            "QBP coverage is incomplete; preserve whole boundary groups and sweep boundary_state_cap/max_scale_candidates rather than optimizing individual budgets."
+        )
+    if fallback_groups > 0:
+        suggestions.append(
+            "fallback groups were selected; make the candidate action solve those groups directly because fallback-heavy candidates cannot win finalist replay."
+        )
+    if selected_top and all("component_budget_repair" not in source for source, _count in selected_top) and component_score < 0.75:
+        suggestions.append(
+            "selected_source_counts are dominated by non-component actions; raise component_budget_repair prior or reduce its penalties until it appears in selected_source_counts."
+        )
+    if not suggestions:
+        suggestions.append(
+            "Current candidate passed the main gates; mutate latency/rescale knobs conservatively while preserving QBP coverage and component alignment."
+        )
+
+    return {
+        "trace_model": "alphaevolve-fhe-style",
+        "selected_source_counts_top": dict(selected_top),
+        "candidate_invalid_reasons_top": dict(invalid_top),
+        "target_bootstrap_count": target,
+        "bootstrap_count": bootstrap_count,
+        "component_bootstrap_score": component_score,
+        "candidate_qbp_coverage": qbp_coverage,
+        "boundary_group_validity": boundary_validity,
+        "fallback_selected_groups": fallback_groups,
+        "policy_focus": {
+            "mcts_action_cap": hints.get("mcts_action_cap"),
+            "mcts_rollout_budget": hints.get("mcts_rollout_budget"),
+            "component_budget_budgets_present": bool(_policy_unit_bootstrap_targets(hints)),
+        },
+        "suggestions": suggestions[:6],
+    }
+
+
+def _dict_from_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def evaluate_candidate_program(context_path: str | Path, program_path: str | Path) -> dict[str, Any]:
@@ -3256,6 +3389,9 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": diagnostics.get("candidate_invalid_reasons", {})}
                 ),
+                "component_bootstrap_alignment": json.dumps(
+                    component_bootstrap, sort_keys=True
+                )[:4000],
                 "reserve_summary": json.dumps(reserve_summary, sort_keys=True)[:4000],
                 "policy_summary": _compact_policy_summary(hints),
                 "repair_summary": json.dumps(_unit_policy_summary(context, hints), sort_keys=True),
@@ -3263,6 +3399,23 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                     _profile_unmatched_targets(context), sort_keys=True
                 ),
                 "profiler_plan_hints": _compact_profile_plan(context),
+                "alphaevolve_feedback": json.dumps(
+                    _alphaevolve_feedback(
+                        context,
+                        hints,
+                        {
+                            "diagnostics": diagnostics,
+                            "bootstrap_count": counts["bootstrap"],
+                            "rescale_count": counts["rescale"],
+                            "component_bootstrap_alignment": component_bootstrap,
+                            "candidate_qbp_coverage": candidate_qbp_coverage,
+                            "boundary_group_validity": boundary_group_validity,
+                            "fallback_selected_groups": fallback_groups,
+                            "valid": bool(solved),
+                        },
+                    ),
+                    sort_keys=True,
+                )[:4000],
                 "patchgate": json.dumps(static, sort_keys=True),
             },
         }
@@ -6116,6 +6269,81 @@ def _context_budget_aggressive(context: dict[str, Any]) -> bool:
     return _bool_hint(value, True)
 
 
+def _alphaevolve_guidance(params: Params, unit_bootstrap_budget: dict[str, Any]) -> dict[str, Any]:
+    """Paper-inspired operating instructions for the evolved program.
+
+    The AlphaEvolve TPU/FHE paper emphasizes narrow high-impact mutation
+    surfaces, full-module scoring, correctness/security gates, and compact
+    execution-trace feedback. Keep the same shape here: OpenEvolve mutates the
+    placement policy, while Orbit owns CKKS legality, repair, and final DP.
+    """
+
+    component_target = int(unit_bootstrap_budget.get("effective_target_bootstrap_count", 0) or 0)
+    requested_target = int(getattr(params, "openevolve_target_bootstrap_count", 0) or 0)
+    return {
+        "source": "Adapting AlphaEvolve to Optimize Fully Homomorphic Encryption on TPUs",
+        "principles": [
+            "Mutate only the exposed placement policy and bounded action parameters.",
+            "Optimize broad QBP/compile behavior; isolated budget wins do not matter unless final DP improves.",
+            "Validity and CKKS safety are hard gates before latency and bootstrap score.",
+            "Use evaluator trace artifacts as profiling feedback, especially selected_source_counts and candidate_invalid_reasons.",
+            "Prefer implementation/scheduling choices over inventing new cryptographic semantics.",
+        ],
+        "high_impact_knobs": [
+            "mcts_actions[*].prior",
+            "mcts_actions[*].policy.selection_objective",
+            "mcts_actions[*].policy.bootstrap_anchor_count",
+            "mcts_actions[*].policy.force_bootstrap_anchors",
+            "mcts_actions[*].policy.boundary_state_cap",
+            "mcts_actions[*].policy.boundary_scale_policy",
+            "mcts_actions[*].policy.max_scale_candidates",
+            "mcts_actions[*].policy.bootstrap_penalty",
+            "mcts_actions[*].policy.selection_bootstrap_penalty",
+            "mcts_rollout_budget",
+            "mcts_action_cap",
+        ],
+        "strategy_pool": [
+            {
+                "name": "component_budget_repair",
+                "when": "bootstrap_count is below nonlinear component budget or component_bootstrap_score is low",
+                "mutations": [
+                    "set selection_objective='component_budget_fit'",
+                    "try force_bootstrap_anchors both true and false",
+                    "sweep bootstrap_anchor_count between 1 and 6",
+                    "lower bootstrap penalties only inside this action",
+                ],
+            },
+            {
+                "name": "budget_fulfillment_beam",
+                "when": "candidate_qbp_coverage or boundary_group_validity is low",
+                "mutations": [
+                    "increase boundary_state_cap before increasing beam_width",
+                    "try boundary_scale_policy in ['frontier', 'waterline', 'sf']",
+                    "avoid excessive bootstrap penalties that erase legal refresh candidates",
+                ],
+            },
+            {
+                "name": "strict_no_bootstrap",
+                "when": "component budget is satisfied and latency is still high",
+                "mutations": [
+                    "keep as a baseline action, but do not let it dominate when component_bootstrap_score is low",
+                ],
+            },
+        ],
+        "tiered_evaluator": {
+            "static_only": "normalize and clamp candidate policy; reject source mutation or solver calls",
+            "clear_only": "replay QBP boundary groups with deterministic Orbit repair",
+            "finalist": "full-bundle replay; fallback-heavy candidates cannot win",
+        },
+        "target_bootstraps": max(component_target, requested_target),
+        "component_budget_summary": {
+            "component_total": unit_bootstrap_budget.get("component_budget_total", 0),
+            "kind_totals": unit_bootstrap_budget.get("kind_totals", {}),
+            "notes": unit_bootstrap_budget.get("notes", []),
+        },
+    }
+
+
 def _compact_policy_summary(hints: dict[str, Any]) -> str:
     keys = [
         "strategy",
@@ -6138,6 +6366,10 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
         "scale_lattice",
         "budget_aggressive",
         "selection_bootstrap_penalty",
+        "selection_objective",
+        "prefer_component_budget_fit",
+        "force_bootstrap_anchors",
+        "force_bootstrap_nodes",
         "mcts_rollout_budget",
         "mcts_exploration_weight",
         "mcts_max_repair_bootstraps",

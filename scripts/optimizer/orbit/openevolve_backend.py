@@ -473,7 +473,7 @@ def place(context):
         target_bootstraps = context.get("harness", {}).get("target_bootstrap_count", 9)
         return PlacementMCTS(context).low_bootstrap_seed(
             target_bootstraps=target_bootstraps,
-            rollout_budget=48,
+            rollout_budget=16,
             exploration_weight=1.4,
             max_repair_bootstraps=max(4, int(target_bootstraps or 0)),
         )
@@ -3378,14 +3378,16 @@ def _boundary_mcts_group_attempts(
     stats = [_MCTSNodeStats() for _ in actions]
     attempts_by_budget: dict[int, list[_BudgetAttempt]] = {idx: [] for idx in range(len(budgets))}
     seen_actions: set[str] = set()
-    direct_attempts = _direct_budget_beam_group_attempts(
-        pdag,
-        params,
-        budgets,
-        le,
-        hints,
-        diagnostics,
-    )
+    direct_attempts = {}
+    if _use_direct_budget_beam(hints, policy):
+        direct_attempts = _direct_budget_beam_group_attempts(
+            pdag,
+            params,
+            budgets,
+            le,
+            hints,
+            diagnostics,
+        )
     for budget_idx, attempt in direct_attempts.items():
         attempts_by_budget[budget_idx].append(attempt)
     if _boundary_mcts_group_target_met(
@@ -3480,6 +3482,19 @@ def _direct_budget_beam_group_attempts(
             if diagnostics is not None:
                 _record_invalid_reason(diagnostics, "candidate_invalid_reasons", exc)
     return attempts
+
+
+def _use_direct_budget_beam(hints: dict[str, Any], policy: dict[str, Any]) -> bool:
+    """Opt in to the expensive direct beam pre-pass.
+
+    The beam is useful as a budget-fulfillment repair action, but running it
+    before every MCTS action made compile-level startup spend minutes in the
+    seed replay before OpenEvolve got a chance to mutate anything.
+    """
+
+    return _bool_hint(hints.get("enable_direct_budget_beam"), False) or _bool_hint(
+        policy.get("enable_direct_budget_beam"), False
+    )
 
 
 def _direct_budget_beam_policy_from_hints(hints: dict[str, Any]) -> dict[str, Any]:
@@ -4383,6 +4398,7 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
             "target_bootstrap_count": target,
             "mcts_action_cap": 2,
             "boundary_state_cap": 1,
+            "enable_direct_budget_beam": False,
         }
     )
     return policy
@@ -4536,6 +4552,7 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
         "mcts_max_repair_bootstraps": max(
             0, min(1024, _int_hint(hints.get("mcts_max_repair_bootstraps"), 4))
         ),
+        "enable_direct_budget_beam": _bool_hint(hints.get("enable_direct_budget_beam"), False),
         "max_scale": _max_scale(params),
     }
 
@@ -6006,6 +6023,7 @@ class PlacementMCTS:
                 "mcts_exploration_weight": float(exploration_weight),
                 "mcts_max_repair_bootstraps": int(max_repair_bootstraps),
                 "mcts_action_cap": int(action_cap),
+                "enable_direct_budget_beam": False,
                 "mcts_actions": candidate_actions(
                     self.context,
                     target_bootstraps=int(target_bootstraps),
@@ -7203,6 +7221,7 @@ _PATCHABLE_POLICY_KEYS = {
     "mcts_exploration_weight",
     "mcts_max_repair_bootstraps",
     "mcts_action_cap",
+    "enable_direct_budget_beam",
     "boundary_scale_policy",
     "boundary_state_cap",
     "preferred_boundary_scale",

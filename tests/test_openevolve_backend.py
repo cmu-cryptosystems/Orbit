@@ -979,7 +979,7 @@ def test_bootstrap_mcts_batch_keeps_complete_boundary_group(
         budgets,
         le,
         params,
-        oe_backend._bootstrap_mcts_seed_policy(params),
+        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
         diagnostics,
     )
 
@@ -1025,7 +1025,7 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
         budgets,
         le,
         params,
-        oe_backend._bootstrap_mcts_seed_policy(params),
+        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
         diagnostics,
     )
 
@@ -1035,7 +1035,28 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
     assert io_to_cost
 
 
-def test_bootstrap_mcts_uses_direct_budget_beam_before_actions(toy_cost_json: str):
+def test_bootstrap_mcts_can_opt_into_direct_budget_beam_before_actions(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    diagnostics = {}
+
+    solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": params.Sw}],
+        le,
+        params,
+        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
+        diagnostics,
+    )
+
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert diagnostics["selected_source_counts"] == {"candidate:direct_budget_beam": 1}
+
+
+def test_bootstrap_mcts_skips_direct_budget_beam_by_default(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
     params.openevolve_evaluating_candidate = True
     graph = _toy_pdag(params)
@@ -1051,9 +1072,7 @@ def test_bootstrap_mcts_uses_direct_budget_beam_before_actions(toy_cost_json: st
         diagnostics,
     )
 
-    assert diagnostics["candidate_solved_budgets"] == 1
-    assert diagnostics["fallback_selected_budgets"] == 0
-    assert diagnostics["selected_source_counts"] == {"candidate:direct_budget_beam": 1}
+    assert "candidate:direct_budget_beam" not in diagnostics["selected_source_counts"]
 
 
 def test_compile_harness_retries_bypass_replay_without_bypass(
@@ -1208,7 +1227,7 @@ def test_bootstrap_mcts_returns_complete_qbp_boundary_group(toy_cost_json: str):
         budgets,
         le,
         params,
-        oe_backend._bootstrap_mcts_seed_policy(params),
+        {**oe_backend._bootstrap_mcts_seed_policy(params), "enable_direct_budget_beam": True},
         diagnostics,
     )
 

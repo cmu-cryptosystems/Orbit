@@ -805,6 +805,12 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
         and action["policy"]["direct_budget_policy"] is True
         for action in hints["mcts_actions"]
     )
+    assert any(
+        action["name"] == "waterline_budget_repair"
+        and action["policy"]["strategy"] == "waterline_seed"
+        and action["policy"]["direct_budget_policy"] is True
+        for action in hints["mcts_actions"]
+    )
     assert any(action["policy"].get("forbid_bootstrap") for action in hints["mcts_actions"])
     assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
     assert sampled["mcts_rollout_budget"] <= 2

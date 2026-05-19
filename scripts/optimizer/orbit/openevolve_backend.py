@@ -1679,8 +1679,6 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
         policy = item.get("policy", item)
         if not isinstance(policy, dict):
             continue
-        if _bool_hint(policy.get("direct_budget_policy"), False):
-            continue
         if str(policy.get("strategy", "")) == "latency_beam":
             continue
         filtered.append(item)
@@ -4061,9 +4059,10 @@ def _mcts_actions_from_hints(hints: dict[str, Any], params: Params) -> list[MCTS
             if not isinstance(item, dict):
                 continue
             policy = _with_default_policy(item.get("policy", item))
-            policy["strategy"] = (
-                "latency_beam" if str(policy.get("strategy")) == "latency_beam" else "level_preserving"
-            )
+            strategy = str(policy.get("strategy"))
+            if strategy not in {"latency_beam", "waterline_seed"}:
+                strategy = "level_preserving"
+            policy["strategy"] = strategy
             actions.append(
                 MCTSAction(
                     name=str(item.get("name", f"candidate_action_{idx}")),
@@ -4141,6 +4140,20 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "bootstrap_anchor_count": max(1, min(4, target or 2)),
             },
             0.10,
+        ),
+        (
+            "waterline_budget_repair",
+            {
+                **_waterline_seed_policy(),
+                "direct_budget_policy": True,
+                "allow_seed_fallback": False,
+                "target_bootstrap_count": target,
+                "selection_bootstrap_penalty": max(
+                    750_000_000.0,
+                    _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
+                ),
+            },
+            0.08,
         ),
         (
             "budget_fulfillment_beam",
@@ -5937,6 +5950,17 @@ def candidate_actions(
                 "allow_bootstrap": True,
                 "boundary_scale_policy": "frontier",
                 "bootstrap_anchor_count": max(1, min(4, target or 2)),
+            },
+        },
+        {
+            "name": "waterline_budget_repair",
+            "prior": 0.08,
+            "policy": {
+                **_waterline_seed_policy(),
+                "direct_budget_policy": True,
+                "allow_seed_fallback": False,
+                "target_bootstrap_count": target,
+                "selection_bootstrap_penalty": 750_000_000.0,
             },
         },
         {

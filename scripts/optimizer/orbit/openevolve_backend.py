@@ -1630,6 +1630,10 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
         _int_hint(bounded.get("beam_width"), 5 if budget_aggressive else 4),
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
+        if not _bool_hint(bounded.get("enable_sampled_latency_beam"), False):
+            bounded["mcts_actions"] = _sampled_lightweight_mcts_actions(
+                bounded.get("mcts_actions")
+            )
         bounded["mcts_rollout_budget"] = min(
             4 if budget_aggressive else 2,
             _int_hint(bounded.get("mcts_rollout_budget"), 4 if budget_aggressive else 2),
@@ -1663,6 +1667,24 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
         )
         bounded["portfolio"] = sampled_portfolio[:2]
     return bounded
+
+
+def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] | Any:
+    if not isinstance(raw_actions, list):
+        return raw_actions
+    filtered: list[dict[str, Any]] = []
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        policy = item.get("policy", item)
+        if not isinstance(policy, dict):
+            continue
+        if _bool_hint(policy.get("direct_budget_policy"), False):
+            continue
+        if str(policy.get("strategy", "")) == "latency_beam":
+            continue
+        filtered.append(item)
+    return filtered or raw_actions
 
 
 def _finalist_hints_for_full_bundle(hints: dict[str, Any]) -> dict[str, Any]:
@@ -7222,6 +7244,7 @@ _PATCHABLE_POLICY_KEYS = {
     "mcts_max_repair_bootstraps",
     "mcts_action_cap",
     "enable_direct_budget_beam",
+    "enable_sampled_latency_beam",
     "boundary_scale_policy",
     "boundary_state_cap",
     "preferred_boundary_scale",

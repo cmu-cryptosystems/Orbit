@@ -810,6 +810,10 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     assert sampled["mcts_rollout_budget"] <= 2
     assert sampled["mcts_action_cap"] <= 2
     assert sampled["mcts_max_repair_bootstraps"] <= 4
+    assert all(
+        action.get("policy", {}).get("strategy") != "latency_beam"
+        for action in sampled["mcts_actions"]
+    )
 
 
 def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(

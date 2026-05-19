@@ -722,7 +722,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
 
     assert hints["strategy"] == "bootstrap_mcts"
     assert hints["include_seed_repair_actions"] is False
-    assert hints["mcts_rollout_budget"] == 24
+    assert hints["mcts_rollout_budget"] == 12
     assert hints["mcts_exploration_weight"] == 1.15
     raw_budget_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
@@ -805,6 +805,29 @@ def test_target_bootstrap_score_rewards_absolute_progress_without_reference():
     assert high > 0.0
     assert lower > high
     assert oe_backend._target_bootstrap_score(9, 9, None) == 1.0
+
+
+def test_component_bootstrap_target_penalizes_under_budget(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = Tdag(params, "unit_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "softmax",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.add_edge("arg0", "softmax")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"softmax"}
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    under = oe_backend._contextual_target_bootstrap_score(context, 9, 1, None)
+    aligned = oe_backend._contextual_target_bootstrap_score(context, 9, 3, None)
+
+    assert under < aligned
+    assert aligned == 1.0
 
 
 def test_assignment_count_summary_does_not_sum_qbp_alternatives(monkeypatch):
@@ -1657,6 +1680,22 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
         "nonlinear:layer.0:attention_softmax": 3
     }
     assert component["policy"]["bootstrap_anchor_count"] >= 3
+
+
+def test_component_budget_mcts_does_not_stop_at_too_few_bootstraps(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    hints = {
+        "target_bootstrap_count": 9,
+        "component_bootstrap_budgets": {
+            "nonlinear:global:attention_softmax": 4,
+            "nonlinear:global:norm": 2,
+            "nonlinear:global:reciprocal": 2,
+            "nonlinear:global:activation": 1,
+        },
+    }
+
+    assert not oe_backend._policy_bootstrap_target_met(hints, params, 3)
+    assert oe_backend._policy_bootstrap_target_met(hints, params, 7)
 
 
 def test_unit_policy_api_and_lenient_repairs(toy_cost_json: str, tmp_path: Path):

@@ -495,14 +495,14 @@ def place(context):
         action["policy"] = policy
     policy = mcts.low_bootstrap_seed(
         target_bootstraps=target_bootstraps,
-        rollout_budget=24,
+        rollout_budget=12,
         exploration_weight=1.15,
         max_repair_bootstraps=max(4, int(target_bootstraps or 0)),
         action_cap=len(actions),
     )
     policy["mcts_actions"] = actions
     policy["mcts_action_cap"] = len(actions)
-    policy["mcts_rollout_budget"] = 24
+    policy["mcts_rollout_budget"] = 12
     policy["mcts_exploration_weight"] = 1.15
     return policy
 # EVOLVE-BLOCK-END
@@ -564,14 +564,14 @@ def place(context):
             action["policy"] = policy
         policy = mcts.low_bootstrap_seed(
             target_bootstraps=target_bootstraps,
-            rollout_budget=24,
+            rollout_budget=12,
             exploration_weight=1.15,
             max_repair_bootstraps=max(4, int(target_bootstraps or 0)),
             action_cap=len(actions),
         )
         policy["mcts_actions"] = actions
         policy["mcts_action_cap"] = len(actions)
-        policy["mcts_rollout_budget"] = 24
+        policy["mcts_rollout_budget"] = 12
         policy["mcts_exploration_weight"] = 1.15
         policy["include_seed_repair_actions"] = False
         return policy
@@ -998,7 +998,8 @@ def evaluate_compile_candidate_program(
         repair_score = 1.0 / (1.0 + repair_count)
         boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
         target_bootstrap_count = _context_target_bootstrap_count(context)
-        target_bootstrap_score = _target_bootstrap_score(
+        target_bootstrap_score = _contextual_target_bootstrap_score(
+            context,
             target_bootstrap_count,
             result["bootstrap_count"],
             reference.get("bootstrap_count"),
@@ -1021,8 +1022,8 @@ def evaluate_compile_candidate_program(
         quality_score = (
             0.35 * latency_score
             + 0.08 * bootstrap_score
-            + 0.07 * target_bootstrap_score
-            + 0.06 * component_bootstrap_score
+            + 0.05 * target_bootstrap_score
+            + 0.10 * component_bootstrap_score
             + 0.05 * rescale_score
             + 0.08 * boundary_score
             + 0.07 * risk_score
@@ -1038,7 +1039,8 @@ def evaluate_compile_candidate_program(
                 0.14 * effective_validity
                 + 0.18 * boundary_group_validity
                 + 0.14 * candidate_qbp_coverage
-                + 0.44 * bootstrap_frontier
+                + 0.38 * bootstrap_frontier
+                + 0.06 * component_bootstrap_score
                 + 0.10 * quality_score
             )
         elif result["fallback_selected_budgets"] > 0 or fallback_groups > 0 or repair_count > 0:
@@ -1049,8 +1051,8 @@ def evaluate_compile_candidate_program(
                     + 0.18 * boundary_group_validity
                     + 0.24 * candidate_qbp_coverage
                     + 0.18 * fallback_score
-                    + 0.14 * quality_score
-                    + 0.08 * unit_coverage
+                    + 0.13 * quality_score
+                    + 0.10 * unit_coverage
                     + 0.06 * repair_score,
                 )
             else:
@@ -3112,7 +3114,8 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
             reference["bootstrap_count"], counts["bootstrap"]
         )
         target_bootstrap_count = _context_target_bootstrap_count(context)
-        target_bootstrap_score = _target_bootstrap_score(
+        target_bootstrap_score = _contextual_target_bootstrap_score(
+            context,
             target_bootstrap_count,
             counts["bootstrap"],
             reference["bootstrap_count"],
@@ -3129,8 +3132,8 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         quality_score = (
             0.39 * latency_score
             + 0.12 * bootstrap_score
-            + 0.09 * target_bootstrap_score
-            + 0.06 * component_bootstrap_score
+            + 0.06 * target_bootstrap_score
+            + 0.09 * component_bootstrap_score
             + 0.08 * rescale_score
             + 0.13 * risk_score
             + 0.12 * reserve_score
@@ -4290,15 +4293,12 @@ def _boundary_mcts_group_reward(
     if not attempts:
         return -0.1
     summary = _assignment_count_summary([attempt.assign for attempt in attempts])
-    target = max(
-        0,
-        _int_hint(
-            hints.get("target_bootstrap_count"),
-            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
-        ),
+    bootstrap_score = _policy_target_bootstrap_score(
+        hints,
+        params,
+        summary["avg_bootstrap"],
+        None,
     )
-    target = max(target, sum(_policy_unit_bootstrap_targets(hints).values()))
-    bootstrap_score = _target_bootstrap_score(target, summary["avg_bootstrap"], None)
     rescale_score = 1.0 / (1.0 + summary["avg_rescale"] / 32.0)
     cost_score = 1.0 / (1.0 + (sum(attempt.cost for attempt in attempts) / len(attempts)) / 1_000_000_000.0)
     return 0.50 * coverage + 0.30 * bootstrap_score + 0.12 * rescale_score + 0.08 * cost_score
@@ -4312,18 +4312,8 @@ def _boundary_mcts_group_target_met(
 ) -> bool:
     if requested <= 0 or len(attempts) < requested:
         return False
-    target = max(
-        0,
-        _int_hint(
-            hints.get("target_bootstrap_count"),
-            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
-        ),
-    )
-    target = max(target, sum(_policy_unit_bootstrap_targets(hints).values()))
-    if target <= 0:
-        return False
     summary = _assignment_count_summary([attempt.assign for attempt in attempts])
-    return summary["avg_bootstrap"] <= target
+    return _policy_bootstrap_target_met(hints, params, summary["avg_bootstrap"])
 
 
 def _build_bootstrap_mcts_assign(
@@ -4570,15 +4560,20 @@ def _mcts_rollout_reward(
     root_hints: dict[str, Any],
 ) -> float:
     counts = _aggregate_counts([assign])
-    target = max(0, _int_hint(root_hints.get("target_bootstrap_count"), 0))
-    if target <= 0:
-        target = max(0, int(getattr(params, "openevolve_target_bootstrap_count", 0)))
-    component_target = sum(_policy_unit_bootstrap_targets(root_hints).values())
-    target = max(target, component_target)
-    bootstrap_score = _target_bootstrap_score(target, counts["bootstrap"], None)
+    bootstrap_score = _policy_target_bootstrap_score(
+        root_hints,
+        params,
+        counts["bootstrap"],
+        None,
+    )
     op_penalty = 0.0005 * counts["rescale"] + 0.02 * counts["bootstrap"]
     latency_penalty = min(0.25, max(0.0, cost) / 1_000_000_000_000.0)
-    no_bootstrap_bonus = 0.08 if counts["bootstrap"] == 0 and component_target <= 0 else 0.0
+    no_bootstrap_bonus = (
+        0.08
+        if counts["bootstrap"] == 0
+        and not _policy_unit_bootstrap_targets(root_hints)
+        else 0.0
+    )
     strict_bonus = 0.04 if action_policy.get("forbid_bootstrap") else 0.0
     return bootstrap_score + no_bootstrap_bonus + strict_bonus - op_penalty - latency_penalty
 
@@ -4588,11 +4583,11 @@ def _mcts_invalid_reward(action: MCTSAction, step: int) -> float:
 
 
 def _mcts_target_met(assign: Assign, params: Params, hints: dict[str, Any]) -> bool:
-    target = max(0, _int_hint(hints.get("target_bootstrap_count"), 0))
-    if target <= 0:
-        target = max(0, int(getattr(params, "openevolve_target_bootstrap_count", 0)))
-    target = max(target, sum(_policy_unit_bootstrap_targets(hints).values()))
-    return target > 0 and _aggregate_counts([assign])["bootstrap"] <= target
+    return _policy_bootstrap_target_met(
+        hints,
+        params,
+        _aggregate_counts([assign])["bootstrap"],
+    )
 
 
 def _policy_assignment_score(
@@ -5813,6 +5808,93 @@ def _target_bootstrap_score(
         progress_score = max(0.0, min(1.0, 1.0 - numerator / denominator))
     absolute_score = math.sqrt(float(target_int) / float(candidate_int))
     return max(progress_score, max(0.0, min(1.0, 0.35 * absolute_score)))
+
+
+def _contextual_target_bootstrap_score(
+    context: dict[str, Any],
+    target: int | float | None,
+    candidate: int | float,
+    reference: int | float | None = None,
+) -> float:
+    component_target = _safe_int(
+        context.get("unit_bootstrap_budget", {}).get("component_budget_total"),
+        0,
+    )
+    if component_target <= 0:
+        return _target_bootstrap_score(target, candidate, reference)
+    target_int = max(component_target, _safe_int(target, 0))
+    return _bootstrap_budget_fit_score(
+        max(0.0, _finite_float(candidate, float("inf"))),
+        target_int,
+        reference,
+        component_target=component_target,
+    )
+
+
+def _policy_target_bootstrap_score(
+    hints: dict[str, Any],
+    params: Params,
+    candidate: int | float,
+    reference: int | float | None = None,
+) -> float:
+    target = max(
+        0,
+        _int_hint(
+            hints.get("target_bootstrap_count"),
+            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
+        ),
+    )
+    component_target = sum(_policy_unit_bootstrap_targets(hints).values())
+    if component_target <= 0:
+        return _target_bootstrap_score(target, candidate, reference)
+    return _bootstrap_budget_fit_score(
+        max(0.0, _finite_float(candidate, float("inf"))),
+        max(target, component_target),
+        reference,
+        component_target=component_target,
+    )
+
+
+def _bootstrap_budget_fit_score(
+    candidate: float,
+    target: int | float,
+    reference: int | float | None = None,
+    *,
+    component_target: int | float = 0,
+) -> float:
+    target_value = max(1.0, float(target or 0))
+    if not math.isfinite(candidate):
+        return 0.0
+    if component_target > 0 and candidate < float(component_target):
+        # Component budgets are soft, but under-maintaining softmax/norm style
+        # regions should not score as perfect merely because it is fewer
+        # bootstraps globally.
+        return max(0.05, min(0.82, candidate / max(1.0, float(component_target))))
+    if candidate <= target_value:
+        return 1.0
+    return _target_bootstrap_score(int(target_value), candidate, reference)
+
+
+def _policy_bootstrap_target_met(
+    hints: dict[str, Any],
+    params: Params,
+    candidate: int | float,
+) -> bool:
+    target = max(
+        0,
+        _int_hint(
+            hints.get("target_bootstrap_count"),
+            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
+        ),
+    )
+    component_target = sum(_policy_unit_bootstrap_targets(hints).values())
+    candidate_value = max(0.0, _finite_float(candidate, float("inf")))
+    if component_target > 0:
+        return candidate_value >= max(1.0, 0.65 * component_target) and candidate_value <= max(
+            component_target,
+            target,
+        ) * 1.35
+    return target > 0 and candidate_value <= target
 
 
 def _component_bootstrap_alignment_summary(

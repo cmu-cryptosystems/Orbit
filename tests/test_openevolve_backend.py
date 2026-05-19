@@ -721,7 +721,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
-    assert hints["include_seed_repair_actions"] is True
+    assert hints["include_seed_repair_actions"] is False
     assert hints["mcts_rollout_budget"] == 24
     assert hints["mcts_exploration_weight"] == 1.15
     raw_budget_beams = [
@@ -1127,6 +1127,43 @@ def test_bootstrap_mcts_can_opt_into_direct_budget_beam_before_actions(toy_cost_
     assert diagnostics["candidate_solved_budgets"] == 1
     assert diagnostics["fallback_selected_budgets"] == 0
     assert diagnostics["selected_source_counts"] == {"candidate:direct_budget_beam": 1}
+
+
+def test_bootstrap_mcts_candidate_actions_precede_seed_repair(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    params.openevolve_evaluating_candidate = True
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    diagnostics = {}
+    action_policy = oe_backend._budget_fulfillment_beam_policy()
+    action_policy["direct_budget_policy"] = True
+
+    solve_budget_batch(
+        graph,
+        [{"in_lvl": -1, "in_scl": params.Sw}],
+        le,
+        params,
+        {
+            **oe_backend._bootstrap_mcts_seed_policy(params),
+            "allow_seed_fallback": False,
+            "include_seed_repair_actions": True,
+            "mcts_actions": [
+                {
+                    "name": "budget_fulfillment_beam",
+                    "policy": action_policy,
+                    "prior": 1.0,
+                }
+            ],
+        },
+        diagnostics,
+    )
+
+    assert diagnostics["candidate_solved_budgets"] == 1
+    assert diagnostics["fallback_selected_budgets"] == 0
+    assert not any(
+        source.startswith("candidate:seed_repair")
+        for source in diagnostics["selected_source_counts"]
+    )
 
 
 def test_bootstrap_mcts_skips_direct_budget_beam_by_default(toy_cost_json: str):

@@ -2349,7 +2349,6 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
     assert hints["strategy"] == "level_preserving"
     assert hints["level_drop_penalty"] == 123.0
     assert ("polybert-sampled", 20_000_000.0) in eval_suites
-    assert ("polybert-full", 20_000_000.0) in eval_suites
     assert ("polybert-full", 123.0) in eval_suites
     assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
 

@@ -2049,16 +2049,30 @@ def _run_full_bundle_finalists(
         return fail_open
     full_context = json.loads(json.dumps(sampled_context))
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
-    reference_hints = initial_hints or {}
-    reference = _evaluate_compile_hints(full_context, reference_hints, suppress_output=True)
-    full_context["reference"] = {
-        "final_latency_usec": reference.get("final_latency_usec"),
-        "bootstrap_count": reference.get("bootstrap_count"),
-        "rescale_count": reference.get("rescale_count"),
-        "valid": reference.get("valid", False),
-        "source": "initial_seed",
-        "policy_summary": _compact_policy_summary(reference_hints),
-    }
+    reference_hints = _finalist_hints_for_full_bundle(initial_hints or {})
+    sampled_reference = sampled_context.get("reference")
+    if isinstance(sampled_reference, dict) and sampled_reference:
+        full_context["reference"] = {
+            "final_latency_usec": sampled_reference.get("final_latency_usec"),
+            "bootstrap_count": sampled_reference.get("bootstrap_count"),
+            "rescale_count": sampled_reference.get("rescale_count"),
+            "valid": sampled_reference.get("valid", False),
+            "source": "sampled_initial_seed",
+            "policy_summary": sampled_reference.get(
+                "policy_summary",
+                _compact_policy_summary(reference_hints),
+            ),
+        }
+    else:
+        reference = _evaluate_compile_hints(full_context, reference_hints, suppress_output=True)
+        full_context["reference"] = {
+            "final_latency_usec": reference.get("final_latency_usec"),
+            "bootstrap_count": reference.get("bootstrap_count"),
+            "rescale_count": reference.get("rescale_count"),
+            "valid": reference.get("valid", False),
+            "source": "initial_seed",
+            "policy_summary": _compact_policy_summary(reference_hints),
+        }
     full_context.setdefault("harness", {})["seed_baseline"] = dict(full_context["reference"])
     candidates = _discover_finalist_codes(output_dir, best_code, params.openevolve_finalists)
     summaries = []

@@ -2814,6 +2814,17 @@ def _budget_boundary_groups(io_budgets_list: list[dict]) -> dict[tuple, list[dic
 
 def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
     seed = _default_policy_hints()
+    beam = _budget_fulfillment_beam_policy()
+    if not getattr(params, "openevolve_evaluating_candidate", False):
+        return [("seed_fallback_latency_beam", beam)]
+    return [
+        ("seed_fallback", seed),
+        ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),
+        ("seed_fallback_latency_beam", beam),
+    ]
+
+
+def _budget_fulfillment_beam_policy() -> dict[str, Any]:
     beam = _low_scale_frontier_policy()
     beam.update(
         {
@@ -2826,13 +2837,7 @@ def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
             "max_scale_candidates": 16,
         }
     )
-    if not getattr(params, "openevolve_evaluating_candidate", False):
-        return [("seed_fallback_latency_beam", beam)]
-    return [
-        ("seed_fallback", seed),
-        ("seed_fallback_relaxed", _relaxed_scheduler_policy(seed, params)),
-        ("seed_fallback_latency_beam", beam),
-    ]
+    return beam
 
 
 def _boundary_mcts_group_attempts(
@@ -3459,6 +3464,18 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
     )
     target = max(0, _int_hint(base.get("target_bootstrap_count"), 0))
     variants = [
+        (
+            "budget_fulfillment_beam",
+            {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "selection_bootstrap_penalty": max(
+                    500_000_000.0,
+                    _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
+                ),
+            },
+            0.35,
+        ),
         (
             "strict_no_bootstrap",
             {
@@ -5236,6 +5253,14 @@ def candidate_actions(
         "bootstrap_anchor_count": 0,
     }
     actions: list[dict[str, Any]] = [
+        {
+            "name": "budget_fulfillment_beam",
+            "prior": 0.35,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+            },
+        },
         {
             "name": "strict_no_bootstrap",
             "prior": 0.30,

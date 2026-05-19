@@ -798,7 +798,9 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     assert hints["strategy"] == "bootstrap_mcts"
     assert hints["target_bootstrap_count"] == 9
     assert len(hints["mcts_actions"]) >= 4
-    assert hints["mcts_actions"][0]["policy"]["forbid_bootstrap"] is True
+    assert hints["mcts_actions"][0]["name"] == "budget_fulfillment_beam"
+    assert hints["mcts_actions"][0]["policy"]["strategy"] == "latency_beam"
+    assert any(action["policy"].get("forbid_bootstrap") for action in hints["mcts_actions"])
     assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
     assert sampled["mcts_rollout_budget"] <= 2
     assert sampled["mcts_action_cap"] <= 2

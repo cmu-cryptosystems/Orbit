@@ -1680,6 +1680,61 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
         "nonlinear:layer.0:attention_softmax": 3
     }
     assert component["policy"]["bootstrap_anchor_count"] >= 3
+    assert component["policy"]["selection_objective"] == "component_budget_fit"
+    assert component["policy"]["prefer_component_budget_fit"] is True
+
+
+def test_component_budget_selection_prefers_budget_fit_over_low_cost(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=1)
+    graph = Tdag(params, "selection_objective")
+    graph.add_node(
+        "softmax",
+        op="input",
+        weight=1,
+        op_descr={},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.inputs = {"softmax"}
+    graph.outputs = {"softmax"}
+
+    low = Assign(graph)
+    low.v_lvl_in["softmax"] = params.lvl_ub
+    low.v_scl_in["softmax"] = params.Sw
+    low.v_lvl_out["softmax"] = params.lvl_ub
+    low.v_scl_out["softmax"] = params.Sw
+
+    maintained = Assign(graph)
+    maintained.v_lvl_in["softmax"] = params.bts_lb
+    maintained.v_scl_in["softmax"] = params.Sw
+    maintained.v_lvl_out["softmax"] = params.bts_lb + 1
+    maintained.v_scl_out["softmax"] = params.Sf
+
+    policy = {
+        "selection_objective": "component_budget_fit",
+        "prefer_component_budget_fit": True,
+        "target_bootstrap_count": 1,
+        "component_bootstrap_budgets": {"nonlinear:layer.0:attention_softmax": 1},
+    }
+    low_attempt = oe_backend._BudgetAttempt(
+        "candidate:low",
+        low,
+        1.0,
+        (params.lvl_ub, params.Sw),
+        (params.lvl_ub, params.Sw),
+        1.0,
+        policy,
+    )
+    maintained_attempt = oe_backend._BudgetAttempt(
+        "candidate:maintained",
+        maintained,
+        10.0,
+        (params.bts_lb, params.Sw),
+        (params.bts_lb + 1, params.Sf),
+        10.0,
+        policy,
+    )
+
+    assert oe_backend._best_candidate_attempt([low_attempt, maintained_attempt], params) is maintained_attempt
 
 
 def test_component_budget_mcts_does_not_stop_at_too_few_bootstraps(toy_cost_json: str):

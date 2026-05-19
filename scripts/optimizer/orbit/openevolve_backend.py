@@ -61,6 +61,7 @@ class _BudgetAttempt:
     in_key: tuple[int, int]
     out_key: tuple[int, int]
     actual_cost: float | None = None
+    policy: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -488,7 +489,11 @@ def place(context):
             policy["selection_bootstrap_penalty"] = 1_250_000_000.0
         elif name == "component_budget_repair":
             action["prior"] = 0.20
-            policy["selection_bootstrap_penalty"] = 450_000_000.0
+            policy["selection_objective"] = "component_budget_fit"
+            policy["prefer_component_budget_fit"] = True
+            policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
+            policy["bootstrap_penalty"] = 250_000_000.0
+            policy["selection_bootstrap_penalty"] = 50_000_000.0
         elif name == "waterline_budget_repair":
             action["prior"] = 0.10
             policy["selection_bootstrap_penalty"] = 1_750_000_000.0
@@ -557,7 +562,11 @@ def place(context):
                 policy["selection_bootstrap_penalty"] = 1_250_000_000.0
             elif name == "component_budget_repair":
                 action["prior"] = 0.20
-                policy["selection_bootstrap_penalty"] = 450_000_000.0
+                policy["selection_objective"] = "component_budget_fit"
+                policy["prefer_component_budget_fit"] = True
+                policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
+                policy["bootstrap_penalty"] = 250_000_000.0
+                policy["selection_bootstrap_penalty"] = 50_000_000.0
             elif name == "waterline_budget_repair":
                 action["prior"] = 0.10
                 policy["selection_bootstrap_penalty"] = 1_750_000_000.0
@@ -3353,9 +3362,7 @@ def solve_budget_batch(
                 )
             continue
 
-        candidate_attempt = _best_attempt(
-            attempt for attempt in attempts if attempt.source.startswith("candidate")
-        )
+        candidate_attempt = _best_candidate_attempt(attempts, params)
         fallback_attempt = _best_attempt(
             attempt for attempt in attempts if attempt.source.startswith("seed_fallback")
         )
@@ -3586,9 +3593,7 @@ def _solve_budget_batch_boundary_mcts(
                         last_error or PlacementError("no feasible boundary-mcts placement policy"),
                     )
                 continue
-            candidate_attempt = _best_attempt(
-                attempt for attempt in attempts if attempt.source.startswith("candidate")
-            )
+            candidate_attempt = _best_candidate_attempt(attempts, params)
             fallback_attempt = _best_attempt(
                 attempt for attempt in attempts if attempt.source.startswith("seed_fallback")
             )
@@ -3738,7 +3743,11 @@ def _boundary_mcts_group_attempts(
                             f"boundary-mcts rollout exceeded bootstrap repair cap "
                             f"({counts['bootstrap']} > {max_repair_bootstraps})"
                         )
-                    if best_for_budget is None or attempt.cost < best_for_budget.cost:
+                    if best_for_budget is None or _attempt_selection_rank(
+                        attempt, variant, params
+                    ) > _attempt_selection_rank(
+                        best_for_budget, best_for_budget.policy or variant, params
+                    ):
                         best_for_budget = attempt
                 except Exception as exc:
                     invalid_reasons[f"{type(exc).__name__}: {str(exc)[:160]}"] += 1
@@ -3938,6 +3947,7 @@ def _solve_one_budget_attempt(
         in_key,
         out_key,
         actual_cost,
+        dict(policy_hints),
     )
 
 
@@ -3961,7 +3971,7 @@ def _solve_one_record_attempt(
     if io_budget.get("out_lvl", -1) >= 0 and out_key[0] != io_budget["out_lvl"]:
         raise PlacementError("record output level mismatch")
     actual_cost = estimate_assign(assign, le)
-    return _BudgetAttempt("candidate_record", assign, actual_cost, in_key, out_key, actual_cost)
+    return _BudgetAttempt("candidate_record", assign, actual_cost, in_key, out_key, actual_cost, None)
 
 
 def _best_attempt(attempts) -> _BudgetAttempt | None:
@@ -3970,6 +3980,84 @@ def _best_attempt(attempts) -> _BudgetAttempt | None:
         if best is None or attempt.cost < best.cost:
             best = attempt
     return best
+
+
+def _candidate_attempt_objective(attempts: list[_BudgetAttempt]) -> bool:
+    return any(
+        _selection_objective(attempt.policy or {}) != "cost"
+        for attempt in attempts
+    )
+
+
+def _best_candidate_attempt(
+    attempts,
+    params: Params,
+) -> _BudgetAttempt | None:
+    candidate_attempts = [
+        attempt for attempt in attempts if attempt.source.startswith("candidate")
+    ]
+    if not candidate_attempts:
+        return None
+    if not _candidate_attempt_objective(candidate_attempts):
+        return _best_attempt(candidate_attempts)
+    return max(
+        candidate_attempts,
+        key=lambda attempt: _attempt_selection_rank(
+            attempt,
+            attempt.policy or {},
+            params,
+        ),
+    )
+
+
+def _selection_objective(policy: dict[str, Any]) -> str:
+    objective = str(policy.get("selection_objective", "cost")).strip().lower()
+    if _bool_hint(policy.get("prefer_component_budget_fit"), False):
+        return "component_budget_fit"
+    if objective in {"component_budget_fit", "target_bootstrap_fit", "budget_fit"}:
+        return objective
+    return "cost"
+
+
+def _attempt_selection_rank(
+    attempt: _BudgetAttempt,
+    policy: dict[str, Any],
+    params: Params,
+) -> tuple[float, float]:
+    objective = _selection_objective(policy)
+    if objective == "cost":
+        return (-float(attempt.cost), -float(_attempt_actual_cost(attempt)))
+
+    counts = _maintenance_counts(attempt.assign)
+    locations = _maintenance_locations(attempt.assign)
+    bootstrap_count = float(counts["bootstrap"])
+    target_score = _policy_target_bootstrap_score(policy, params, bootstrap_count, None)
+    component_context = _component_context_from_policy(policy)
+    component_score = _component_bootstrap_alignment_score(
+        component_context,
+        locations.get("bootstrap", {}),
+        bootstrap_count,
+    )
+    rescale_score = 1.0 / (1.0 + float(counts["rescale"]) / 32.0)
+    latency_score = 1.0 / (1.0 + max(0.0, _attempt_actual_cost(attempt)) / 1_000_000_000.0)
+    if objective == "target_bootstrap_fit":
+        score = 0.62 * target_score + 0.18 * component_score + 0.12 * rescale_score + 0.08 * latency_score
+    else:
+        score = 0.42 * target_score + 0.38 * component_score + 0.12 * rescale_score + 0.08 * latency_score
+    return (float(score), -float(_attempt_actual_cost(attempt)))
+
+
+def _component_context_from_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    targets = _policy_unit_bootstrap_targets(policy)
+    return {
+        "unit_bootstrap_budget": {
+            "unit_budgets": {
+                unit_id: {"target": target}
+                for unit_id, target in targets.items()
+            }
+        },
+        "placement_units": [],
+    }
 
 
 def _placement_record_for_budget(
@@ -6528,6 +6616,8 @@ def candidate_actions(
         "boundary_state_cap": 2,
         "bootstrap_anchor_count": 0,
         "component_bootstrap_budgets": component_targets,
+        "selection_objective": "cost",
+        "prefer_component_budget_fit": False,
     }
     actions: list[dict[str, Any]] = [
         {
@@ -6590,8 +6680,10 @@ def candidate_actions(
                 "allow_bootstrap": True,
                 "boundary_scale_policy": "frontier",
                 "bootstrap_anchor_count": component_anchor_count,
-                "bootstrap_penalty": 1_250_000_000.0,
-                "selection_bootstrap_penalty": 450_000_000.0,
+                "bootstrap_penalty": 250_000_000.0,
+                "selection_bootstrap_penalty": 50_000_000.0,
+                "selection_objective": "component_budget_fit",
+                "prefer_component_budget_fit": True,
                 "min_transition_reserve": 2,
                 "min_decryptability_reserve": 2,
             },
@@ -7650,6 +7742,15 @@ def _sanitize_policy_values(
     }:
         repairs.append(f"{prefix}.strategy reset to level_preserving")
         policy["strategy"] = "level_preserving"
+    if "selection_objective" in policy:
+        objective = _selection_objective(policy)
+        if objective != str(policy.get("selection_objective", "cost")).strip().lower():
+            repairs.append(f"{prefix}.selection_objective reset to {objective}")
+        policy["selection_objective"] = objective
+    if "prefer_component_budget_fit" in policy:
+        policy["prefer_component_budget_fit"] = _bool_hint(
+            policy.get("prefer_component_budget_fit"), False
+        )
     clamp_int("max_scale_candidates", 3, 32)
     clamp_int("beam_width", 1, 8)
     clamp_int("state_cap_per_node", 1, 32)
@@ -7913,6 +8014,8 @@ _PATCHABLE_POLICY_KEYS = {
     "enable_direct_budget_beam",
     "include_seed_repair_actions",
     "enable_sampled_latency_beam",
+    "selection_objective",
+    "prefer_component_budget_fit",
     "boundary_scale_policy",
     "boundary_state_cap",
     "preferred_boundary_scale",

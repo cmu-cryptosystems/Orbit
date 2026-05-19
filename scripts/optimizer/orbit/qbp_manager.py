@@ -272,11 +272,21 @@ class QBPManager:
             return io_budgets_list
         if suite == "toy":
             return io_budgets_list[: min(len(io_budgets_list), 8)]
+        max_sample_hint = int(getattr(self.params, "openevolve_max_unit_samples", 64))
+        if (
+            getattr(self.params, "openevolve_harness", "compile") == "compile"
+            and getattr(self.params, "openevolve_search_mode", "") == "bootstrap-mcts"
+            and suite != "polybert-full"
+        ):
+            return self._sample_individual_openevolve_eval_budgets(
+                io_budgets_list,
+                min(len(io_budgets_list), max(1, max_sample_hint)),
+            )
         if len(io_budgets_list) <= 64:
             return io_budgets_list
         max_sample = min(
             len(io_budgets_list),
-            max(8, int(getattr(self.params, "openevolve_max_unit_samples", 64))),
+            max(8, max_sample_hint),
         )
         keep_levels = {
             1,
@@ -415,6 +425,98 @@ class QBPManager:
                 add(budget)
             sampled = [budget for key in sampled_groups for budget in groups[key]]
         return sampled or io_budgets_list[:1]
+
+    def _sample_individual_openevolve_eval_budgets(
+        self,
+        io_budgets_list: list[dict],
+        max_sample: int,
+    ) -> list[dict]:
+        if len(io_budgets_list) <= max_sample:
+            return io_budgets_list
+        selected: list[dict] = []
+        seen = set()
+        keep_levels = {
+            1,
+            max(1, self.params.bts_lb + 1),
+            max(1, self.params.lvl_ub // 2),
+            self.params.lvl_ub,
+        }
+
+        def key_for(budget: dict) -> tuple:
+            return (
+                int(budget.get("in_lvl", -1)),
+                int(budget.get("in_scl", -1)),
+                int(budget.get("out_lvl", -1)),
+                str(budget.get("maino_v", "")),
+                int(budget.get("main_dag_size", 0) or 0),
+            )
+
+        def add(budget: dict) -> None:
+            if len(selected) >= max_sample:
+                return
+            key = key_for(budget)
+            if key in seen:
+                return
+            seen.add(key)
+            selected.append(budget)
+
+        def budget_cost(budget: dict) -> float:
+            costs = budget.get("main_qbp_cost")
+            if isinstance(costs, dict) and costs:
+                return float(min(costs.values()))
+            return 0.0
+
+        def budget_size(budget: dict) -> float:
+            try:
+                return float(budget.get("main_dag_size", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def add_quantiles(budgets: list[dict], key_fn, limit: int) -> None:
+            if not budgets or len(selected) >= max_sample:
+                return
+            ordered = sorted(
+                budgets,
+                key=lambda item: (
+                    key_fn(item),
+                    int(item.get("out_lvl", -1)),
+                    int(item.get("in_lvl", -1)),
+                    int(item.get("in_scl", -1)),
+                    str(item.get("maino_v", "")),
+                ),
+            )
+            indexes = {
+                0,
+                len(ordered) // 4,
+                len(ordered) // 2,
+                (3 * len(ordered)) // 4,
+                len(ordered) - 1,
+            }
+            for idx in sorted(indexes)[:limit]:
+                if 0 <= idx < len(ordered):
+                    add(ordered[idx])
+
+        bypass_budgets = [budget for budget in io_budgets_list if "maino_v" in budget]
+        add_quantiles(bypass_budgets, budget_cost, max(1, max_sample // 3))
+        add_quantiles(bypass_budgets, budget_size, max(1, max_sample // 3))
+
+        by_level: dict[int, list[dict]] = {}
+        for budget in io_budgets_list:
+            by_level.setdefault(int(budget.get("out_lvl", -1)), []).append(budget)
+        for level in sorted(keep_levels):
+            add_quantiles(by_level.get(level, []), budget_cost, 1)
+            if len(selected) >= max_sample:
+                break
+
+        add_quantiles(io_budgets_list, budget_cost, max_sample)
+        add_quantiles(io_budgets_list, budget_size, max_sample)
+        if len(selected) < max_sample:
+            stride = max(1, len(io_budgets_list) // max_sample)
+            for budget in io_budgets_list[::stride]:
+                add(budget)
+                if len(selected) >= max_sample:
+                    break
+        return selected or io_budgets_list[:1]
 
     def _record_openevolve_budget_task(
         self,

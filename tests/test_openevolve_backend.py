@@ -1164,6 +1164,29 @@ def test_sampled_compile_harness_uses_cached_budget_tasks(
     assert result["diagnostics"]["solved_budgets"] == 1
 
 
+def test_bootstrap_mcts_sampled_budget_sampler_can_use_individual_records(
+    toy_cost_json: str,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_harness="compile",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=4,
+    )
+    params.openevolve_evaluating_candidate = True
+    manager = QBPManager(params, LatencyEstimator(params))
+    budgets = [
+        {"in_lvl": -1, "in_scl": params.Sw, "out_lvl": out_lvl}
+        for out_lvl in range(1, params.lvl_ub + 1)
+    ]
+
+    sampled = manager._sample_openevolve_eval_budgets(_toy_pdag(params), budgets)
+
+    assert 1 <= len(sampled) <= 4
+    assert len({int(item["out_lvl"]) for item in sampled}) == len(sampled)
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)
@@ -1457,6 +1480,7 @@ def test_polybert_sampled_budgets_keep_bypass_and_cost_extremes(toy_cost_json: s
     params = _params(toy_cost_json)
     params.openevolve_evaluating_candidate = True
     params.openevolve_eval_suite = "polybert-sampled"
+    params.openevolve_search_mode = "legacy"
     manager = QBPManager(params, None)
     budgets = []
     for group_idx in range(20):

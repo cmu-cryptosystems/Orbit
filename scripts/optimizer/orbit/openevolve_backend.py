@@ -1705,6 +1705,33 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
                 filtered.append(cheap)
             continue
         filtered.append(item)
+    if filtered:
+        # Sampled MCTS uses a small action cap. Keep one direct budget solver in
+        # the first capped actions so evolution sees real QBP coverage instead
+        # of only fallback-repaired seed assignments.
+        original_order = {id(item): idx for idx, item in enumerate(filtered)}
+
+        def sampled_action_rank(item: dict[str, Any]) -> tuple[int, int]:
+            policy = item.get("policy", item)
+            if not isinstance(policy, dict):
+                policy = {}
+            name = str(item.get("name", ""))
+            strategy = str(policy.get("strategy", ""))
+            is_budget_beam = (
+                name == "budget_fulfillment_beam"
+                or (strategy == "latency_beam" and _bool_hint(policy.get("direct_budget_policy"), False))
+            )
+            if name == "strict_no_bootstrap" or _bool_hint(policy.get("forbid_bootstrap"), False):
+                return (0, original_order[id(item)])
+            if is_budget_beam:
+                return (1, original_order[id(item)])
+            if name == "minimal_bootstrap_repair":
+                return (2, original_order[id(item)])
+            if name == "waterline_budget_repair":
+                return (3, original_order[id(item)])
+            return (4, original_order[id(item)])
+
+        filtered.sort(key=sampled_action_rank)
     return filtered or raw_actions
 
 

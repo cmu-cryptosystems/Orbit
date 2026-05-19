@@ -2495,7 +2495,7 @@ def solve_budget_batch(
                 params,
                 diagnostics,
             )
-        return _solve_budget_batch_boundary_mcts(
+        result = _solve_budget_batch_boundary_mcts(
             pdag,
             io_budgets_list,
             le,
@@ -2503,6 +2503,21 @@ def solve_budget_batch(
             hints,
             diagnostics,
         )
+        if (
+            not result[0]
+            and not getattr(params, "openevolve_evaluating_candidate", False)
+            and bool(getattr(params, "openevolve_fail_open", True))
+        ):
+            if diagnostics is not None:
+                diagnostics["fail_open_seed_replay"] = True
+            return _solve_budget_batch_fast_seed(
+                pdag,
+                io_budgets_list,
+                le,
+                params,
+                diagnostics,
+            )
+        return result
     for io_budget in io_budgets_list:
         attempts: list[_BudgetAttempt] = []
         last_error = None

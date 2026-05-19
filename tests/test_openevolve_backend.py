@@ -983,6 +983,50 @@ def test_bootstrap_mcts_batch_keeps_complete_boundary_group(
     assert io_to_cost
 
 
+def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json, openevolve_iterations=1)
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budgets = [{"in_lvl": -1, "in_scl": 40, "out_lvl": 1}]
+    diagnostics = {}
+    fallback_called = False
+
+    def fake_boundary(*_args, **_kwargs):
+        return {}, {}
+
+    def fake_fast_seed(pdag, budget_list, le_arg, params_arg, diagnostics_arg):
+        nonlocal fallback_called
+        fallback_called = True
+        return oe_backend.solve_budget_batch(
+            pdag,
+            budget_list,
+            le_arg,
+            params_arg,
+            oe_backend._low_scale_frontier_policy(),
+            diagnostics_arg,
+        )
+
+    monkeypatch.setattr(oe_backend, "_solve_budget_batch_boundary_mcts", fake_boundary)
+    monkeypatch.setattr(oe_backend, "_solve_budget_batch_fast_seed", fake_fast_seed)
+
+    io_to_assign, io_to_cost = solve_budget_batch(
+        graph,
+        budgets,
+        le,
+        params,
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        diagnostics,
+    )
+
+    assert fallback_called
+    assert diagnostics["fail_open_seed_replay"] is True
+    assert io_to_assign
+    assert io_to_cost
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

@@ -491,6 +491,7 @@ def place(context):
             action["prior"] = 0.20
             policy["selection_objective"] = "component_budget_fit"
             policy["prefer_component_budget_fit"] = True
+            policy["force_bootstrap_anchors"] = True
             policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
             policy["bootstrap_penalty"] = 250_000_000.0
             policy["selection_bootstrap_penalty"] = 50_000_000.0
@@ -564,6 +565,7 @@ def place(context):
                 action["prior"] = 0.20
                 policy["selection_objective"] = "component_budget_fit"
                 policy["prefer_component_budget_fit"] = True
+                policy["force_bootstrap_anchors"] = True
                 policy["bootstrap_anchor_count"] = max(1, target_bootstraps)
                 policy["bootstrap_penalty"] = 250_000_000.0
                 policy["selection_bootstrap_penalty"] = 50_000_000.0
@@ -4253,14 +4255,16 @@ def _boundary_policy_variants(
         node_scales[pdag_vout] = int(scale)
         if int(io_budget.get("out_lvl", -1)) >= 0:
             node_levels[pdag_vout] = int(io_budget["out_lvl"])
-        for anchor in anchors:
-            node_levels[anchor] = _anchor_output_level(params, base)
-            node_scales[anchor] = max(
-                params.scale_lower_bound(anchor, tdag.nodes[anchor], "out"),
-                min(params.Sf, params.Sw),
-            )
+            for anchor in anchors:
+                node_levels[anchor] = _anchor_output_level(params, base)
+                node_scales[anchor] = max(
+                    params.scale_lower_bound(anchor, tdag.nodes[anchor], "out"),
+                    min(params.Sf, params.Sw),
+                )
         variant["preferred_node_levels"] = node_levels
         variant["preferred_node_scales"] = node_scales
+        if anchors and _bool_hint(base.get("force_bootstrap_anchors"), False):
+            variant["force_bootstrap_nodes"] = list(anchors)
         variants.append(_with_default_policy(variant))
     return variants
 
@@ -5015,6 +5019,11 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             0, min(1024, _int_hint(hints.get("mcts_max_repair_bootstraps"), 4))
         ),
         "enable_direct_budget_beam": _bool_hint(hints.get("enable_direct_budget_beam"), False),
+        "force_bootstrap_nodes": {
+            str(node) for node in hints.get("force_bootstrap_nodes", []) or []
+        }
+        if isinstance(hints.get("force_bootstrap_nodes", []), (list, tuple, set))
+        else set(),
         "max_scale": _max_scale(params),
     }
 
@@ -5533,6 +5542,13 @@ def _choose_output_state(
         and policy["min_internal_level"] is not None
         and in_level <= _effective_min_internal_level(policy, params) + 1
         and tdag.out_degree(v) > 1
+        and best_bootstrap is not None
+    ):
+        _, out_level, out_scale = best_bootstrap
+        return out_level, out_scale
+    if (
+        str(v) in policy.get("force_bootstrap_nodes", set())
+        and not policy.get("forbid_bootstrap")
         and best_bootstrap is not None
     ):
         _, out_level, out_scale = best_bootstrap
@@ -6684,6 +6700,7 @@ def candidate_actions(
                 "selection_bootstrap_penalty": 50_000_000.0,
                 "selection_objective": "component_budget_fit",
                 "prefer_component_budget_fit": True,
+                "force_bootstrap_anchors": True,
                 "min_transition_reserve": 2,
                 "min_decryptability_reserve": 2,
             },
@@ -7751,6 +7768,13 @@ def _sanitize_policy_values(
         policy["prefer_component_budget_fit"] = _bool_hint(
             policy.get("prefer_component_budget_fit"), False
         )
+    if "force_bootstrap_anchors" in policy:
+        policy["force_bootstrap_anchors"] = _bool_hint(
+            policy.get("force_bootstrap_anchors"), False
+        )
+    if "force_bootstrap_nodes" in policy and not isinstance(policy.get("force_bootstrap_nodes"), list):
+        repairs.append(f"{prefix}.force_bootstrap_nodes reset to []")
+        policy["force_bootstrap_nodes"] = []
     clamp_int("max_scale_candidates", 3, 32)
     clamp_int("beam_width", 1, 8)
     clamp_int("state_cap_per_node", 1, 32)
@@ -8016,6 +8040,8 @@ _PATCHABLE_POLICY_KEYS = {
     "enable_sampled_latency_beam",
     "selection_objective",
     "prefer_component_budget_fit",
+    "force_bootstrap_anchors",
+    "force_bootstrap_nodes",
     "boundary_scale_policy",
     "boundary_state_cap",
     "preferred_boundary_scale",

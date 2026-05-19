@@ -1682,6 +1682,45 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
     assert component["policy"]["bootstrap_anchor_count"] >= 3
     assert component["policy"]["selection_objective"] == "component_budget_fit"
     assert component["policy"]["prefer_component_budget_fit"] is True
+    assert component["policy"]["force_bootstrap_anchors"] is True
+
+
+def test_force_bootstrap_anchor_selects_refresh_transition(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "force_anchor")
+    graph.add_node(
+        "softmax",
+        op="input",
+        weight=1,
+        op_descr={},
+        comment="scope=bert.encoder.layer.0.attention.self.qk_softmax.softmax_mul;op=qk_softmax_mul",
+    )
+    graph.inputs = {"softmax"}
+    graph.outputs = {"softmax"}
+    policy = oe_backend._policy_options(
+        {
+            "strategy": "level_preserving",
+            "allow_bootstrap": True,
+            "force_bootstrap_nodes": ["softmax"],
+            "bootstrap_penalty": 1_000_000_000.0,
+        },
+        params,
+    )
+
+    out_level, out_scale = oe_backend._choose_output_state(
+        graph,
+        "softmax",
+        params,
+        10,
+        params.Sw,
+        None,
+        None,
+        None,
+        policy,
+        LatencyEstimator(params),
+    )
+
+    assert not params.check_res(10, params.Sw, out_level, out_scale)
 
 
 def test_component_budget_selection_prefers_budget_fit_over_low_cost(toy_cost_json: str):

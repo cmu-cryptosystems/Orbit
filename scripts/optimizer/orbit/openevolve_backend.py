@@ -463,8 +463,10 @@ def place(context):
     final repair into Assign objects.
 
     During sampled evolution, Orbit first rewards candidates that directly solve
-    more requested budget records. Latency and bootstrap count only become
-    competitive after a candidate covers enough budgets without seed fallback.
+    complete QBP boundary groups. Candidate programs should reduce the final
+    DP-selected bootstrap count versus context["reference"]["bootstrap_count"].
+    Sampled averages are diagnostics only: finalists must replay the full QBP
+    bundle, avoid seed fallback, and improve selected-path bootstrap/latency.
     """
     builder = PlacementBuilder(context)
     if context.get("harness", {}).get("search_mode") == "bootstrap-mcts":
@@ -744,13 +746,18 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     root = _compile_workspace_root(dag, params)
     root.mkdir(parents=True, exist_ok=True)
     context = build_compile_context(dag, params)
-    reference = _evaluate_compile_hints(context, {}, suppress_output=True)
+    initial_source = _initial_compile_program_source()
+    initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
+    reference = _evaluate_compile_hints(context, initial_hints, suppress_output=True)
     context["reference"] = {
         "final_latency_usec": reference.get("final_latency_usec"),
         "bootstrap_count": reference.get("bootstrap_count"),
         "rescale_count": reference.get("rescale_count"),
         "valid": reference.get("valid", False),
+        "source": "initial_seed",
+        "policy_summary": _compact_policy_summary(initial_hints),
     }
+    context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
     if reference.get("sampled_budget_tasks"):
         context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
     context["placement_profile"] = reference.get("bottleneck_summary", [])
@@ -764,9 +771,8 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     output_dir = root / "openevolve_output"
     context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    initial_path.write_text(_initial_compile_program_source(), encoding="utf-8")
+    initial_path.write_text(initial_source, encoding="utf-8")
     evaluator_path.write_text(_compile_evaluator_source(context_path), encoding="utf-8")
-    initial_hints = _load_candidate_hints(initial_path, context)
 
     worker = OpenEvolvePlacementWorker(params, le)
     if getattr(params, "openevolve_reuse_output", False):
@@ -888,6 +894,12 @@ def evaluate_compile_candidate_program(
             result["bootstrap_count"],
             reference.get("bootstrap_count"),
         )
+        seed_bootstrap_count = _context_seed_bootstrap_count(context)
+        bootstrap_delta_vs_seed = (
+            float(result["bootstrap_count"] - seed_bootstrap_count)
+            if seed_bootstrap_count is not None
+            else 0.0
+        )
         noise_estimate = _fast_compile_noise_estimate(context, result)
         noise_score = 1.0 if noise_estimate.get("valid", False) else 0.0
         reserve_score = _reserve_quality_score(result.get("reserve_summary", {}))
@@ -954,6 +966,8 @@ def evaluate_compile_candidate_program(
                 "final_latency_usec": float(result["final_latency_usec"] if result["valid"] else 0.0),
                 "boundary_quality": float(boundary_score),
                 "bootstrap_count": float(result["bootstrap_count"]),
+                "reference_bootstrap_count": float(seed_bootstrap_count or 0),
+                "bootstrap_delta_vs_seed": float(bootstrap_delta_vs_seed),
                 "target_bootstrap_count": float(target_bootstrap_count),
                 "rescale_count": float(result["rescale_count"]),
                 "profile_risk": float(result["profile_risk"]),
@@ -984,6 +998,7 @@ def evaluate_compile_candidate_program(
             },
             "artifacts": {
                 "reference_final_latency_usec": str(reference.get("final_latency_usec", "none")),
+                "reference_bootstrap_count": str(seed_bootstrap_count if seed_bootstrap_count is not None else "none"),
                 "candidate_final_latency_usec": f"{result['final_latency_usec']:.3f}",
                 "latency_delta_usec": (
                     f"{result['final_latency_usec'] - ref_latency:.3f}"
@@ -991,6 +1006,11 @@ def evaluate_compile_candidate_program(
                     else "none"
                 ),
                 "bootstrap_count": str(result["bootstrap_count"]),
+                "bootstrap_delta_vs_seed": (
+                    str(int(result["bootstrap_count"]) - seed_bootstrap_count)
+                    if seed_bootstrap_count is not None
+                    else "none"
+                ),
                 "rescale_count": str(result["rescale_count"]),
                 "boundary_quality": f"{boundary_score:.6f}",
                 "score_breakdown": json.dumps(
@@ -1801,13 +1821,17 @@ def _run_full_bundle_finalists(
         return fail_open
     full_context = json.loads(json.dumps(sampled_context))
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
-    reference = _evaluate_compile_hints(full_context, {}, suppress_output=True)
+    reference_hints = initial_hints or {}
+    reference = _evaluate_compile_hints(full_context, reference_hints, suppress_output=True)
     full_context["reference"] = {
         "final_latency_usec": reference.get("final_latency_usec"),
         "bootstrap_count": reference.get("bootstrap_count"),
         "rescale_count": reference.get("rescale_count"),
         "valid": reference.get("valid", False),
+        "source": "initial_seed",
+        "policy_summary": _compact_policy_summary(reference_hints),
     }
+    full_context.setdefault("harness", {})["seed_baseline"] = dict(full_context["reference"])
     candidates = _discover_finalist_codes(output_dir, best_code, params.openevolve_finalists)
     summaries = []
     best = None
@@ -1924,6 +1948,15 @@ def _run_full_bundle_finalists(
                     margin_target = _finalist_output_margin_target_bits(full_context)
                     forced_bootstrap_floor = _finalist_forced_bootstrap_floor(full_context)
                     target_bootstrap_count = _context_target_bootstrap_count(full_context)
+                    seed_bootstrap_count = _context_seed_bootstrap_count(full_context)
+                    bootstrap_delta_vs_seed = (
+                        int(result["bootstrap_count"]) - seed_bootstrap_count
+                        if seed_bootstrap_count is not None
+                        else None
+                    )
+                    bootstrap_regression = int(
+                        bootstrap_delta_vs_seed is not None and bootstrap_delta_vs_seed > 0
+                    )
                     bootstrap_excess = (
                         max(0, int(result["bootstrap_count"]) - target_bootstrap_count)
                         if target_bootstrap_count > 0
@@ -1961,6 +1994,9 @@ def _run_full_bundle_finalists(
                         "forced_bootstrap_floor": forced_bootstrap_floor,
                         "target_bootstrap_count": target_bootstrap_count,
                         "target_bootstrap_excess": bootstrap_excess,
+                        "seed_bootstrap_count": seed_bootstrap_count,
+                        "bootstrap_delta_vs_seed": bootstrap_delta_vs_seed,
+                        "bootstrap_regression": bool(bootstrap_regression),
                         "bootstrap_reject": bool(bootstrap_reject),
                         "plaintext_quality_reject": plaintext_quality_reject,
                         "plaintext_quality_reason": plaintext_quality_reason,
@@ -1981,6 +2017,7 @@ def _run_full_bundle_finalists(
                         ),
                         bootstrap_reject,
                         latency_reject,
+                        bootstrap_regression,
                         bootstrap_excess,
                         float(result["final_latency_usec"]),
                         -float(margin),
@@ -1988,7 +2025,7 @@ def _run_full_bundle_finalists(
                         finalist_hints,
                         summary,
                     )
-                    if best is None or item[:12] < best[:12]:
+                    if best is None or item[:13] < best[:13]:
                         best = item
             except Exception as exc:
                 summary = {
@@ -2004,12 +2041,13 @@ def _run_full_bundle_finalists(
             {
                 "reference": full_context["reference"],
                 "candidates": summaries,
-                "selected_index": None if best is None else best[11],
+                "selected_index": None if best is None else best[12],
                 "finalist_gate": {
                     "latency_target_usec": _finalist_latency_target_usec(full_context),
                     "output_margin_target_bits": _finalist_output_margin_target_bits(full_context),
                     "forced_bootstrap_floor": _finalist_forced_bootstrap_floor(full_context),
                     "target_bootstrap_count": _context_target_bootstrap_count(full_context),
+                    "seed_bootstrap_count": _context_seed_bootstrap_count(full_context),
                 },
                 "noise_estimator": {
                     "mode": params.noise_estimator,
@@ -2041,19 +2079,19 @@ def _run_full_bundle_finalists(
                 "fallback_selected_reject": fallback_reject,
                 "noise_warning_reject": bool(best[2]),
                 "noise_estimator_reject": bool(best[3]),
-                "selected_index": best[11],
+                "selected_index": best[12],
             },
         )
         return _bounded_fail_open_hints(initial_hints)
     write_noise_summary(
         finalist_dir / "noise_estimator_summary.json",
         {
-            "selected_index": best[11],
-            "selected": best[13],
+            "selected_index": best[12],
+            "selected": best[14],
             "records": estimator_records,
         },
     )
-    return best[12]
+    return best[13]
 
 
 def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -5392,6 +5430,23 @@ def _context_target_bootstrap_count(context: dict[str, Any]) -> int:
             0,
         ),
     )
+
+
+def _context_seed_bootstrap_count(context: dict[str, Any]) -> int | None:
+    candidates = [
+        context.get("reference", {}).get("bootstrap_count"),
+        context.get("harness", {}).get("seed_baseline", {}).get("bootstrap_count"),
+    ]
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            continue
+        if result >= 0:
+            return result
+    return None
 
 
 def _context_budget_aggressive(context: dict[str, Any]) -> bool:

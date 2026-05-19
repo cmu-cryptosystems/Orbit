@@ -2004,10 +2004,76 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
 
     assert hints["strategy"] == "level_preserving"
     assert hints["level_drop_penalty"] == 123.0
-    assert ("polybert-sampled", None) in eval_suites
-    assert ("polybert-full", None) in eval_suites
+    assert ("polybert-sampled", 20_000_000.0) in eval_suites
+    assert ("polybert-full", 20_000_000.0) in eval_suites
     assert ("polybert-full", 123.0) in eval_suites
     assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
+
+
+def test_full_bundle_finalist_prefers_seed_over_bootstrap_regression(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        noise_estimator="off",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    initial_hints = {
+        "strategy": "level_preserving",
+        "level_drop_penalty": 111.0,
+        "allow_seed_fallback": False,
+    }
+    candidate_code = (
+        "def place(context):\n"
+        "    return {'strategy': 'level_preserving', 'level_drop_penalty': 999.0, "
+        "'allow_seed_fallback': False}\n"
+    )
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        is_seed = hints.get("level_drop_penalty") == 111.0
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 50.0 if not is_seed else 100.0,
+            "bootstrap_count": 60 if not is_seed else 44,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "candidate_qbp_coverage": 1.0,
+            "selected_output_state": {},
+            "reserve_summary": {},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    selected = oe_backend._run_full_bundle_finalists(
+        tmp_path,
+        tmp_path / "openevolve_output",
+        context,
+        candidate_code,
+        params,
+        initial_hints,
+    )
+
+    summary = json.loads((tmp_path / "finalists" / "full_bundle_summary.json").read_text())
+    assert selected["level_drop_penalty"] == 111.0
+    assert summary["finalist_gate"]["seed_bootstrap_count"] == 44
+    assert any(
+        item.get("finalist_gate", {}).get("bootstrap_regression") is True
+        for item in summary["candidates"]
+    )
 
 
 def test_compile_harness_reuses_existing_output_without_llm(

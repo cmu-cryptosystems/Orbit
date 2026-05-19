@@ -948,8 +948,10 @@ def evaluate_compile_candidate_program(
         candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
         fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
         invalid_groups = int(diagnostics.get("invalid_boundary_groups", 0) or 0)
-        boundary_group_validity = solved_groups / requested_groups
-        candidate_qbp_coverage = candidate_groups / requested_groups
+        unreachable_groups = int(diagnostics.get("unreachable_boundary_groups", 0) or 0)
+        scored_groups = _scored_boundary_group_count(diagnostics)
+        boundary_group_validity = min(1.0, solved_groups / scored_groups)
+        candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
         repair_count = _repair_count(eval_hints)
         unit_coverage = _unit_coverage(context, eval_hints)
         reference = context.get("reference", {})
@@ -1065,6 +1067,7 @@ def evaluate_compile_candidate_program(
                 "candidate_solved_boundary_groups": float(candidate_groups),
                 "fallback_selected_groups": float(fallback_groups),
                 "invalid_boundary_groups": float(invalid_groups),
+                "unreachable_boundary_groups": float(unreachable_groups),
                 "estimated_precision_bits": float(noise_estimate.get("estimated_precision_bits", 0.0)),
                 "output_margin_bits": float(noise_estimate.get("output_margin_bits", 0.0)),
                 "reserve_score": float(reserve_score),
@@ -1122,10 +1125,11 @@ def evaluate_compile_candidate_program(
                 "rescale_locations": json.dumps(result["rescale_locations"], sort_keys=True),
                 "bottleneck_summary": json.dumps(result.get("bottleneck_summary", []), sort_keys=True),
                 "selected_output_state": json.dumps(result["selected_output_state"], sort_keys=True),
-                "boundary_group_validity": f"{solved_groups}/{requested_groups}",
-                "candidate_qbp_coverage": f"{candidate_groups}/{requested_groups}",
+                "boundary_group_validity": f"{solved_groups}/{scored_groups} scored ({requested_groups} raw)",
+                "candidate_qbp_coverage": f"{candidate_groups}/{scored_groups} scored ({requested_groups} raw)",
                 "fallback_selected_groups": f"{fallback_groups}/{requested_groups}",
                 "invalid_boundary_groups": f"{invalid_groups}/{requested_groups}",
+                "unreachable_boundary_groups": f"{unreachable_groups}/{requested_groups}",
                 "invalid_reasons": _compact_invalid_reasons(result["diagnostics"]),
                 "candidate_invalid_reasons": _compact_invalid_reasons(
                     {"invalid_reasons": result["diagnostics"].get("candidate_invalid_reasons", {})}
@@ -1251,15 +1255,19 @@ def _evaluate_compile_hints(
         reserve_summary = _assignment_reserve_summary(assign, tdag, params)
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
         requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+        scored_groups = _scored_boundary_group_count(diagnostics)
         return {
             "valid": True,
             "validity": 1.0,
             "boundary_group_validity": float(
-                int(diagnostics.get("solved_boundary_groups", 0) or 0) / requested_groups
+                min(1.0, int(diagnostics.get("solved_boundary_groups", 0) or 0) / scored_groups)
             ),
             "candidate_qbp_coverage": float(
-                int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
-                / requested_groups
+                min(
+                    1.0,
+                    int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+                    / scored_groups,
+                )
             ),
             "final_latency_usec": float(estimate_assign(assign, le)),
             "aggregated_partition_cost_usec": float(final_cost),
@@ -1273,6 +1281,9 @@ def _evaluate_compile_hints(
                 diagnostics.get("fallback_selected_boundary_groups", 0)
             ),
             "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
+            "unreachable_boundary_groups": int(
+                diagnostics.get("unreachable_boundary_groups", 0)
+            ),
             "selected_output_state": {
                 "in_lvl": final_io_choice[0],
                 "in_scl": final_io_choice[1],
@@ -1339,6 +1350,9 @@ def _evaluate_compile_hints(
                 diagnostics.get("fallback_selected_boundary_groups", 0)
             ),
             "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
+            "unreachable_boundary_groups": int(
+                diagnostics.get("unreachable_boundary_groups", 0)
+            ),
             "selected_output_state": {},
             "reserve_summary": {},
             "assignment": {},
@@ -1406,11 +1420,12 @@ def _sampled_progress_compile_result(
     requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
     solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
     candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+    scored_groups = _scored_boundary_group_count(diagnostics)
     return {
         "valid": bool(solved),
         "validity": float(solved / requested),
-        "boundary_group_validity": float(solved_groups / requested_groups),
-        "candidate_qbp_coverage": float(candidate_groups / requested_groups),
+        "boundary_group_validity": float(min(1.0, solved_groups / scored_groups)),
+        "candidate_qbp_coverage": float(min(1.0, candidate_groups / scored_groups)),
         "sampled_progress_only": True,
         "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
         "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
@@ -1424,6 +1439,9 @@ def _sampled_progress_compile_result(
             diagnostics.get("fallback_selected_boundary_groups", 0)
         ),
         "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0)),
+        "unreachable_boundary_groups": int(
+            diagnostics.get("unreachable_boundary_groups", 0)
+        ),
         "selected_output_state": {},
         "reserve_summary": reserve_summary,
         "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
@@ -1479,6 +1497,7 @@ def _evaluate_sampled_budget_tasks(
         "candidate_solved_boundary_groups": 0,
         "fallback_selected_boundary_groups": 0,
         "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
         "candidate_improved_budgets": 0,
         "candidate_invalid_reasons": {},
         "invalid_reasons": {},
@@ -1544,6 +1563,7 @@ def _evaluate_sampled_budget_tasks(
                     "candidate_solved_boundary_groups",
                     "fallback_selected_boundary_groups",
                     "invalid_boundary_groups",
+                    "unreachable_boundary_groups",
                     "candidate_improved_budgets",
                 ):
                     merge_counts(key, task_diag)
@@ -1603,11 +1623,12 @@ def _evaluate_sampled_budget_tasks(
         requested_groups = max(1, int(total.get("requested_boundary_groups", 0) or 1))
         solved_groups = int(total.get("solved_boundary_groups", 0) or 0)
         candidate_groups = int(total.get("candidate_solved_boundary_groups", 0) or 0)
+        scored_groups = _scored_boundary_group_count(total)
         return {
             "valid": bool(solved),
             "validity": float(solved / requested),
-            "boundary_group_validity": float(solved_groups / requested_groups),
-            "candidate_qbp_coverage": float(candidate_groups / requested_groups),
+            "boundary_group_validity": float(min(1.0, solved_groups / scored_groups)),
+            "candidate_qbp_coverage": float(min(1.0, candidate_groups / scored_groups)),
             "sampled_progress_only": True,
             "final_latency_usec": float(sum(costs) / len(costs)) if costs else 0.0,
             "aggregated_partition_cost_usec": float(sum(costs)) if costs else 0.0,
@@ -1619,6 +1640,7 @@ def _evaluate_sampled_budget_tasks(
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
             "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
+            "unreachable_boundary_groups": int(total.get("unreachable_boundary_groups", 0)),
             "selected_output_state": {},
             "reserve_summary": reserve_summary,
             "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
@@ -1648,6 +1670,7 @@ def _evaluate_sampled_budget_tasks(
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
             "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
+            "unreachable_boundary_groups": int(total.get("unreachable_boundary_groups", 0)),
             "selected_output_state": {},
             "reserve_summary": {},
             "assignment": {},
@@ -1684,6 +1707,12 @@ def _merge_reserve_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 def _is_retryable_bypass_failure(exc: BaseException) -> bool:
     text = str(exc)
     return "QBP not found" in text or "No placement solution found for the whole DAG" in text
+
+
+def _scored_boundary_group_count(diagnostics: dict[str, Any]) -> int:
+    requested = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+    unreachable = max(0, int(diagnostics.get("unreachable_boundary_groups", 0) or 0))
+    return max(1, requested - unreachable)
 
 
 def _compile_hints_for_eval_suite(hints: dict[str, Any], eval_suite: str) -> dict[str, Any]:
@@ -2662,6 +2691,7 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         "candidate_solved_boundary_groups": 0,
         "fallback_selected_boundary_groups": 0,
         "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
         "candidate_invalid_reasons": {},
         "candidate_costs": [],
         "costs": [],
@@ -2681,6 +2711,7 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
             "candidate_solved_boundary_groups",
             "fallback_selected_boundary_groups",
             "invalid_boundary_groups",
+            "unreachable_boundary_groups",
         ):
             totals[key] += int(item.get(key, 0))
         totals["candidate_costs"].extend(item.get("candidate_costs", []))
@@ -2958,6 +2989,7 @@ def _record_compile_trace(
                 "candidate_qbp_coverage",
                 "boundary_group_validity",
                 "fallback_selected_groups",
+                "unreachable_boundary_groups",
             }
         },
     }
@@ -2995,12 +3027,14 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
         fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
         invalid_groups = int(diagnostics.get("invalid_boundary_groups", 0) or 0)
+        unreachable_groups = int(diagnostics.get("unreachable_boundary_groups", 0) or 0)
+        scored_groups = _scored_boundary_group_count(diagnostics)
         candidate_improved = int(diagnostics.get("candidate_improved_budgets", 0))
         requested = max(1, len(io_budgets))
         effective_validity = solved / requested
         validity = candidate_solved / requested
-        boundary_group_validity = solved_groups / requested_groups
-        candidate_qbp_coverage = candidate_groups / requested_groups
+        boundary_group_validity = min(1.0, solved_groups / scored_groups)
+        candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
         repair_count = _repair_count(hints)
         unit_coverage = _unit_coverage(context, hints)
         avg_cost = sum(costs) / solved if costs else float("inf")
@@ -3095,6 +3129,7 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "candidate_solved_boundary_groups": float(candidate_groups),
                 "fallback_selected_groups": float(fallback_groups),
                 "invalid_boundary_groups": float(invalid_groups),
+                "unreachable_boundary_groups": float(unreachable_groups),
                 "candidate_improved_budgets": float(candidate_improved),
                 "reserve_score": float(reserve_score),
                 "min_decryptability_reserve_bits": float(
@@ -3111,10 +3146,11 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
                 "solved_budgets": f"{solved}/{len(io_budgets)}",
                 "candidate_solved_budgets": f"{candidate_solved}/{len(io_budgets)}",
                 "fallback_selected_budgets": f"{fallback_selected}/{len(io_budgets)}",
-                "boundary_group_validity": f"{solved_groups}/{requested_groups}",
-                "candidate_qbp_coverage": f"{candidate_groups}/{requested_groups}",
+                "boundary_group_validity": f"{solved_groups}/{scored_groups} scored ({requested_groups} raw)",
+                "candidate_qbp_coverage": f"{candidate_groups}/{scored_groups} scored ({requested_groups} raw)",
                 "fallback_selected_groups": f"{fallback_groups}/{requested_groups}",
                 "invalid_boundary_groups": f"{invalid_groups}/{requested_groups}",
+                "unreachable_boundary_groups": f"{unreachable_groups}/{requested_groups}",
                 "candidate_improved_budgets": f"{candidate_improved}/{len(io_budgets)}",
                 "reference_avg_latency_usec": f"{reference_avg:.3f}",
                 "latency_delta_usec": (
@@ -3314,6 +3350,7 @@ def _init_budget_diagnostics(diagnostics: dict[str, Any], requested_budgets: int
     diagnostics["candidate_solved_boundary_groups"] = 0
     diagnostics["fallback_selected_boundary_groups"] = 0
     diagnostics["invalid_boundary_groups"] = 0
+    diagnostics["unreachable_boundary_groups"] = 0
     diagnostics["candidate_improved_budgets"] = 0
     diagnostics["costs"] = []
     diagnostics["candidate_costs"] = []
@@ -3354,6 +3391,7 @@ def _attempt_actual_cost(attempt: _BudgetAttempt) -> float:
 
 def _record_boundary_group_result(
     diagnostics: dict[str, Any],
+    params: Params,
     group_key: tuple,
     budgets: list[dict],
     selected_attempts: list[_BudgetAttempt],
@@ -3367,6 +3405,8 @@ def _record_boundary_group_result(
         diagnostics["solved_boundary_groups"] += 1
     elif solved > 0:
         diagnostics["partial_boundary_groups"] += 1
+    elif _boundary_group_input_cannot_refresh(params, group_key):
+        diagnostics["unreachable_boundary_groups"] += 1
     else:
         diagnostics["invalid_boundary_groups"] += 1
     if requested > 0 and candidate_solved_count == requested:
@@ -3395,6 +3435,9 @@ def _record_boundary_group_result(
         "fallback_selected_budgets": int(fallback_selected_count),
         "complete": bool(requested > 0 and solved == requested),
         "candidate_complete": bool(requested > 0 and candidate_solved_count == requested),
+        "unreachable_input": bool(
+            solved == 0 and _boundary_group_input_cannot_refresh(params, group_key)
+        ),
         "avg_bootstrap": float(selected_counts["avg_bootstrap"]),
         "min_bootstrap": float(selected_counts["min_bootstrap"]),
         "max_bootstrap": float(selected_counts["max_bootstrap"]),
@@ -3405,6 +3448,25 @@ def _record_boundary_group_result(
     summaries = diagnostics.setdefault("boundary_group_summaries", [])
     if len(summaries) < 256:
         summaries.append(summary)
+
+
+def _boundary_group_input_cannot_refresh(params: Params, group_key: tuple) -> bool:
+    """Return true for sampled input states that cannot legally bootstrap.
+
+    QBP budget tables can contain boundary states that are syntactically present
+    but unusable for a deep downstream partition. Original Orbit's DP can ignore
+    those states; sampled OpenEvolve feedback should not treat them the same as
+    a reachable group that the candidate failed to place.
+    """
+
+    try:
+        in_lvl = int(group_key[0])
+        in_scl = int(group_key[1])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if in_lvl < 0:
+        return False
+    return not params.check_res(in_lvl, in_scl, params.bts_lb, params.Sf)
 
 
 def _solve_budget_batch_boundary_mcts(
@@ -3473,6 +3535,7 @@ def _solve_budget_batch_boundary_mcts(
         if diagnostics is not None:
             _record_boundary_group_result(
                 diagnostics,
+                params,
                 _group_key,
                 budgets,
                 selected_attempts,

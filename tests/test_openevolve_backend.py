@@ -1373,6 +1373,26 @@ def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
     assert summary["frontier_rescale"] == 3.0
 
 
+def test_unrefreshable_empty_boundary_group_is_not_scored_invalid(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    diagnostics = {"requested_boundary_groups": 0, "unreachable_boundary_groups": 0, "invalid_boundary_groups": 0}
+
+    oe_backend._record_boundary_group_result(
+        diagnostics,
+        params,
+        (1, params.Sf * 2, "", 0),
+        [{"out_lvl": 1}],
+        [],
+        0,
+        0,
+    )
+
+    assert diagnostics["requested_boundary_groups"] == 1
+    assert diagnostics["unreachable_boundary_groups"] == 1
+    assert diagnostics["invalid_boundary_groups"] == 0
+    assert oe_backend._scored_boundary_group_count(diagnostics) == 1
+
+
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)

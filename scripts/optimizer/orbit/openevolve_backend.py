@@ -1618,17 +1618,6 @@ def evaluate_compile_candidate_program(
             + 0.01 * policy_tiebreak_score
         )
         combined_score = latency_only_score
-        if placement_effect_score <= placement_effect_eps:
-            # In positive OpenEvolve runs the exact seed should not dominate merely
-            # because it is the first valid program. Non-seed policies with the same
-            # sampled outcome can stay in the population for exploration, but full
-            # finalist replay still dedupes effective QBP/DP paths before selection.
-            no_effect_penalty = 0.14
-            combined_score = (
-                max(1.0, float(combined_score) - no_effect_penalty)
-                if bool(correctness_gate["correct"])
-                else 0.0
-            )
         execution_trace = _execution_trace_artifact(
             context,
             eval_hints,

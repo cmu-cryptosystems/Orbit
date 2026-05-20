@@ -20,9 +20,11 @@ from typing import Any
 import networkx as nx
 
 from ...assignment import Assign
+from ...assignment.decode_assign import decode_assign
 from ...latency_estimator import LatencyEstimator, estimate_assign
 from ...params.params import Params
 from ...tdag import Tdag
+from ...tdag.tdag2mlir import tdag_to_mlir
 from .noise_estimator import estimate_compile_result_noise, write_noise_summary
 
 
@@ -1633,6 +1635,15 @@ def evaluate_compile_candidate_program(
             scale_floor_summary,
             correctness_gate,
         )
+        candidate_artifacts = _maybe_write_candidate_mlir_artifacts(
+            context,
+            Path(program_path),
+            eval_hints,
+            result,
+            objective,
+            correctness_gate,
+            execution_trace,
+        )
         evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
@@ -1832,6 +1843,14 @@ def evaluate_compile_candidate_program(
                     },
                     sort_keys=True,
                 ),
+                "candidate_mlir_artifacts": json.dumps(
+                    candidate_artifacts, sort_keys=True
+                )[:4000],
+                "candidate_mlir_path": str(candidate_artifacts.get("mlir_path", "")),
+                "candidate_mlir_digest": str(candidate_artifacts.get("mlir_digest", "")),
+                "candidate_mlir_preview": str(
+                    candidate_artifacts.get("mlir_preview", "")
+                )[:6000],
                 "noise_estimator": json.dumps(noise_estimate, sort_keys=True)[:4000],
                 "reserve_summary": json.dumps(
                     result.get("reserve_summary", {}), sort_keys=True
@@ -2084,6 +2103,7 @@ def _evaluate_compile_hints(
             },
             "reserve_summary": reserve_summary,
             "assignment": _serialize_assign(assign),
+            "assignment_context": context,
             "bootstrap_locations": locations["bootstrap"],
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
@@ -2444,6 +2464,7 @@ def _evaluate_sampled_budget_tasks(
     reserve_summaries: list[dict[str, Any]] = []
     best_assign: Assign | None = None
     best_cost = float("inf")
+    best_task_context: dict[str, Any] | None = None
     log_buffer = io.StringIO()
     stdout_context = redirect_stdout(log_buffer) if suppress_output else nullcontext()
     stderr_context = redirect_stderr(log_buffer) if suppress_output else nullcontext()
@@ -2534,6 +2555,7 @@ def _evaluate_sampled_budget_tasks(
                     if task_costs[idx] < best_cost:
                         best_cost = task_costs[idx]
                         best_assign = task_assignments[idx]
+                        best_task_context = task_context
 
         assignments = list(total["assignments"])
         costs = [float(item) for item in total["costs"]]
@@ -2615,6 +2637,7 @@ def _evaluate_sampled_budget_tasks(
             "selected_output_state": {},
             "reserve_summary": reserve_summary,
             "assignment": _serialize_assign(best_assign) if best_assign is not None else {},
+            "assignment_context": best_task_context or {},
             "bootstrap_locations": locations["bootstrap"],
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
@@ -3024,6 +3047,103 @@ def _execution_trace_artifact(
         "scale_floor": scale_floor_summary,
         "model": context.get("model", {}),
     }
+
+
+def _maybe_write_candidate_mlir_artifacts(
+    context: dict[str, Any],
+    program_path: Path,
+    eval_hints: dict[str, Any],
+    result: dict[str, Any],
+    objective: dict[str, Any],
+    correctness_gate: dict[str, Any],
+    execution_trace: dict[str, Any],
+) -> dict[str, Any]:
+    if not bool(correctness_gate.get("correct", False)):
+        return {"written": False, "reason": "correctness_gate_failed"}
+    trace_dir = context.get("harness", {}).get("trace_dir")
+    if not trace_dir:
+        return {"written": False, "reason": "missing_trace_dir"}
+    assignment = result.get("assignment")
+    if not isinstance(assignment, dict) or not assignment:
+        return {"written": False, "reason": "missing_assignment"}
+    try:
+        source = program_path.read_text(encoding="utf-8")
+    except Exception:
+        source = ""
+    candidate_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "source": source,
+                "policy": _compact_policy_summary(eval_hints),
+                "assignment": assignment,
+                "objective_cost_usec": objective.get("objective_cost_usec"),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    artifact_root = Path(trace_dir).parent / "candidate_mlirs" / candidate_digest
+    try:
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        assignment_context = (
+            result.get("assignment_context")
+            if isinstance(result.get("assignment_context"), dict) and result.get("assignment_context")
+            else context
+        )
+        tdag = tdag_from_context(assignment_context)
+        assign = _assign_from_serialized(tdag, assignment)
+        assign.check_assign()
+        decoded = decode_assign(assign, tdag, {str(node): str(node) for node in tdag.nodes})
+        mlir_path = artifact_root / "candidate.mlir"
+        tdag_to_mlir(decoded, str(mlir_path))
+        mlir_text = mlir_path.read_text(encoding="utf-8")
+        mlir_digest = hashlib.sha256(mlir_text.encode("utf-8")).hexdigest()
+        summary = {
+            "written": True,
+            "candidate_digest": candidate_digest,
+            "mlir_path": str(mlir_path),
+            "mlir_digest": mlir_digest,
+            "mlir_bytes": len(mlir_text.encode("utf-8")),
+            "context_name": assignment_context.get("tdag", {}).get("name", context.get("tdag", {}).get("name", "")),
+            "sampled_partition_mlir": assignment_context is not context,
+            "objective_cost_usec": _finite_float(objective.get("objective_cost_usec"), 0.0),
+            "final_latency_usec": _finite_float(result.get("final_latency_usec"), 0.0),
+            "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
+            "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
+            "scale_floor_bits": _finite_float(result.get("scale_floor_bits"), 0.0),
+            "selected_path_digest": result.get("sampled_selected_path_digest", ""),
+            "policy_summary": json.loads(_compact_policy_summary(eval_hints)),
+            "mlir_preview": mlir_text[:6000],
+        }
+        (artifact_root / "summary.json").write_text(
+            json.dumps({k: v for k, v in summary.items() if k != "mlir_preview"}, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        (artifact_root / "assignment.json").write_text(
+            json.dumps(assignment, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_root / "policy.json").write_text(
+            json.dumps(eval_hints, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_root / "execution_trace.json").write_text(
+            json.dumps(execution_trace, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        index_record = {k: v for k, v in summary.items() if k != "mlir_preview"}
+        with (Path(trace_dir).parent / "candidate_mlirs" / "index.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(index_record, sort_keys=True, default=str) + "\n")
+        return summary
+    except Exception as exc:
+        return {
+            "written": False,
+            "reason": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "candidate_digest": candidate_digest,
+        }
 
 
 def _placement_effect_summary(
@@ -5364,6 +5484,10 @@ def _record_compile_trace(
                 "correctness_gate",
                 "latency_only_objective",
                 "execution_trace",
+                "candidate_mlir_artifacts",
+                "candidate_mlir_path",
+                "candidate_mlir_digest",
+                "candidate_mlir_preview",
             }
         },
     }

@@ -2973,6 +2973,7 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
     )
     graph = _branch_merge_pdag(params)
     context = build_compile_context(graph, params)
+    context["harness"]["trace_dir"] = str(tmp_path / "trace_repository")
     context_path = tmp_path / "compile_context.json"
     seed_program = tmp_path / "seed.py"
     evolved_program = tmp_path / "evolved.py"
@@ -2992,6 +2993,12 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
     assert evolved["metrics"]["validity"] == 1.0
     assert "candidate_final_latency_usec" in evolved["artifacts"]
     assert evolved["metrics"]["final_latency_usec"] > 0.0
+    if evolved["metrics"].get("latency_only_correct") == 1.0:
+        candidate_artifacts = json.loads(evolved["artifacts"]["candidate_mlir_artifacts"])
+        assert candidate_artifacts["written"] is True
+        assert Path(candidate_artifacts["mlir_path"]).exists()
+        assert candidate_artifacts["mlir_digest"]
+        assert "earth." in evolved["artifacts"]["candidate_mlir_preview"]
 
 
 def test_compile_invalid_metrics_cover_configured_feature_dimensions(

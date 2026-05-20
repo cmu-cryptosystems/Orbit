@@ -1276,6 +1276,51 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
     return context
 
 
+def _load_cached_compile_context(path: Path, dag: Tdag, params: Params) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if cached.get("schema_version") != COMPILE_CONTEXT_SCHEMA_VERSION:
+        return None
+    tdata = cached.get("tdag", {})
+    if tdata.get("name") != dag.name:
+        return None
+    if len(tdata.get("nodes", {})) != len(dag.nodes) or len(tdata.get("edges", [])) != len(dag.edges):
+        return None
+    harness = cached.get("harness", {})
+    if harness.get("eval_suite") != params.openevolve_eval_suite:
+        return None
+    if not isinstance(cached.get("reference"), dict):
+        return None
+    if params.openevolve_eval_suite != "polybert-full" and not cached.get("sampled_budget_tasks"):
+        return None
+    return cached
+
+
+def _merge_cached_compile_context(
+    context: dict[str, Any],
+    cached: dict[str, Any],
+    params: Params,
+) -> None:
+    reference = dict(cached.get("reference", {}))
+    context["reference"] = reference
+    cached_harness = cached.get("harness", {}) if isinstance(cached.get("harness"), dict) else {}
+    harness = context.setdefault("harness", {})
+    harness["seed_baseline"] = dict(cached_harness.get("seed_baseline") or reference)
+    sampled_seed = cached_harness.get("sampled_seed_baseline")
+    if isinstance(sampled_seed, dict):
+        harness["sampled_seed_baseline"] = dict(sampled_seed)
+    if cached.get("sampled_budget_tasks") and params.openevolve_eval_suite != "polybert-full":
+        context["sampled_budget_tasks"] = cached["sampled_budget_tasks"]
+    if isinstance(cached.get("placement_profile"), list):
+        context["placement_profile"] = cached["placement_profile"]
+    if isinstance(cached.get("unit_hotspots"), list):
+        context["unit_hotspots"] = cached["unit_hotspots"]
+
+
 def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> dict[str, Any]:
     try:
         from openevolve import run_evolution
@@ -1286,52 +1331,72 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
 
     root = _compile_workspace_root(dag, params)
     root.mkdir(parents=True, exist_ok=True)
+    context_path = root / "compile_context.json"
+    initial_path = root / "initial_program.py"
+    evaluator_path = root / "evaluator.py"
+    output_dir = root / "openevolve_output"
+    print(f"OpenEvolve compile workspace: {root}", flush=True)
+    cached_context = _load_cached_compile_context(context_path, dag, params)
     context = build_compile_context(dag, params)
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
     )
     initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
-    reference = _evaluate_compile_hints(context, initial_hints, suppress_output=True)
-    context["reference"] = {
-        "final_latency_usec": reference.get("final_latency_usec"),
-        "objective_cost_usec": reference.get(
-            "objective_cost_usec", reference.get("final_latency_usec")
-        ),
-        "total_frontier_cost_usec": reference.get("total_frontier_cost_usec"),
-        "sampled_dp_latency_usec": reference.get("sampled_dp_latency_usec"),
-        "bootstrap_count": reference.get("bootstrap_count"),
-        "rescale_count": reference.get("rescale_count"),
-        "valid": reference.get("valid", False),
-        "effective_qbp_digest": _effective_qbp_digest(reference.get("diagnostics", {})),
-        "selected_path_digest": _selected_path_digest(reference, reference.get("diagnostics", {})),
-        "source": "initial_seed",
-        "policy_summary": _compact_policy_summary(initial_hints),
-    }
-    context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
-    if reference.get("sampled_budget_tasks"):
-        context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
-        if params.openevolve_eval_suite != "polybert-full":
-            sampled_reference = _evaluate_compile_hints(
-                context,
-                _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
-                suppress_output=True,
-            )
-            context.setdefault("harness", {})["sampled_seed_baseline"] = _placement_baseline_from_result(
-                sampled_reference
-            )
-    context["placement_profile"] = reference.get("bottleneck_summary", [])
+    if cached_context is not None:
+        print("OpenEvolve compile harness: reusing cached seed replay/context.", flush=True)
+        _merge_cached_compile_context(context, cached_context, params)
+    else:
+        print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
+        reference = _evaluate_compile_hints(context, initial_hints, suppress_output=True)
+        context["reference"] = {
+            "final_latency_usec": reference.get("final_latency_usec"),
+            "objective_cost_usec": reference.get(
+                "objective_cost_usec", reference.get("final_latency_usec")
+            ),
+            "total_frontier_cost_usec": reference.get("total_frontier_cost_usec"),
+            "sampled_dp_latency_usec": reference.get("sampled_dp_latency_usec"),
+            "bootstrap_count": reference.get("bootstrap_count"),
+            "rescale_count": reference.get("rescale_count"),
+            "valid": reference.get("valid", False),
+            "effective_qbp_digest": _effective_qbp_digest(reference.get("diagnostics", {})),
+            "selected_path_digest": _selected_path_digest(reference, reference.get("diagnostics", {})),
+            "source": "initial_seed",
+            "policy_summary": _compact_policy_summary(initial_hints),
+        }
+        context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
+        if reference.get("sampled_budget_tasks"):
+            context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
+            if params.openevolve_eval_suite != "polybert-full":
+                sampled_reference = _evaluate_compile_hints(
+                    context,
+                    _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
+                    suppress_output=True,
+                )
+                context.setdefault("harness", {})["sampled_seed_baseline"] = _placement_baseline_from_result(
+                    sampled_reference
+                )
+        context["placement_profile"] = reference.get("bottleneck_summary", [])
+        print(
+            "OpenEvolve compile harness: seed baseline "
+            f"valid={context['reference'].get('valid')} "
+            f"latency={context['reference'].get('final_latency_usec')} "
+            f"bootstraps={context['reference'].get('bootstrap_count')}.",
+            flush=True,
+        )
     context["unit_hotspots"] = _unit_hotspots_from_profile(
         context.get("placement_units", []),
-        reference.get("bottleneck_summary", []),
+        context.get("placement_profile", []),
     )
-    context_path = root / "compile_context.json"
-    initial_path = root / "initial_program.py"
-    evaluator_path = root / "evaluator.py"
-    output_dir = root / "openevolve_output"
     context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initial_path.write_text(initial_source, encoding="utf-8")
     evaluator_path.write_text(_compile_evaluator_source(context_path), encoding="utf-8")
+    print(
+        "OpenEvolve compile harness: starting evolution "
+        f"iterations={params.openevolve_iterations} "
+        f"parallel_evaluations={params.openevolve_parallel_evaluations}.",
+        flush=True,
+    )
 
     worker = OpenEvolvePlacementWorker(params, le)
     if getattr(params, "openevolve_reuse_output", False):

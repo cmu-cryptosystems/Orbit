@@ -2423,6 +2423,69 @@ def _evenly_spaced_items(items: list[Any], limit: int) -> list[Any]:
     return [items[index] for index in sorted(indexes)]
 
 
+def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str]) -> dict[str, Any]:
+    task_context, eval_hints, eval_suite = payload
+    log_buffer = io.StringIO()
+    try:
+        with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+            task_tdag = tdag_from_context(task_context)
+            task_params = task_tdag.params
+            task_params.openevolve_iterations = 0
+            task_params.openevolve_harness = "compile"
+            task_params.openevolve_compile_hints = eval_hints
+            task_params.openevolve_evaluating_candidate = True
+            task_params.openevolve_eval_suite = eval_suite
+            _apply_active_scale_floor_from_hints(task_params, eval_hints)
+            task_le = LatencyEstimator(task_params)
+            budgets = [
+                _io_budget_from_json(item)
+                for item in task_context.get("io_budgets", [])
+                if isinstance(item, dict)
+            ]
+            if not budgets:
+                return {
+                    "task_context": task_context,
+                    "diagnostics": {},
+                    "assignments": [],
+                    "costs": [],
+                    "log_tail": log_buffer.getvalue()[-2000:],
+                }
+            task_diag: dict[str, Any] = {}
+            solve_budget_batch(
+                task_tdag,
+                budgets,
+                task_le,
+                task_params,
+                eval_hints,
+                task_diag,
+            )
+        assignments = [
+            _serialize_assign(assign)
+            for assign in task_diag.get("assignments", [])
+            if isinstance(assign, Assign)
+        ]
+        diagnostics = dict(task_diag)
+        diagnostics.pop("assignments", None)
+        return {
+            "task_context": task_context,
+            "diagnostics": diagnostics,
+            "assignments": assignments,
+            "costs": [float(item) for item in task_diag.get("costs", [])],
+            "log_tail": log_buffer.getvalue()[-2000:],
+        }
+    except Exception as exc:
+        return {
+            "task_context": task_context,
+            "diagnostics": {
+                "invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1},
+                "traceback": traceback.format_exc()[-3000:],
+            },
+            "assignments": [],
+            "costs": [],
+            "log_tail": (log_buffer.getvalue() + "\n" + traceback.format_exc())[-3000:],
+        }
+
+
 def _sampled_task_parallelism(context: dict[str, Any], task_count: int) -> int:
     if task_count <= 1:
         return 1
@@ -2486,40 +2549,26 @@ def _evaluate_sampled_budget_tasks(
     def merge_counts(key: str, item: dict[str, Any]) -> None:
         total[key] += int(item.get(key, 0))
 
-    def run_task(task: dict[str, Any]) -> tuple[dict[str, Any], Tdag, Params, dict[str, Any], list[Assign], list[float]]:
-        task_context = task["context"]
+    def decode_task_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], Tdag, Params, dict[str, Any], list[Assign], list[float]]:
+        if payload.get("log_tail"):
+            log_buffer.write(str(payload.get("log_tail"))[-2000:])
+        task_context = payload["task_context"]
         task_tdag = tdag_from_context(task_context)
         task_params = task_tdag.params
-        task_params.openevolve_iterations = 0
-        task_params.openevolve_harness = "compile"
-        task_params.openevolve_compile_hints = eval_hints
-        task_params.openevolve_evaluating_candidate = True
         task_params.openevolve_eval_suite = eval_suite
         _apply_active_scale_floor_from_hints(task_params, eval_hints)
-        task_le = LatencyEstimator(task_params)
-        budgets = [
-            _io_budget_from_json(item)
-            for item in task_context.get("io_budgets", [])
+        task_assignments = [
+            _assign_from_serialized(task_tdag, item)
+            for item in payload.get("assignments", [])
             if isinstance(item, dict)
         ]
-        if not budgets:
-            return task_context, task_tdag, task_params, {}, [], []
-        task_diag: dict[str, Any] = {}
-        solve_budget_batch(
-            task_tdag,
-            budgets,
-            task_le,
-            task_params,
-            eval_hints,
-            task_diag,
-        )
         return (
             task_context,
             task_tdag,
             task_params,
-            task_diag,
-            list(task_diag.get("assignments", [])),
-            [float(item) for item in task_diag.get("costs", [])],
+            dict(payload.get("diagnostics", {})),
+            task_assignments,
+            [float(item) for item in payload.get("costs", [])],
         )
 
     try:
@@ -2530,11 +2579,13 @@ def _evaluate_sampled_budget_tasks(
                 if isinstance(task, dict) and isinstance(task.get("context"), dict)
             ]
             workers = _sampled_task_parallelism(context, len(tasks))
+            payloads = [(task["context"], eval_hints, eval_suite) for task in tasks]
             if workers > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                    task_results = list(executor.map(run_task, tasks))
+                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                    raw_results = list(executor.map(_run_sampled_task_payload, payloads))
             else:
-                task_results = [run_task(task) for task in tasks]
+                raw_results = [_run_sampled_task_payload(payload) for payload in payloads]
+            task_results = [decode_task_payload(payload) for payload in raw_results]
             total["sampled_task_parallelism"] = workers
             for (
                 task_context,

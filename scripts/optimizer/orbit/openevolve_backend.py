@@ -204,6 +204,8 @@ class OpenEvolvePlacementWorker:
         config.random_seed = self.params.openevolve_seed
         if hasattr(config, "max_code_length"):
             config.max_code_length = 50_000
+        if hasattr(config, "diff_based_evolution"):
+            config.diff_based_evolution = False
         config.llm.api_base = api_base
         config.llm.timeout = self.params.openevolve_llm_timeout_sec
         config.llm.retries = self.params.openevolve_llm_retries

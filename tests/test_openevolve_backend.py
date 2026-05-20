@@ -228,6 +228,7 @@ class FakeConfig:
     def __init__(self):
         self.random_seed = None
         self.checkpoint_interval = None
+        self.diff_based_evolution = True
         self.max_code_length = 10_000
         self.llm = FakeLLMConfig()
         self.database = FakeDatabaseConfig()
@@ -3120,6 +3121,7 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
 
     assert config.random_seed == 7
     assert config.max_code_length == 50_000
+    assert config.diff_based_evolution is False
     assert config.database.random_seed == 7
     assert config.llm.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert config.llm.models[0].name == "gemini-3.1-flash-lite"

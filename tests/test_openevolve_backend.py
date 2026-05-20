@@ -3001,6 +3001,78 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
         assert "earth." in evolved["artifacts"]["candidate_mlir_preview"]
 
 
+def test_latency_gate_rejects_seed_equivalent_path_without_improvement():
+    result = {
+        "valid": True,
+        "fallback_selected_budgets": 0,
+    }
+    diagnostics = {
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+    }
+    objective = {
+        "direct_complete": True,
+        "objective_cost_usec": 1000.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
+    gate = oe_backend._latency_only_correctness_gate(
+        result,
+        diagnostics,
+        objective,
+        static={"valid": True},
+        boundary_group_validity=1.0,
+        candidate_qbp_coverage=1.0,
+        effective_path={
+            "reference_selected_path_digest": "seed",
+            "selected_path_digest": "seed",
+            "selected_path_changed_vs_seed": False,
+            "effective_qbp_changed_vs_seed": False,
+            "seed_equivalent_path": True,
+        },
+        policy_effect={"seed_equivalent": False},
+    )
+
+    assert gate["correct"] is False
+    assert "seed_equivalent_selected_path_without_latency_improvement" in gate["reasons"]
+
+
+def test_latency_gate_allows_equivalent_path_with_real_latency_improvement():
+    result = {
+        "valid": True,
+        "fallback_selected_budgets": 0,
+    }
+    diagnostics = {
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+    }
+    objective = {
+        "direct_complete": True,
+        "objective_cost_usec": 900.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
+    gate = oe_backend._latency_only_correctness_gate(
+        result,
+        diagnostics,
+        objective,
+        static={"valid": True},
+        boundary_group_validity=1.0,
+        candidate_qbp_coverage=1.0,
+        effective_path={
+            "reference_selected_path_digest": "seed",
+            "selected_path_digest": "seed",
+            "selected_path_changed_vs_seed": False,
+            "effective_qbp_changed_vs_seed": False,
+            "seed_equivalent_path": True,
+        },
+        policy_effect={"seed_equivalent": False},
+    )
+
+    assert gate["correct"] is True
+    assert gate["objective_improved_vs_seed"] is True
+
+
 def test_compile_invalid_metrics_cover_configured_feature_dimensions(
     toy_cost_json: str,
     tmp_path: Path,

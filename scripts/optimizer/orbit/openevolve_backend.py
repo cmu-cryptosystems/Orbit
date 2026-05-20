@@ -1581,6 +1581,8 @@ def evaluate_compile_candidate_program(
             static=static,
             boundary_group_validity=boundary_group_validity,
             candidate_qbp_coverage=candidate_qbp_coverage,
+            effective_path=effective_path,
+            policy_effect=policy_effect,
         )
         latency_only_score = _latency_only_combined_score(
             objective,
@@ -1662,6 +1664,12 @@ def evaluate_compile_candidate_program(
                 "fallback_score": float(fallback_score),
                 "placement_effect_score": float(placement_effect_score),
                 "path_effect_score": float(path_effect_score),
+                "seed_equivalent_path": float(
+                    bool(effective_path.get("seed_equivalent_path", False))
+                ),
+                "objective_improved_vs_seed": float(
+                    bool(correctness_gate.get("objective_improved_vs_seed", False))
+                ),
                 "policy_effect_score": float(policy_effect_score),
                 "action_effect_score": float(action_effect_score),
                 "seed_equivalent_policy": float(bool(policy_effect.get("seed_equivalent"))),
@@ -1782,6 +1790,15 @@ def evaluate_compile_candidate_program(
                         "reference_objective_cost_usec": float(
                             objective["reference_objective_cost_usec"]
                         ),
+                        "selected_path_changed_vs_seed": bool(
+                            effective_path.get("selected_path_changed_vs_seed", False)
+                        ),
+                        "effective_qbp_changed_vs_seed": bool(
+                            effective_path.get("effective_qbp_changed_vs_seed", False)
+                        ),
+                        "objective_improved_vs_seed": bool(
+                            correctness_gate.get("objective_improved_vs_seed", False)
+                        ),
                         "failures": correctness_gate.get("reasons", []),
                     },
                     sort_keys=True,
@@ -1825,6 +1842,12 @@ def evaluate_compile_candidate_program(
                     {
                         "objective": "latency_only_after_correctness_gate",
                         "correct": bool(correctness_gate["correct"]),
+                        "seed_equivalent_path": bool(
+                            effective_path.get("seed_equivalent_path", False)
+                        ),
+                        "objective_improved_vs_seed": bool(
+                            correctness_gate.get("objective_improved_vs_seed", False)
+                        ),
                         "latency_score": latency_score,
                         "latency_only_score": latency_only_score,
                         "correctness_failures": correctness_gate.get("reasons", []),
@@ -2990,8 +3013,21 @@ def _latency_only_correctness_gate(
     static: dict[str, Any],
     boundary_group_validity: float,
     candidate_qbp_coverage: float,
+    effective_path: dict[str, Any] | None = None,
+    policy_effect: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
+    effective_path = effective_path if isinstance(effective_path, dict) else {}
+    policy_effect = policy_effect if isinstance(policy_effect, dict) else {}
+    objective_improved = _objective_improved_vs_seed(objective)
+    path_changed = bool(
+        effective_path.get("selected_path_changed_vs_seed", False)
+        or effective_path.get("effective_qbp_changed_vs_seed", False)
+    )
+    seed_equivalent_path = bool(
+        effective_path.get("reference_selected_path_digest")
+        and not path_changed
+    )
     if not bool(static.get("valid", False)):
         reasons.append("static_policy_invalid")
     if not bool(result.get("valid", False)):
@@ -3012,18 +3048,47 @@ def _latency_only_correctness_gate(
         reasons.append("missing_positive_latency_objective")
     elif not math.isfinite(_finite_float(objective.get("objective_cost_usec"), float("inf"))):
         reasons.append("nonfinite_latency_objective")
+    if seed_equivalent_path and not objective_improved:
+        reasons.append("seed_equivalent_selected_path_without_latency_improvement")
+    if bool(policy_effect.get("seed_equivalent", False)) and not path_changed and not objective_improved:
+        reasons.append("seed_equivalent_policy_without_latency_improvement")
     return {
         "correct": not reasons,
         "reasons": reasons,
         "direct_complete": bool(objective.get("direct_complete", False)),
         "boundary_group_validity": float(boundary_group_validity),
         "candidate_qbp_coverage": float(candidate_qbp_coverage),
+        "selected_path_changed_vs_seed": bool(
+            effective_path.get("selected_path_changed_vs_seed", False)
+        ),
+        "effective_qbp_changed_vs_seed": bool(
+            effective_path.get("effective_qbp_changed_vs_seed", False)
+        ),
+        "seed_equivalent_path": bool(seed_equivalent_path),
+        "seed_equivalent_policy": bool(policy_effect.get("seed_equivalent", False)),
+        "objective_improved_vs_seed": bool(objective_improved),
         "fallback_selected_boundary_groups": int(
             diagnostics.get("fallback_selected_boundary_groups", 0) or 0
         ),
         "fallback_selected_budgets": int(result.get("fallback_selected_budgets", 0) or 0),
         "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0) or 0),
     }
+
+
+def _objective_improved_vs_seed(
+    objective: dict[str, Any],
+    *,
+    min_relative_improvement: float = 0.001,
+) -> bool:
+    cost = _finite_float(objective.get("objective_cost_usec"), float("inf"))
+    reference = _finite_float(objective.get("reference_objective_cost_usec"), float("inf"))
+    if not math.isfinite(reference) or reference <= 0.0:
+        reference = _finite_float(objective.get("base_objective_cost_usec"), float("inf"))
+    if not math.isfinite(cost) or not math.isfinite(reference):
+        return False
+    if cost <= 0.0 or reference <= 0.0:
+        return False
+    return cost < reference * (1.0 - max(0.0, min_relative_improvement))
 
 
 def _latency_only_combined_score(
@@ -3068,6 +3133,12 @@ def _execution_trace_artifact(
             "effect_score": _finite_float(placement_effect.get("effect_score"), 0.0),
             "selected_path_changed_vs_seed": bool(
                 effective_path.get("selected_path_changed_vs_seed", False)
+            ),
+            "seed_equivalent_path": bool(
+                effective_path.get("seed_equivalent_path", False)
+            ),
+            "objective_improved_vs_seed": bool(
+                correctness_gate.get("objective_improved_vs_seed", False)
             ),
             "changed_boundary_groups": int(
                 effective_path.get("changed_boundary_groups_vs_seed", 0) or 0
@@ -3952,6 +4023,11 @@ def _result_effective_summary(
         "reference_selected_path_digest": reference_path[:24],
         "effective_qbp_changed_vs_seed": bool(reference_qbp and qbp_digest != reference_qbp),
         "selected_path_changed_vs_seed": bool(reference_path and path_digest != reference_path),
+        "seed_equivalent_path": bool(
+            reference_path
+            and path_digest == reference_path
+            and (not reference_qbp or qbp_digest == reference_qbp)
+        ),
         "changed_boundary_groups_vs_seed": int(changed_groups),
         "selected_path_payload": _selected_path_payload(result, diagnostics),
     }
@@ -4654,6 +4730,11 @@ def _run_full_bundle_finalists(
                     summary["finalist_gate"] = {
                         "latency_target_usec": latency_target,
                         "latency_reject": bool(latency_reject),
+                        "effective_duplicate": bool(effective_duplicate),
+                        "seed_equivalent_policy": bool(seed_equivalent_policy),
+                        "selected_path_changed_vs_seed": bool(
+                            summary.get("selected_path_changed_vs_seed", False)
+                        ),
                         "output_margin_target_bits": margin_target,
                         "output_margin_reject": bool(margin_reject),
                         "forced_bootstrap_floor": forced_bootstrap_floor,
@@ -4714,13 +4795,14 @@ def _run_full_bundle_finalists(
             {
                 "reference": full_context["reference"],
                 "candidates": summaries,
-                "selected_index": None if (best or duplicate_best) is None else (best or duplicate_best)[15],
+                "selected_index": None if best is None else best[15],
                 "effective_dedupe": {
                     "unique_effective_paths": len(seen_effective_paths),
                     "duplicate_candidates": len(
                         [item for item in summaries if item.get("effective_duplicate_of_index") is not None]
                     ),
-                    "used_duplicate_fallback": bool(best is None and duplicate_best is not None),
+                    "duplicate_best_index": None if duplicate_best is None else duplicate_best[15],
+                    "duplicate_best_not_selectable": bool(duplicate_best is not None),
                 },
                 "finalist_gate": {
                     "latency_target_usec": _finalist_latency_target_usec(full_context),
@@ -4745,9 +4827,21 @@ def _run_full_bundle_finalists(
         + "\n",
         encoding="utf-8",
     )
-    if best is None and duplicate_best is not None:
-        best = duplicate_best
     if best is None:
+        if duplicate_best is not None:
+            _write_finalist_rejection_summary(
+                finalist_dir,
+                duplicate_best[17],
+                {
+                    "effective_duplicate_reject": True,
+                    "seed_equivalent_policy_reject": bool(
+                        duplicate_best[17].get("finalist_gate", {}).get(
+                            "seed_equivalent_policy"
+                        )
+                    ),
+                    "selected_index": duplicate_best[15],
+                },
+            )
         return _bounded_fail_open_hints(initial_hints)
     write_noise_summary(
         finalist_dir / "scale_floor_summary.json",
@@ -4826,6 +4920,11 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
     combined_score = _finite_float(metrics.get("combined_score"), 0.0)
     if validity <= 0.0 and effective_validity <= 0.0 and combined_score < 1.0:
         return "sampled_best_solved_no_budgets"
+    if (
+        _finite_float(metrics.get("seed_equivalent_path"), 0.0) >= 1.0
+        and _finite_float(metrics.get("objective_improved_vs_seed"), 0.0) <= 0.0
+    ):
+        return "sampled_best_seed_equivalent_path"
     candidate_qbp_coverage = _finite_float(metrics.get("candidate_qbp_coverage"), 0.0)
     candidate_groups = _finite_float(metrics.get("candidate_solved_boundary_groups"), 0.0)
     fallback_budgets = _finite_float(metrics.get("fallback_selected_budgets"), 0.0)
@@ -5683,6 +5782,10 @@ def _alphaevolve_feedback(
     if policy_effect.get("seed_equivalent") is True:
         suggestions.append(
             "normalized policy is seed-equivalent after sampled bounding; mutate mcts_action_presets or high-impact MCTS keys so candidate_digest changes."
+        )
+    if _finite_float(metrics.get("seed_equivalent_path"), 0.0) >= 1.0:
+        suggestions.append(
+            "selected_path_digest is seed-equivalent; change boundary_state_cap, boundary_scale_policy, scale_floor_bits, or bootstrap anchor placement until the selected QBP path digest changes."
         )
     elif _finite_float(placement_effect.get("effect_score"), 0.0) <= 0.0:
         suggestions.append(

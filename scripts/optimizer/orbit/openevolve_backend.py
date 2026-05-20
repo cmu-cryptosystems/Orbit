@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import concurrent.futures
 import io
 import json
 import math
@@ -1123,6 +1124,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "openevolve_max_unit_samples": params.openevolve_max_unit_samples,
             "openevolve_reference_json": params.openevolve_reference_json,
             "openevolve_finalists": params.openevolve_finalists,
+            "openevolve_parallel_evaluations": params.openevolve_parallel_evaluations,
             "openevolve_budget_aggressive": getattr(params, "openevolve_budget_aggressive", True),
             "openevolve_target_bootstrap_count": getattr(params, "openevolve_target_bootstrap_count", 0),
             "noise_estimator": params.noise_estimator,
@@ -2421,6 +2423,18 @@ def _evenly_spaced_items(items: list[Any], limit: int) -> list[Any]:
     return [items[index] for index in sorted(indexes)]
 
 
+def _sampled_task_parallelism(context: dict[str, Any], task_count: int) -> int:
+    if task_count <= 1:
+        return 1
+    params = context.get("params", {}) if isinstance(context.get("params"), dict) else {}
+    threads = max(1, _safe_int(params.get("threads"), 1))
+    outer_parallel = max(1, _safe_int(params.get("openevolve_parallel_evaluations"), 1))
+    # Leave room for OpenEvolve's outer evaluator pool so OE100 does not create
+    # hundreds of active workers per generation on large graphs.
+    budget = max(1, threads // outer_parallel)
+    return max(1, min(task_count, budget))
+
+
 def _evaluate_sampled_budget_tasks(
     context: dict[str, Any],
     hints: dict[str, Any],
@@ -2472,39 +2486,66 @@ def _evaluate_sampled_budget_tasks(
     def merge_counts(key: str, item: dict[str, Any]) -> None:
         total[key] += int(item.get(key, 0))
 
+    def run_task(task: dict[str, Any]) -> tuple[dict[str, Any], Tdag, Params, dict[str, Any], list[Assign], list[float]]:
+        task_context = task["context"]
+        task_tdag = tdag_from_context(task_context)
+        task_params = task_tdag.params
+        task_params.openevolve_iterations = 0
+        task_params.openevolve_harness = "compile"
+        task_params.openevolve_compile_hints = eval_hints
+        task_params.openevolve_evaluating_candidate = True
+        task_params.openevolve_eval_suite = eval_suite
+        _apply_active_scale_floor_from_hints(task_params, eval_hints)
+        task_le = LatencyEstimator(task_params)
+        budgets = [
+            _io_budget_from_json(item)
+            for item in task_context.get("io_budgets", [])
+            if isinstance(item, dict)
+        ]
+        if not budgets:
+            return task_context, task_tdag, task_params, {}, [], []
+        task_diag: dict[str, Any] = {}
+        solve_budget_batch(
+            task_tdag,
+            budgets,
+            task_le,
+            task_params,
+            eval_hints,
+            task_diag,
+        )
+        return (
+            task_context,
+            task_tdag,
+            task_params,
+            task_diag,
+            list(task_diag.get("assignments", [])),
+            [float(item) for item in task_diag.get("costs", [])],
+        )
+
     try:
         with stdout_context, stderr_context:
-            for task in context.get("sampled_budget_tasks", []):
-                if not isinstance(task, dict) or not isinstance(task.get("context"), dict):
+            tasks = [
+                task
+                for task in context.get("sampled_budget_tasks", [])
+                if isinstance(task, dict) and isinstance(task.get("context"), dict)
+            ]
+            workers = _sampled_task_parallelism(context, len(tasks))
+            if workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    task_results = list(executor.map(run_task, tasks))
+            else:
+                task_results = [run_task(task) for task in tasks]
+            total["sampled_task_parallelism"] = workers
+            for (
+                task_context,
+                task_tdag,
+                task_params,
+                task_diag,
+                task_assignments,
+                task_costs,
+            ) in task_results:
+                if not task_diag:
                     continue
-                task_context = task["context"]
-                task_tdag = tdag_from_context(task_context)
-                task_params = task_tdag.params
-                task_params.openevolve_iterations = 0
-                task_params.openevolve_harness = "compile"
-                task_params.openevolve_compile_hints = eval_hints
-                task_params.openevolve_evaluating_candidate = True
-                task_params.openevolve_eval_suite = eval_suite
-                task_scale_floor_bits = _apply_active_scale_floor_from_hints(
-                    task_params, eval_hints
-                )
-                task_le = LatencyEstimator(task_params)
-                budgets = [
-                    _io_budget_from_json(item)
-                    for item in task_context.get("io_budgets", [])
-                    if isinstance(item, dict)
-                ]
-                if not budgets:
-                    continue
-                task_diag: dict[str, Any] = {}
-                solve_budget_batch(
-                    task_tdag,
-                    budgets,
-                    task_le,
-                    task_params,
-                    eval_hints,
-                    task_diag,
-                )
                 total["sampled_task_count"] += 1
                 for key in (
                     "requested_budgets",
@@ -2544,12 +2585,10 @@ def _evaluate_sampled_budget_tasks(
                 for reason_key in ("invalid_reasons", "candidate_invalid_reasons"):
                     for reason, count in task_diag.get(reason_key, {}).items():
                         total[reason_key][reason] = total[reason_key].get(reason, 0) + int(count)
-                task_assignments = list(task_diag.get("assignments", []))
                 if task_assignments:
                     reserve_summaries.append(
                         _aggregate_reserve_summary(task_assignments, task_tdag, task_params)
                     )
-                task_costs = [float(item) for item in task_diag.get("costs", [])]
                 if task_costs and len(task_costs) == len(task_assignments):
                     idx = min(range(len(task_costs)), key=lambda pos: task_costs[pos])
                     if task_costs[idx] < best_cost:

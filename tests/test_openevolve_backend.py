@@ -3074,6 +3074,50 @@ def test_latency_gate_allows_equivalent_path_with_real_latency_improvement():
     assert gate["objective_improved_vs_seed"] is True
 
 
+def test_latency_only_score_tiers_slower_candidates_below_improvements():
+    slower = {
+        "objective_cost_usec": 1001.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
+    improved = {
+        "objective_cost_usec": 999.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
+
+    slower_score = oe_backend._latency_only_combined_score(slower, correct=True)
+    improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
+
+    assert 0.0 < slower_score < 1.0
+    assert improved_score > 1.0
+    assert improved_score > slower_score
+    assert oe_backend._latency_only_combined_score(improved, correct=False) == 0.0
+
+
+def test_sampled_best_without_latency_improvement_is_rejected(tmp_path: Path):
+    best_dir = tmp_path / "best"
+    best_dir.mkdir()
+    (best_dir / "best_program_info.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "validity": 1.0,
+                    "effective_validity": 1.0,
+                    "combined_score": 0.999,
+                    "latency_only_correct": 1.0,
+                    "seed_equivalent_path": 0.0,
+                    "objective_improved_vs_seed": 0.0,
+                    "candidate_qbp_coverage": 1.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert oe_backend._sampled_best_invalid_reason(tmp_path) == "sampled_best_not_latency_improved"
+
+
 def test_compile_invalid_metrics_cover_configured_feature_dimensions(
     toy_cost_json: str,
     tmp_path: Path,
@@ -3458,10 +3502,11 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
 
     def fake_evaluate_compile_hints(context, hints, *, suppress_output):
         eval_suites.append((context.get("harness", {}).get("eval_suite"), hints.get("level_drop_penalty")))
+        is_evolved = hints.get("level_drop_penalty") == 123.0
         return {
             "valid": True,
             "validity": 1.0,
-            "final_latency_usec": 100.0 if hints else 120.0,
+            "final_latency_usec": 100.0 if is_evolved else 120.0,
             "bootstrap_count": 4,
             "rescale_count": 2,
             "profile_risk": 0.0,
@@ -3560,6 +3605,71 @@ def test_full_bundle_finalist_prefers_lower_latency_over_bootstrap_regression(
         for item in summary["candidates"]
     )
     assert summary["selected_index"] == 1
+
+
+def test_full_bundle_finalist_fails_open_when_candidate_is_slower(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=1,
+        noise_estimator="off",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    initial_hints = {
+        "strategy": "level_preserving",
+        "level_drop_penalty": 111.0,
+        "allow_seed_fallback": False,
+    }
+    candidate_code = (
+        "def place(context):\n"
+        "    return {'strategy': 'level_preserving', 'level_drop_penalty': 999.0, "
+        "'allow_seed_fallback': False}\n"
+    )
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        is_seed = hints.get("level_drop_penalty") == 111.0
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 120.0 if not is_seed else 100.0,
+            "objective_cost_usec": 120.0 if not is_seed else 100.0,
+            "bootstrap_count": 4,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "candidate_qbp_coverage": 1.0,
+            "selected_output_state": {},
+            "reserve_summary": {},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {},
+            "log_tail": "",
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    selected = oe_backend._run_full_bundle_finalists(
+        tmp_path,
+        tmp_path / "openevolve_output",
+        context,
+        candidate_code,
+        params,
+        initial_hints,
+    )
+
+    summary = json.loads((tmp_path / "finalists" / "full_bundle_summary.json").read_text())
+    rejection = json.loads((tmp_path / "finalists" / "finalist_rejection_summary.json").read_text())
+    assert selected["fail_open_reason"] == "zero_iteration_seed_portfolio"
+    assert summary["candidates"][1]["finalist_gate"]["latency_improvement_reject"] is True
+    assert rejection["reason"]["latency_improvement_reject"] is True
 
 
 def test_full_bundle_finalist_dedupes_seed_equivalent_selected_path(

@@ -13,6 +13,7 @@ import time
 import traceback
 from collections import Counter
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -485,11 +486,14 @@ def place(context):
     ablations when selected_source_counts are unchanged. Orbit validates and
     repairs every assignment.
 
-    Follow context["evolution_guidance"]: use evaluator artifacts as execution
-    trace feedback. If component_bootstrap_score is low, change the component
-    budget action; if candidate_qbp_coverage is low, change boundary-state
-    coverage; if candidate_invalid_reasons point to forced anchors, soften or
-    retarget anchors rather than deleting the component action.
+    Follow context["evolution_guidance"] and context["harness"]["candidate_examples"]:
+    use evaluator artifacts as execution trace feedback. Keep path-diverse
+    candidates for exploration, but the winning program must reduce
+    objective_cost_usec versus the seed. If component_bootstrap_score is low,
+    change the component budget action; if candidate_qbp_coverage is low,
+    change boundary-state coverage; if candidate_invalid_reasons point to
+    forced anchors, soften or retarget anchors rather than deleting the
+    component action.
     """
     target_bootstraps = max(
         int(context.get("harness", {}).get("target_bootstrap_count", 9) or 0),
@@ -753,16 +757,18 @@ def place(context):
     built from Orbit's helper API. Orbit validates every assignment and owns
     final repair into Assign objects.
 
-    Follow context["evolution_guidance"]: use previous evaluator artifacts as
-    execution-trace feedback, keep CKKS legality intact, and mutate only the
-    high-impact policy surface rather than Orbit source code.
+    Follow context["evolution_guidance"] and context["harness"]["candidate_examples"]:
+    use previous evaluator artifacts as execution-trace feedback, keep CKKS
+    legality intact, and mutate only the high-impact policy surface rather
+    than Orbit source code.
 
     During sampled evolution, Orbit ranks policies lexicographically: first
     solve every reachable QBP boundary group directly, then minimize total
-    objective_cost_usec. Bootstrap/rescale counts are secondary tie-breakers,
-    not the primary objective. Sampled averages are diagnostics only:
-    finalists must replay the full QBP bundle, avoid seed fallback, and reduce
-    final_latency_usec.
+    objective_cost_usec. Path-diverse but slower candidates are exploration
+    examples only and cannot become final MLIR selections. Bootstrap/rescale
+    counts are secondary diagnostics, not the primary objective. Sampled
+    averages are diagnostics only: finalists must replay the full QBP bundle,
+    avoid seed fallback, and reduce final_latency_usec.
     """
     builder = PlacementBuilder(context)
     if context.get("harness", {}).get("search_mode") == "bootstrap-mcts":
@@ -1395,6 +1401,23 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     )
     context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    policy_bank = _run_compile_policy_bank_prepass(
+        context_path,
+        context,
+        initial_hints,
+        output_dir,
+        params,
+    )
+    if policy_bank.get("initial_hints") is not None:
+        initial_hints = policy_bank["initial_hints"]
+        initial_source = _program_source_from_hints(
+            initial_hints,
+            "Policy-bank latency-improved OpenEvolve initial program.",
+        )
+        context.setdefault("harness", {})["initial_policy_source"] = "policy_bank"
+    context.setdefault("harness", {})["candidate_examples"] = policy_bank.get("examples", [])
+    context.setdefault("harness", {})["policy_bank_summary"] = policy_bank.get("summary", {})
+    context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initial_path.write_text(initial_source, encoding="utf-8")
     evaluator_path.write_text(_compile_evaluator_source(context_path), encoding="utf-8")
     print(
@@ -1439,6 +1462,15 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     best_program = root / "best_program.py"
     best_program.write_text(best_code, encoding="utf-8")
     try:
+        sampled_reject_reason = _sampled_best_invalid_reason(output_dir)
+        if sampled_reject_reason is not None and params.openevolve_finalists <= 0:
+            _write_sampled_selection_summary(
+                root,
+                output_dir,
+                sampled_reject_reason,
+                fail_open=True,
+            )
+            return _bounded_fail_open_hints(initial_hints)
         finalist_hints = _run_full_bundle_finalists(
             root,
             output_dir,
@@ -1458,6 +1490,347 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     finally:
         if not params.openevolve_keep_workdir and params.openevolve_output_dir is None:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def _run_compile_policy_bank_prepass(
+    context_path: Path,
+    context: dict[str, Any],
+    initial_hints: dict[str, Any],
+    output_dir: Path,
+    params: Params,
+) -> dict[str, Any]:
+    if (
+        params.openevolve_iterations <= 0
+        or getattr(params, "openevolve_reuse_output", False)
+        or getattr(params, "openevolve_search_mode", "bootstrap-mcts") != "bootstrap-mcts"
+    ):
+        return {"examples": [], "summary": {"enabled": False}, "initial_hints": None}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bank_dir = output_dir / "policy_bank"
+    bank_dir.mkdir(parents=True, exist_ok=True)
+    variants = _compile_policy_bank_variants(initial_hints, context, params)
+    records: list[dict[str, Any]] = []
+    best_improved: tuple[float, dict[str, Any], dict[str, Any]] | None = None
+    print(
+        f"OpenEvolve compile harness: evaluating policy bank variants={len(variants)}.",
+        flush=True,
+    )
+    for idx, (label, hints) in enumerate(variants):
+        program_path = bank_dir / f"{idx:02d}_{_safe_filename(label)}.py"
+        program_path.write_text(
+            _program_source_from_hints(hints, f"Policy-bank candidate {label}."),
+            encoding="utf-8",
+        )
+        evaluation = evaluate_compile_candidate_program(context_path, program_path)
+        record = _policy_bank_record(label, hints, evaluation)
+        records.append(record)
+        if record.get("latency_improved") and record.get("correct"):
+            objective = _finite_float(record.get("objective_cost_usec"), float("inf"))
+            if best_improved is None or objective < best_improved[0]:
+                best_improved = (objective, hints, record)
+    summary = {
+        "enabled": True,
+        "variant_count": len(variants),
+        "records": records,
+        "selected_initial_label": (
+            best_improved[2].get("label") if best_improved is not None else None
+        ),
+        "selected_initial_objective_cost_usec": (
+            best_improved[0] if best_improved is not None else None
+        ),
+    }
+    (bank_dir / "policy_bank_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    examples = _policy_bank_candidate_examples(context, records)
+    print(
+        "OpenEvolve compile harness: policy bank "
+        f"improved={best_improved is not None} "
+        f"best={summary['selected_initial_label']}.",
+        flush=True,
+    )
+    return {
+        "examples": examples,
+        "summary": summary,
+        "initial_hints": best_improved[1] if best_improved is not None else None,
+    }
+
+
+def _compile_policy_bank_variants(
+    initial_hints: dict[str, Any],
+    context: dict[str, Any],
+    params: Params,
+) -> list[tuple[str, dict[str, Any]]]:
+    target = _context_target_bootstrap_count(context)
+    scale_candidates = _scale_floor_candidates_from_context(context)
+    variants: list[tuple[str, dict[str, Any]]] = []
+
+    def add(
+        label: str,
+        updates: dict[str, Any],
+        preset_updates: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        hints = deepcopy(initial_hints)
+        hints.update(updates)
+        if preset_updates:
+            presets = deepcopy(hints.get("mcts_action_presets", {}))
+            for name, patch in preset_updates.items():
+                base = deepcopy(presets.get(name, {}))
+                base_policy = deepcopy(base.get("policy", {}))
+                base_policy.update(patch.get("policy", {}))
+                base["policy"] = base_policy
+                if "prior" in patch:
+                    base["prior"] = patch["prior"]
+                presets[name] = base
+            hints["mcts_action_presets"] = presets
+        variants.append((label, hints))
+
+    add(
+        "frontier_wide_low_bootstrap_penalty",
+        {
+            "boundary_scale_policy": "frontier",
+            "boundary_state_cap": 8,
+            "max_scale_candidates": 64,
+            "state_cap_per_node": 32,
+            "beam_width": 8,
+            "mcts_action_cap": 10,
+            "mcts_rollout_budget": 16,
+            "selection_objective": "cost",
+            "bootstrap_penalty": 50_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "wide_boundary_cost_beam": {
+                "prior": 0.7,
+                "policy": {
+                    "boundary_scale_policy": "frontier",
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "bootstrap_penalty": 50_000_000.0,
+                },
+            },
+            "budget_fulfillment_beam": {
+                "prior": 0.55,
+                "policy": {
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "selection_objective": "cost",
+                },
+            },
+        },
+    )
+    add(
+        "waterline_sf_coverage",
+        {
+            "boundary_scale_policy": "waterline",
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 6,
+            "max_scale_candidates": 48,
+            "state_cap_per_node": 24,
+            "beam_width": 8,
+            "mcts_action_cap": 10,
+            "mcts_rollout_budget": 16,
+            "selection_objective": "cost",
+            "bootstrap_penalty": 125_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "profile_waterline_repair": {
+                "prior": 0.65,
+                "policy": {
+                    "boundary_state_cap": 6,
+                    "max_scale_candidates": 48,
+                    "bootstrap_penalty": 125_000_000.0,
+                },
+            },
+        },
+    )
+    add(
+        "component_budget_cost",
+        {
+            "boundary_state_cap": 6,
+            "max_scale_candidates": 48,
+            "mcts_action_cap": 10,
+            "mcts_rollout_budget": 18,
+            "selection_objective": "component_budget_fit",
+            "prefer_component_budget_fit": True,
+            "bootstrap_anchor_count": max(2, min(8, target or 4)),
+            "force_bootstrap_anchors": False,
+            "bootstrap_penalty": 80_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "component_budget_repair": {
+                "prior": 0.75,
+                "policy": {
+                    "boundary_state_cap": 6,
+                    "max_scale_candidates": 48,
+                    "bootstrap_anchor_count": max(2, min(8, target or 4)),
+                    "selection_objective": "component_budget_fit",
+                    "force_bootstrap_anchors": False,
+                },
+            },
+        },
+    )
+    for floor in scale_candidates:
+        waterline = int(_ckks_dict(context)["Sw"])
+        if int(floor) >= waterline:
+            continue
+        add(
+            f"relaxed_floor_{int(floor)}_frontier",
+            {
+                "scale_floor_bits": int(floor),
+                "boundary_scale_policy": "frontier",
+                "boundary_state_cap": 8,
+                "max_scale_candidates": 64,
+                "state_cap_per_node": 32,
+                "beam_width": 8,
+                "mcts_action_cap": 10,
+                "mcts_rollout_budget": 16,
+                "selection_objective": "cost",
+                "bootstrap_penalty": 75_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+            },
+            {
+                f"estimator_relaxed_floor_{int(floor)}": {
+                    "prior": 0.8,
+                    "policy": {
+                        "scale_floor_bits": int(floor),
+                        "boundary_scale_policy": "frontier",
+                        "boundary_state_cap": 8,
+                        "max_scale_candidates": 64,
+                        "selection_objective": "cost",
+                    },
+                },
+            },
+        )
+    return variants[:7]
+
+
+def _policy_bank_record(
+    label: str,
+    hints: dict[str, Any],
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    metrics = evaluation.get("metrics", {}) if isinstance(evaluation, dict) else {}
+    artifacts = evaluation.get("artifacts", {}) if isinstance(evaluation, dict) else {}
+    gate = _dict_from_jsonish(artifacts.get("correctness_gate", {}))
+    objective = _finite_float(metrics.get("objective_cost_usec"), float("inf"))
+    reference = _finite_float(metrics.get("reference_objective_cost_usec"), float("inf"))
+    improved = bool(
+        metrics.get("objective_improved_vs_seed", 0.0)
+        or (math.isfinite(objective) and math.isfinite(reference) and objective < reference)
+    )
+    return {
+        "label": label,
+        "correct": bool(metrics.get("latency_only_correct", 0.0)),
+        "latency_improved": improved,
+        "combined_score": _finite_float(metrics.get("combined_score"), 0.0),
+        "objective_cost_usec": objective,
+        "reference_objective_cost_usec": reference,
+        "objective_delta_usec": (
+            objective - reference
+            if math.isfinite(objective) and math.isfinite(reference)
+            else float("inf")
+        ),
+        "seed_equivalent_path": bool(metrics.get("seed_equivalent_path", 0.0)),
+        "candidate_qbp_coverage": _finite_float(metrics.get("candidate_qbp_coverage"), 0.0),
+        "boundary_group_validity": _finite_float(metrics.get("boundary_group_validity"), 0.0),
+        "fallback_selected_budgets": _finite_float(metrics.get("fallback_selected_budgets"), 0.0),
+        "sampled_selected_path_bootstraps": _finite_float(
+            metrics.get("sampled_selected_path_bootstraps"), 0.0
+        ),
+        "rescale_count": _finite_float(metrics.get("rescale_count"), 0.0),
+        "path_digest": str(artifacts.get("sampled_selected_path_digest", ""))[:24],
+        "candidate_mlir_digest": str(artifacts.get("candidate_mlir_digest", "")),
+        "candidate_mlir_path": str(artifacts.get("candidate_mlir_path", "")),
+        "gate_reasons": list(gate.get("reasons", []) or [])[:8],
+        "policy_summary": json.loads(_compact_policy_summary(hints)),
+    }
+
+
+def _policy_bank_candidate_examples(
+    context: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    seed = (
+        context.get("harness", {}).get("sampled_seed_baseline")
+        if isinstance(context.get("harness", {}), dict)
+        else None
+    )
+    if not isinstance(seed, dict):
+        seed = context.get("reference", {})
+    if isinstance(seed, dict) and seed:
+        examples.append(
+            {
+                "kind": "seed_reference",
+                "objective_cost_usec": _finite_float(
+                    seed.get("objective_cost_usec", seed.get("sampled_dp_latency_usec")),
+                    0.0,
+                ),
+                "selected_path_digest": str(seed.get("selected_path_digest", ""))[:24],
+                "bootstrap_count": _finite_float(seed.get("bootstrap_count"), 0.0),
+                "rescale_count": _finite_float(seed.get("rescale_count"), 0.0),
+            }
+        )
+    ranked = sorted(
+        records,
+        key=lambda item: (
+            not bool(item.get("correct")),
+            not bool(item.get("latency_improved")),
+            _finite_float(item.get("objective_cost_usec"), float("inf")),
+        ),
+    )
+    for item in ranked[:6]:
+        examples.append(
+            {
+                "kind": (
+                    "policy_bank_latency_improved"
+                    if item.get("latency_improved")
+                    else "policy_bank_loser"
+                ),
+                "label": item.get("label"),
+                "correct": bool(item.get("correct")),
+                "latency_improved": bool(item.get("latency_improved")),
+                "objective_cost_usec": _finite_float(item.get("objective_cost_usec"), 0.0),
+                "objective_delta_usec": _finite_float(item.get("objective_delta_usec"), 0.0),
+                "selected_path_digest": str(item.get("path_digest", "")),
+                "bootstrap_count": _finite_float(item.get("sampled_selected_path_bootstraps"), 0.0),
+                "rescale_count": _finite_float(item.get("rescale_count"), 0.0),
+                "fallback_selected_budgets": _finite_float(
+                    item.get("fallback_selected_budgets"), 0.0
+                ),
+                "candidate_mlir_digest": item.get("candidate_mlir_digest", ""),
+                "candidate_mlir_path": item.get("candidate_mlir_path", ""),
+                "why_it_lost": _policy_bank_loss_reason(item),
+            }
+        )
+    return examples[:8]
+
+
+def _policy_bank_loss_reason(item: dict[str, Any]) -> str:
+    if item.get("latency_improved"):
+        return "beats_seed_latency"
+    if not item.get("correct"):
+        reasons = item.get("gate_reasons") or []
+        return "incorrect_or_incomplete: " + ", ".join(str(reason) for reason in reasons[:3])
+    delta = _finite_float(item.get("objective_delta_usec"), 0.0)
+    return f"path_changed_but_slower_by_{delta:.3f}_usec"
+
+
+def _program_source_from_hints(hints: dict[str, Any], title: str) -> str:
+    return (
+        f'"""{title}"""\n\n'
+        "def place(context):\n"
+        f"    return {repr(hints)}\n"
+    )
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value)
+    return cleaned[:80] or "candidate"
 
 
 def evaluate_compile_candidate_program(
@@ -1859,6 +2232,11 @@ def evaluate_compile_candidate_program(
                     },
                     sort_keys=True,
                 ),
+                "trace_backed_candidate_examples": json.dumps(
+                    context.get("harness", {}).get("candidate_examples", []),
+                    sort_keys=True,
+                    default=str,
+                )[:8000],
                 "candidate_mlir_artifacts": json.dumps(
                     candidate_artifacts, sort_keys=True
                 )[:4000],
@@ -3072,7 +3450,7 @@ def _latency_only_correctness_gate(
 def _objective_improved_vs_seed(
     objective: dict[str, Any],
     *,
-    min_relative_improvement: float = 0.001,
+    min_relative_improvement: float = 0.0,
 ) -> bool:
     cost = _finite_float(objective.get("objective_cost_usec"), float("inf"))
     reference = _finite_float(objective.get("reference_objective_cost_usec"), float("inf"))
@@ -3098,7 +3476,10 @@ def _latency_only_combined_score(
         reference = _finite_float(objective.get("base_objective_cost_usec"), 1_000_000.0)
     if not math.isfinite(cost) or cost <= 0:
         return 0.0
-    return 1.0 + min(999.0, max(0.0, reference / cost))
+    ratio = reference / cost
+    if ratio <= 1.0:
+        return max(1e-6, min(0.999999, ratio))
+    return min(999.0, ratio)
 
 
 def _execution_trace_artifact(
@@ -4706,9 +5087,26 @@ def _run_full_bundle_finalists(
                     if relaxed_floor_reject and not profile_noise_reject:
                         profile_noise_reject = True
                         profile_noise_reason = relaxed_floor_reason
+                    finalist_objective = {
+                        "objective_cost_usec": result.get(
+                            "objective_cost_usec",
+                            result.get("final_latency_usec", float("inf")),
+                        ),
+                        "reference_objective_cost_usec": _baseline_objective_cost_usec(
+                            full_context,
+                            _finite_float(result.get("final_latency_usec"), float("inf")),
+                        ),
+                    }
+                    finalist_latency_improved = _objective_improved_vs_seed(
+                        finalist_objective
+                    )
+                    latency_improvement_reject = int(not finalist_latency_improved)
                     latency_reject = int(
-                        latency_target is not None
-                        and float(result["final_latency_usec"]) > latency_target
+                        latency_improvement_reject
+                        or (
+                            latency_target is not None
+                            and float(result["final_latency_usec"]) > latency_target
+                        )
                     )
                     margin_reject = int(
                         noise is not None
@@ -4722,6 +5120,11 @@ def _run_full_bundle_finalists(
                     summary["finalist_gate"] = {
                         "latency_target_usec": latency_target,
                         "latency_reject": bool(latency_reject),
+                        "latency_improvement_reject": bool(latency_improvement_reject),
+                        "final_latency_improved_vs_seed": bool(finalist_latency_improved),
+                        "reference_objective_cost_usec": finalist_objective[
+                            "reference_objective_cost_usec"
+                        ],
                         "effective_duplicate": bool(effective_duplicate),
                         "seed_equivalent_policy": bool(seed_equivalent_policy),
                         "selected_path_changed_vs_seed": bool(
@@ -4848,6 +5251,7 @@ def _run_full_bundle_finalists(
         best[0]
         or best[1]
         or fallback_reject
+        or bool(best[9])
         or ((best[2] or best[3]) and params.noise_estimator == "finalists")
     ):
         _write_finalist_rejection_summary(
@@ -4857,6 +5261,12 @@ def _run_full_bundle_finalists(
                 "plaintext_quality_reject": bool(best[0]),
                 "profile_noise_reject": bool(best[1]),
                 "fallback_selected_reject": fallback_reject,
+                "latency_reject": bool(best[9]),
+                "latency_improvement_reject": bool(
+                    best[17].get("finalist_gate", {}).get(
+                        "latency_improvement_reject"
+                    )
+                ),
                 "noise_warning_reject": bool(best[2]),
                 "noise_estimator_reject": bool(best[3]),
                 "relaxed_floor_reject": bool(
@@ -4917,6 +5327,11 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
         and _finite_float(metrics.get("objective_improved_vs_seed"), 0.0) <= 0.0
     ):
         return "sampled_best_seed_equivalent_path"
+    if (
+        _finite_float(metrics.get("latency_only_correct"), 0.0) >= 1.0
+        and _finite_float(metrics.get("objective_improved_vs_seed"), 0.0) <= 0.0
+    ):
+        return "sampled_best_not_latency_improved"
     candidate_qbp_coverage = _finite_float(metrics.get("candidate_qbp_coverage"), 0.0)
     candidate_groups = _finite_float(metrics.get("candidate_solved_boundary_groups"), 0.0)
     fallback_budgets = _finite_float(metrics.get("fallback_selected_budgets"), 0.0)
@@ -4928,6 +5343,52 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
     ):
         return "sampled_best_has_no_direct_qbp_coverage"
     return None
+
+
+def _write_sampled_selection_summary(
+    root: Path,
+    output_dir: Path,
+    reason: str,
+    *,
+    fail_open: bool,
+) -> None:
+    info_path = output_dir / "best" / "best_program_info.json"
+    info: dict[str, Any] = {}
+    if info_path.is_file():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except Exception:
+            info = {}
+    try:
+        (root / "sampled_selection_summary.json").write_text(
+            json.dumps(
+                {
+                    "selected_sampled_best": False,
+                    "fail_open": bool(fail_open),
+                    "reason": reason,
+                    "best_metrics": info.get("metrics", {}),
+                    "best_artifacts": {
+                        key: value
+                        for key, value in info.get("artifacts", {}).items()
+                        if key
+                        in {
+                            "candidate_mlir_path",
+                            "candidate_mlir_digest",
+                            "sampled_selected_path_digest",
+                            "latency_only_objective",
+                            "correctness_gate",
+                        }
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 def _write_finalist_rejection_summary(
@@ -5664,6 +6125,7 @@ def _record_compile_trace(
                 "boundary_group_unsolved_summary",
                 "correctness_gate",
                 "latency_only_objective",
+                "trace_backed_candidate_examples",
                 "execution_trace",
                 "candidate_mlir_artifacts",
                 "candidate_mlir_path",

@@ -3020,13 +3020,12 @@ def _latency_only_correctness_gate(
     effective_path = effective_path if isinstance(effective_path, dict) else {}
     policy_effect = policy_effect if isinstance(policy_effect, dict) else {}
     objective_improved = _objective_improved_vs_seed(objective)
-    path_changed = bool(
+    selected_path_changed = bool(
         effective_path.get("selected_path_changed_vs_seed", False)
-        or effective_path.get("effective_qbp_changed_vs_seed", False)
     )
     seed_equivalent_path = bool(
         effective_path.get("reference_selected_path_digest")
-        and not path_changed
+        and not selected_path_changed
     )
     if not bool(static.get("valid", False)):
         reasons.append("static_policy_invalid")
@@ -3050,7 +3049,11 @@ def _latency_only_correctness_gate(
         reasons.append("nonfinite_latency_objective")
     if seed_equivalent_path and not objective_improved:
         reasons.append("seed_equivalent_selected_path_without_latency_improvement")
-    if bool(policy_effect.get("seed_equivalent", False)) and not path_changed and not objective_improved:
+    if (
+        bool(policy_effect.get("seed_equivalent", False))
+        and not selected_path_changed
+        and not objective_improved
+    ):
         reasons.append("seed_equivalent_policy_without_latency_improvement")
     return {
         "correct": not reasons,
@@ -4024,9 +4027,7 @@ def _result_effective_summary(
         "effective_qbp_changed_vs_seed": bool(reference_qbp and qbp_digest != reference_qbp),
         "selected_path_changed_vs_seed": bool(reference_path and path_digest != reference_path),
         "seed_equivalent_path": bool(
-            reference_path
-            and path_digest == reference_path
-            and (not reference_qbp or qbp_digest == reference_qbp)
+            reference_path and path_digest == reference_path
         ),
         "changed_boundary_groups_vs_seed": int(changed_groups),
         "selected_path_payload": _selected_path_payload(result, diagnostics),

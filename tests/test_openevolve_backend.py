@@ -228,6 +228,7 @@ class FakeConfig:
     def __init__(self):
         self.random_seed = None
         self.checkpoint_interval = None
+        self.max_code_length = 10_000
         self.llm = FakeLLMConfig()
         self.database = FakeDatabaseConfig()
         self.evaluator = FakeEvaluatorConfig()
@@ -259,7 +260,7 @@ def test_context_roundtrip_and_conservative_placement(toy_cost_json: str):
 
     assert restored.name == graph.name
     assert restored.nodes["0"]["op"] == "mul"
-    assert context["schema_version"] == "orbit-openevolve-placement-context-v3"
+    assert context["schema_version"] == "orbit-openevolve-placement-context-v4"
     assert context["tdag"]["topological_order"]
     assert context["graph_summary"]["max_scale"] == params.Sf + 2 * params.Sw
     assert context["budget_summary"]["count"] == 1
@@ -556,6 +557,51 @@ def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
     assert PlacementBuilder(context).constraints.legal_output_states(16, 40)
 
 
+def test_tuneinsight_noise_slack_relaxes_reserve_penalty(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    base_policy = {
+        "bootstrap_penalty": 0.0,
+        "rescale_penalty": 0.0,
+        "level_drop_penalty": 0.0,
+        "reserve_penalty": 10.0,
+        "min_transition_reserve": 1000,
+        "min_decryptability_reserve": 1000,
+    }
+
+    worst_score = oe_backend._transition_score(
+        params,
+        None,
+        16,
+        40,
+        15,
+        40,
+        {**base_policy, "noise_slack_model": "worst_case"},
+    )
+    avgcase_score = oe_backend._transition_score(
+        params,
+        None,
+        16,
+        40,
+        15,
+        40,
+        {**base_policy, "noise_slack_model": "tuneinsight_avgcase"},
+    )
+    ignored_score = oe_backend._transition_score(
+        params,
+        None,
+        16,
+        40,
+        15,
+        40,
+        {**base_policy, "noise_slack_model": "off"},
+    )
+
+    assert worst_score is not None
+    assert avgcase_score is not None
+    assert ignored_score is not None
+    assert 0.0 == ignored_score < avgcase_score < worst_score
+
+
 def test_assignment_validation_rejects_non_decryptable_candidate_record(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = _toy_pdag(params)
@@ -722,22 +768,287 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
 
     assert hints["strategy"] == "bootstrap_mcts"
     assert hints["include_seed_repair_actions"] is False
-    assert hints["mcts_rollout_budget"] == 12
+    assert hints["mcts_rollout_budget"] == 24
+    assert hints["mcts_action_cap"] == 8
+    assert hints["mcts_action_allowlist"] == [
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "latency_mcts_repair",
+        "component_budget_repair",
+        "minimal_bootstrap_repair",
+        "waterline_budget_repair",
+    ]
     assert hints["mcts_exploration_weight"] == 1.15
     raw_budget_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
     ]
     assert raw_budget_beams
-    assert raw_budget_beams[0]["prior"] == 0.34
-    assert raw_budget_beams[0]["policy"]["beam_width"] == 4
+    assert raw_budget_beams[0]["prior"] == 0.54
+    assert raw_budget_beams[0]["policy"]["beam_width"] == 8
+    wide_beams = [
+        action for action in hints["mcts_actions"] if action.get("name") == "wide_boundary_cost_beam"
+    ]
+    assert wide_beams
+    assert wide_beams[0]["policy"]["boundary_state_cap"] == 8
+    assert wide_beams[0]["policy"]["max_scale_candidates"] == 64
+    tuneinsight_beams = [
+        action for action in hints["mcts_actions"] if action.get("name") == "tuneinsight_avgcase_cost_beam"
+    ]
+    assert tuneinsight_beams
+    assert tuneinsight_beams[0]["policy"]["noise_slack_model"] == "tuneinsight_avgcase"
+    deferred_beams = [
+        action
+        for action in hints["mcts_actions"]
+        if action.get("name") == "tuneinsight_deferred_bootstrap_beam"
+    ]
+    assert deferred_beams
+    assert deferred_beams[0]["policy"]["bootstrap_penalty"] == 650_000_000.0
+    assert deferred_beams[0]["policy"]["selection_objective"] == "cost"
+    assert raw_budget_beams[0]["policy"]["selection_objective"] == "cost"
     capped_names = [
         action["name"]
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
     ]
     assert "budget_fulfillment_beam" in capped_names
+    assert "tuneinsight_deferred_bootstrap_beam" in capped_names
+    assert "minimal_bootstrap_repair" not in capped_names
     assert sampled["mcts_action_cap"] <= 8
     assert any(action["name"] == "latency_mcts_repair" for action in sampled["mcts_actions"])
     assert any(action["name"] == "component_budget_repair" for action in sampled["mcts_actions"])
+    assert "component_budget_repair" in hints["mcts_action_presets"]
+
+
+def test_mcts_action_presets_change_effective_action_policy(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    hints = PlacementMCTS(context).low_bootstrap_seed(target_bootstraps=9, action_cap=8)
+    hints["mcts_action_presets"] = {
+        "component_budget_repair": {
+            "prior": 0.77,
+            "policy": {
+                "force_bootstrap_anchors": False,
+                "bootstrap_anchor_count": 6,
+                "selection_bootstrap_penalty": 12_345.0,
+            },
+        }
+    }
+
+    actions = oe_backend._mcts_actions_from_hints(hints, params)
+    component = next(action for action in actions if action.name == "component_budget_repair")
+
+    assert component.prior == 0.77
+    assert component.policy["force_bootstrap_anchors"] is False
+    assert component.policy["bootstrap_anchor_count"] == 6
+    assert component.policy["selection_bootstrap_penalty"] == 12_345.0
+
+
+def test_mcts_action_priority_filter_changes_action_frontier(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
+    mcts = PlacementMCTS(context)
+    hints = mcts.low_bootstrap_seed(target_bootstraps=9, action_cap=8)
+    hints.update(
+        mcts.action_focus(
+            "component_budget_repair",
+            "budget_fulfillment_beam",
+            cap=1,
+            block=["budget_fulfillment_beam"],
+        )
+    )
+    hints["mcts_action_presets"] = mcts.action_presets(
+        component_budget_repair={
+            "prior": 0.95,
+            "policy": {
+                "selection_objective": "component_budget_fit",
+                "bootstrap_anchor_count": 5,
+            },
+        },
+        budget_fulfillment_beam={"prior": 0.99, "enabled": False},
+    )
+
+    actions = oe_backend._mcts_actions_from_hints(hints, params)
+
+    assert [action.name for action in actions] == ["component_budget_repair"]
+    assert actions[0].prior == pytest.approx(0.95)
+    assert actions[0].policy["bootstrap_anchor_count"] == 5
+
+
+def test_policy_effect_summary_detects_seed_equivalent_and_changed_preset(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_budget_aggressive=True,
+        openevolve_target_bootstrap_count=9,
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["eval_suite"] = "polybert-sampled"
+    initial_path = tmp_path / "initial_program.py"
+    changed_path = tmp_path / "changed.py"
+    initial_path.write_text(oe_backend._initial_compile_program_source("bootstrap-mcts"), encoding="utf-8")
+    changed_path.write_text(
+        "from scripts.optimizer.orbit.openevolve_backend import PlacementMCTS\n"
+        "def place(context):\n"
+        "    target = 9\n"
+        "    mcts = PlacementMCTS(context)\n"
+        "    policy = mcts.low_bootstrap_seed(target_bootstraps=target, rollout_budget=12, action_cap=8)\n"
+        "    policy['mcts_action_presets'] = mcts.action_presets(\n"
+        "        component_budget_repair={'prior': 0.91, 'policy': {'force_bootstrap_anchors': False, 'bootstrap_anchor_count': 6}}\n"
+        "    )\n"
+        "    return policy\n",
+        encoding="utf-8",
+    )
+
+    initial_hints = oe_backend._load_candidate_hints(initial_path, context)
+    changed_hints = oe_backend._load_candidate_hints(changed_path, context)
+    initial_eval = oe_backend._compile_hints_for_eval_suite(initial_hints, "polybert-sampled")
+    changed_eval = oe_backend._compile_hints_for_eval_suite(changed_hints, "polybert-sampled")
+
+    seed_effect = oe_backend._policy_effect_summary(context, initial_hints, initial_eval, "polybert-sampled")
+    changed_effect = oe_backend._policy_effect_summary(context, changed_hints, changed_eval, "polybert-sampled")
+
+    assert seed_effect["seed_equivalent"] is True
+    assert seed_effect["effect_score"] == 0.0
+    assert changed_effect["seed_equivalent"] is False
+    assert changed_effect["effect_score"] > 0.0
+    assert "component_budget_repair" in changed_effect["changed_actions"]
+
+
+def test_compile_score_does_not_let_seed_equivalent_policy_dominate(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_budget_aggressive=True,
+    )
+    context = build_compile_context(_branch_merge_pdag(params), params)
+    context["reference"] = {
+        "final_latency_usec": 100.0,
+        "bootstrap_count": 4,
+        "rescale_count": 10,
+        "valid": False,
+    }
+    context["harness"]["sampled_seed_baseline"] = {
+        "final_latency_usec": 100.0,
+        "bootstrap_count": 4,
+        "rescale_count": 10,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "scored_boundary_groups": 2,
+        "solved_boundary_groups": 1,
+        "candidate_solved_boundary_groups": 1,
+    }
+    context_path = tmp_path / "compile_context.json"
+    seed_program = tmp_path / "initial_program.py"
+    changed_program = tmp_path / "changed.py"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    seed_program.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+    changed_program.write_text(
+        "def place(context):\n    return {'changed_marker': True}\n",
+        encoding="utf-8",
+    )
+
+    def fake_policy_effect(_context, raw_hints, _eval_hints, _eval_suite):
+        changed = bool(raw_hints.get("changed_marker"))
+        return {
+            "seed_equivalent": not changed,
+            "effect_score": 1.0 if changed else 0.0,
+            "changed_actions": ["component_budget_repair"] if changed else [],
+        }
+
+    def fake_evaluate_compile_hints(_context, _hints, *, suppress_output):
+        return {
+            "valid": False,
+            "validity": 0.0,
+            "final_latency_usec": 100.0,
+            "bootstrap_count": 4,
+            "rescale_count": 10,
+            "boundary_quality": 0.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "selected_output_state": {},
+            "reserve_summary": {},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {
+                "requested_budgets": 2,
+                "candidate_solved_budgets": 1,
+                "solved_budgets": 1,
+                "requested_boundary_groups": 4,
+                "solved_boundary_groups": 1,
+                "candidate_solved_boundary_groups": 1,
+                "unreachable_boundary_groups": 2,
+                "fallback_selected_boundary_groups": 0,
+            },
+            "log_tail": "",
+        }
+
+    monkeypatch.setattr(oe_backend, "_policy_effect_summary", fake_policy_effect)
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    seed = evaluate_compile_candidate_program(context_path, seed_program)
+    changed = evaluate_compile_candidate_program(context_path, changed_program)
+
+    assert seed["metrics"]["placement_effect_score"] == 0.0
+    assert changed["metrics"]["policy_effect_score"] == 1.0
+    assert changed["metrics"]["placement_effect_score"] == 0.0
+    assert changed["metrics"]["combined_score"] <= seed["metrics"]["combined_score"]
+
+
+def test_sampled_effective_path_uses_sampled_seed_baseline():
+    diagnostics = {
+        "requested_boundary_groups": 1,
+        "solved_boundary_groups": 1,
+        "candidate_solved_boundary_groups": 1,
+        "boundary_group_summaries": [
+            {
+                "group_key": {"pdag": "p0", "in_lvl": -1, "in_scl": 40},
+                "requested_output_levels": [0, 1],
+                "reachable_budgets": 2,
+                "solved_budgets": 2,
+                "candidate_solved_budgets": 2,
+                "candidate_complete": True,
+                "complete": True,
+                "min_cost_usec": 100.0,
+                "min_bootstrap": 1,
+                "min_rescale": 2,
+                "selected_source_counts": {"seed": 2},
+            }
+        ],
+    }
+    sampled_seed = {
+        "valid": False,
+        "bootstrap_count": 1,
+        "rescale_count": 2,
+        "sampled_selected_path_bootstraps": 1,
+        "sampled_selected_path_rescales": 2,
+        "sampled_selected_path_digest": "seed-sampled-digest",
+        "diagnostics": diagnostics,
+    }
+    baseline = oe_backend._placement_baseline_from_result(sampled_seed)
+    context = {
+        "reference": {
+            "effective_qbp_digest": "full-qbp-digest",
+            "selected_path_digest": "full-path-digest",
+        },
+        "harness": {
+            "eval_suite": "polybert-sampled",
+            "sampled_seed_baseline": baseline,
+        },
+    }
+
+    summary = oe_backend._result_effective_summary(context, sampled_seed, diagnostics)
+
+    assert summary["selected_path_changed_vs_seed"] is False
+    assert summary["effective_qbp_changed_vs_seed"] is False
 
 
 def test_sampled_compile_eval_keeps_bounded_candidate_portfolio(
@@ -779,6 +1090,33 @@ def test_full_bundle_finalist_replay_bounds_portfolio(toy_cost_json: str, tmp_pa
     assert "portfolio" not in finalist
     assert finalist["allow_seed_fallback"] is False
     assert finalist["max_scale_candidates"] <= 16
+
+
+def test_bootstrap_mcts_full_replay_keeps_wide_boundary_caps(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_budget_aggressive=True,
+        openevolve_target_bootstrap_count=9,
+    )
+    hints = oe_backend._bootstrap_mcts_seed_policy(params)
+    hints.update(
+        {
+            "max_scale_candidates": 64,
+            "boundary_state_cap": 8,
+            "mcts_rollout_budget": 64,
+            "mcts_action_cap": 16,
+        }
+    )
+
+    finalist = oe_backend._finalist_hints_for_full_bundle(hints)
+
+    assert finalist["strategy"] == "bootstrap_mcts"
+    assert finalist["allow_seed_fallback"] is False
+    assert finalist["max_scale_candidates"] == 64
+    assert finalist["boundary_state_cap"] >= 6
+    assert finalist["mcts_rollout_budget"] >= 32
+    assert finalist["mcts_action_cap"] >= 12
 
 
 def test_compile_fail_open_uses_validated_zero_iteration_portfolio(
@@ -889,11 +1227,14 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     ]
     assert [action["name"] for action in sampled_latency_actions] == [
         "budget_fulfillment_beam",
-        "latency_mcts_repair",
+        "wide_boundary_cost_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
     ]
-    assert sampled_latency_actions[0]["policy"]["beam_width"] <= 2
-    assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 4
-    assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 8
+    assert sampled_latency_actions[0]["policy"]["beam_width"] <= 4
+    assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 12
+    assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 16
 
 
 def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
@@ -956,10 +1297,10 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 8
-    assert captured["mcts_action_cap"] <= 8
-    assert captured["mcts_max_repair_bootstraps"] == 128
-    assert captured["boundary_state_cap"] == 1
+    assert captured["mcts_rollout_budget"] <= 4
+    assert captured["mcts_action_cap"] <= 7
+    assert captured["mcts_max_repair_bootstraps"] <= 64
+    assert captured["boundary_state_cap"] == 4
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(
@@ -1203,7 +1544,8 @@ def test_bootstrap_mcts_can_opt_into_direct_budget_beam_before_actions(toy_cost_
 
     assert diagnostics["candidate_solved_budgets"] == 1
     assert diagnostics["fallback_selected_budgets"] == 0
-    assert diagnostics["selected_source_counts"] == {"candidate:direct_budget_beam": 1}
+    assert sum(diagnostics["selected_source_counts"].values()) == 1
+    assert next(iter(diagnostics["selected_source_counts"])).startswith("candidate:")
 
 
 def test_bootstrap_mcts_candidate_actions_precede_seed_repair(toy_cost_json: str):
@@ -1238,7 +1580,7 @@ def test_bootstrap_mcts_candidate_actions_precede_seed_repair(toy_cost_json: str
     assert diagnostics["candidate_solved_budgets"] == 1
     assert diagnostics["fallback_selected_budgets"] == 0
     assert not any(
-        source.startswith("candidate:seed_repair")
+        source.startswith("seed_fallback")
         for source in diagnostics["selected_source_counts"]
     )
 
@@ -1414,6 +1756,82 @@ def test_bootstrap_mcts_sampled_budget_sampler_preserves_boundary_groups(
     } == {(-1, params.Sw, "")}
 
 
+def test_compile_sampled_budget_cache_caps_groups_globally(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_harness="compile",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=5,
+    )
+    graph = _toy_pdag(params)
+
+    class FakeManager:
+        openevolve_budget_tasks = []
+
+    for task_idx in range(3):
+        budgets = []
+        for group_idx in range(3):
+            for out_lvl in (1, 4, 8, 16):
+                budgets.append(
+                    {
+                        "in_lvl": task_idx * 10 + group_idx + 1,
+                        "in_scl": params.Sw + group_idx,
+                        "out_lvl": out_lvl,
+                        "main_qbp_cost": {(out_lvl, params.Sw): float(task_idx * 100 + group_idx)},
+                        "main_dag_size": task_idx + group_idx,
+                    }
+                )
+        FakeManager.openevolve_budget_tasks.append(
+            {"kind": "normal", "pdag": graph, "io_budgets": budgets}
+        )
+
+    tasks = oe_backend._sampled_budget_tasks_from_qbp_manager(FakeManager, params)
+    sampled_groups = {}
+    sampled_task_indexes = set()
+    for task in tasks:
+        sampled_task_indexes.add(task["index"])
+        for budget in task["context"]["io_budgets"]:
+            key = (
+                task["index"],
+                int(budget["in_lvl"]),
+                int(budget["in_scl"]),
+                str(budget.get("maino_v", "")),
+            )
+            sampled_groups.setdefault(key, set()).add(int(budget["out_lvl"]))
+
+    assert 1 < len(sampled_task_indexes) <= 3
+    assert len(sampled_groups) <= 5
+    assert all(levels == {1, 4, 8, 16} for levels in sampled_groups.values())
+
+
+def test_sampled_boundary_group_ranking_prefers_reachable_inputs(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    reachable = (-1, params.Sw, "", 0)
+    unreachable = (params.bts_lb - 1, params.Sw, "", 0)
+    groups = {
+        unreachable: [
+            {
+                "out_lvl": params.lvl_lb,
+                "main_qbp_cost": {(params.lvl_lb, params.Sw): 1.0},
+                "main_dag_size": 1,
+            }
+        ],
+        reachable: [
+            {
+                "out_lvl": params.lvl_ub,
+                "main_qbp_cost": {(params.lvl_ub, params.Sw): 10_000.0},
+                "main_dag_size": 1,
+            }
+        ],
+    }
+
+    ranked = oe_backend._rank_sampled_boundary_group_keys(groups, params)
+
+    assert ranked[0] == reachable
+    assert ranked[-1] == unreachable
+
+
 def test_bootstrap_mcts_returns_complete_qbp_boundary_group(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
     params.openevolve_evaluating_candidate = True
@@ -1459,6 +1877,9 @@ def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
                 "min_rescale": 4.0,
                 "max_bootstrap": 32.0,
                 "max_rescale": 20.0,
+                "avg_cost_usec": 120.0,
+                "min_cost_usec": 90.0,
+                "max_cost_usec": 180.0,
             },
             {
                 "solved_budgets": 2,
@@ -1468,6 +1889,9 @@ def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
                 "min_rescale": 2.0,
                 "max_bootstrap": 18.0,
                 "max_rescale": 9.0,
+                "avg_cost_usec": 40.0,
+                "min_cost_usec": 30.0,
+                "max_cost_usec": 60.0,
             },
             {
                 "solved_budgets": 0,
@@ -1477,6 +1901,9 @@ def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
                 "min_rescale": 99.0,
                 "max_bootstrap": 99.0,
                 "max_rescale": 99.0,
+                "avg_cost_usec": 999.0,
+                "min_cost_usec": 999.0,
+                "max_cost_usec": 999.0,
             },
         ]
     )
@@ -1485,6 +1912,175 @@ def test_boundary_group_count_summary_uses_frontier_for_sampled_bootstraps():
     assert summary["avg_bootstrap"] == 15.0
     assert summary["frontier_bootstrap"] == 2.0
     assert summary["frontier_rescale"] == 3.0
+    assert summary["frontier_total_bootstrap"] == 4.0
+    assert summary["frontier_total_rescale"] == 6.0
+    assert summary["frontier_total_cost_usec"] == 120.0
+    assert summary["avg_total_bootstrap"] == 30.0
+    assert summary["avg_total_rescale"] == 18.0
+    assert summary["avg_total_cost_usec"] == 160.0
+    assert summary["min_cost_usec"] == 30.0
+    assert summary["max_cost_usec"] == 180.0
+
+
+def test_cost_minimization_objective_prefers_direct_lower_cost_candidate():
+    context = {
+        "harness": {
+            "eval_suite": "polybert-sampled",
+            "sampled_seed_baseline": {"objective_cost_usec": 1_000.0},
+        },
+        "reference": {"objective_cost_usec": 1_000.0},
+    }
+    diagnostics = {
+        "requested_boundary_groups": 2,
+        "solved_boundary_groups": 2,
+        "candidate_solved_boundary_groups": 2,
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+    }
+    low_cost = {
+        "valid": True,
+        "final_latency_usec": 500.0,
+        "objective_cost_usec": 500.0,
+        "total_frontier_cost_usec": 500.0,
+        "fallback_selected_budgets": 0,
+    }
+    high_cost = {**low_cost, "final_latency_usec": 2_000.0, "objective_cost_usec": 2_000.0}
+
+    low_objective = oe_backend._cost_minimization_objective(
+        context, low_cost, diagnostics, effective_validity=1.0, repair_count=0
+    )
+    high_objective = oe_backend._cost_minimization_objective(
+        context, high_cost, diagnostics, effective_validity=1.0, repair_count=0
+    )
+
+    assert low_objective["objective_tier"] == 2.0
+    assert low_objective["candidate_direct_group_coverage"] == 1.0
+    assert low_objective["objective_cost_ratio_vs_seed"] == pytest.approx(2.0)
+    assert low_objective["objective_cost_score"] > high_objective["objective_cost_score"]
+
+
+def test_cost_minimization_objective_gates_partial_and_fallback_candidates():
+    context = {
+        "harness": {"seed_baseline": {"objective_cost_usec": 1_000.0}},
+        "reference": {"objective_cost_usec": 1_000.0},
+    }
+    direct_result = {
+        "valid": True,
+        "final_latency_usec": 2_000.0,
+        "total_frontier_cost_usec": 2_000.0,
+        "fallback_selected_budgets": 0,
+    }
+    direct_diag = {
+        "requested_boundary_groups": 2,
+        "solved_boundary_groups": 2,
+        "candidate_solved_boundary_groups": 2,
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+    }
+    fallback_diag = {**direct_diag, "fallback_selected_boundary_groups": 1}
+    fallback_result = {**direct_result, "final_latency_usec": 250.0, "fallback_selected_budgets": 1}
+    partial_diag = {
+        **direct_diag,
+        "solved_boundary_groups": 1,
+        "candidate_solved_boundary_groups": 1,
+    }
+    partial_result = {**direct_result, "valid": False, "final_latency_usec": 100.0}
+
+    direct = oe_backend._cost_minimization_objective(
+        context, direct_result, direct_diag, effective_validity=1.0, repair_count=0
+    )
+    fallback = oe_backend._cost_minimization_objective(
+        context, fallback_result, fallback_diag, effective_validity=1.0, repair_count=0
+    )
+    partial = oe_backend._cost_minimization_objective(
+        context, partial_result, partial_diag, effective_validity=0.5, repair_count=0
+    )
+
+    assert direct["objective_tier"] == 2.0
+    assert fallback["objective_tier"] == 1.0
+    assert partial["objective_tier"] == 0.0
+    assert fallback["objective_cost_usec"] > direct["objective_cost_usec"]
+    assert partial["unsolved_reachable_boundary_groups"] == 1.0
+
+
+def test_effective_path_digest_ignores_latency_but_tracks_qbp_path():
+    diagnostics = {
+        "requested_boundary_groups": 1,
+        "solved_boundary_groups": 1,
+        "candidate_solved_boundary_groups": 1,
+        "boundary_group_summaries": [
+            {
+                "group_key": {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "requested_output_levels": [1, 2],
+                "reachable_budgets": 2,
+                "solved_budgets": 2,
+                "candidate_solved_budgets": 2,
+                "fallback_selected_budgets": 0,
+                "candidate_complete": True,
+                "complete": True,
+                "min_cost_usec": 10.0,
+                "min_bootstrap": 1,
+                "min_rescale": 2,
+                "selected_source_counts": {"candidate:boundary_mcts:wide_boundary_cost_beam:0": 2},
+            }
+        ],
+    }
+    fast = {
+        "valid": True,
+        "final_latency_usec": 10.0,
+        "objective_cost_usec": 10.0,
+        "bootstrap_count": 1,
+        "rescale_count": 2,
+        "selected_output_state": {"out_lvl": 1, "out_scl": 40},
+        "assignment": {"v_lvl_out": {"x": 1}},
+    }
+    slow = {**fast, "final_latency_usec": 99.0, "objective_cost_usec": 99.0}
+    changed_diag = {
+        **diagnostics,
+        "boundary_group_summaries": [
+            {
+                **diagnostics["boundary_group_summaries"][0],
+                "selected_source_counts": {"candidate:boundary_mcts:profile_waterline_repair:0": 2},
+            }
+        ],
+    }
+
+    assert oe_backend._selected_path_digest(fast, diagnostics) == oe_backend._selected_path_digest(slow, diagnostics)
+    assert oe_backend._effective_qbp_digest(diagnostics) != oe_backend._effective_qbp_digest(changed_diag)
+
+
+def test_sampled_path_proxy_exposes_selected_path_cost():
+    summaries = [
+        {
+            "group_key": {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+            "requested_output_levels": [1, 2],
+            "solved_budgets": 2,
+            "candidate_solved_budgets": 2,
+            "min_cost_usec": 15.0,
+            "min_bootstrap": 1,
+            "min_rescale": 3,
+            "selected_source_counts": {"candidate:direct_budget_beam": 2},
+        },
+        {
+            "group_key": {"in_lvl": 15, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+            "requested_output_levels": [1],
+            "solved_budgets": 1,
+            "candidate_solved_budgets": 1,
+            "min_cost_usec": 7.0,
+            "min_bootstrap": 0,
+            "min_rescale": 1,
+            "selected_source_counts": {"candidate:boundary_mcts:profile_waterline_repair:0": 1},
+        },
+    ]
+
+    proxy = oe_backend._sampled_path_proxy_from_boundary_groups(summaries)
+
+    assert proxy["sampled_dp_latency_usec"] == pytest.approx(22.0)
+    assert proxy["sampled_selected_path_bootstraps"] == pytest.approx(1.0)
+    assert proxy["sampled_selected_path_rescales"] == pytest.approx(4.0)
+    assert proxy["sampled_selected_path_digest"]
 
 
 def test_unrefreshable_empty_boundary_group_is_not_scored_invalid(toy_cost_json: str):
@@ -1505,6 +2101,72 @@ def test_unrefreshable_empty_boundary_group_is_not_scored_invalid(toy_cost_json:
     assert diagnostics["unreachable_boundary_groups"] == 1
     assert diagnostics["invalid_boundary_groups"] == 0
     assert oe_backend._scored_boundary_group_count(diagnostics) == 1
+
+
+def test_partial_group_with_unreachable_output_levels_counts_complete(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(toy_cost_json)
+    graph = _toy_pdag(params)
+    assign = Assign(graph)
+    in_lvl = params.bts_lb + 1
+    in_scl = params.Sf * in_lvl - (params.Sf * params.bts_lb - params.Sf) + 1
+    group_key = (in_lvl, in_scl, "", 0)
+    budgets = [
+        {"out_lvl": params.lvl_lb},
+        {"out_lvl": params.lvl_ub},
+    ]
+    attempt = oe_backend._BudgetAttempt(
+        "candidate:unit-test",
+        assign,
+        10.0,
+        (in_lvl, in_scl),
+        (params.lvl_lb, params.Sw),
+        10.0,
+        {},
+    )
+    diagnostics = {
+        "requested_boundary_groups": 0,
+        "solved_boundary_groups": 0,
+        "partial_boundary_groups": 0,
+        "candidate_solved_boundary_groups": 0,
+        "fallback_selected_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+        "boundary_group_summaries": [],
+    }
+
+    assert oe_backend._boundary_budget_output_cannot_refresh(params, group_key, budgets[1])
+    monkeypatch.setattr(
+        oe_backend,
+        "_assignment_count_summary",
+        lambda _assigns: {
+            "avg_bootstrap": 0.0,
+            "min_bootstrap": 0.0,
+            "max_bootstrap": 0.0,
+            "avg_rescale": 0.0,
+            "min_rescale": 0.0,
+            "max_rescale": 0.0,
+        },
+    )
+
+    oe_backend._record_boundary_group_result(
+        diagnostics,
+        params,
+        group_key,
+        budgets,
+        [attempt],
+        1,
+        0,
+    )
+
+    assert diagnostics["solved_boundary_groups"] == 1
+    assert diagnostics["candidate_solved_boundary_groups"] == 1
+    assert diagnostics["invalid_boundary_groups"] == 0
+    summary = diagnostics["boundary_group_summaries"][0]
+    assert summary["complete"] is True
+    assert summary["reachable_budgets"] == 1
+    assert summary["unreachable_budgets"] == 1
 
 
 def test_boundary_scale_candidates_obey_output_level_bound(toy_cost_json: str):
@@ -1626,6 +2288,51 @@ def test_layer_nonlinear_units_are_extracted_from_comments(toy_cost_json: str):
     assert budget["effective_target_bootstrap_count"] >= 3
 
 
+def test_layer_units_handle_prefixed_rotom_comments_and_waterline_summary(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "prefixed_rotom_comments")
+    graph.add_node(
+        "arg0",
+        op="input",
+        weight=1,
+        op_descr={},
+        comment="0 scope=fhe_bert.input;op=full_model_input",
+    )
+    graph.add_node(
+        "softmax",
+        op="mul",
+        weight=1,
+        op_descr={"single": 0, "double": 1},
+        comment=(
+            "7716 scope=fhe_bert.bert.encoder.layer.1.attention.self."
+            "qk_softmax.softmax_mul;op=qk_softmax_mul"
+        ),
+    )
+    graph.add_node(
+        "pool",
+        op="add",
+        weight=1,
+        op_descr={"single": 1},
+        comment="9910 scope=fhe_bert.bert.pooler.dense;op=pooler_dense",
+    )
+    graph.add_edge("arg0", "softmax")
+    graph.add_edge("softmax", "pool")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"pool"}
+
+    context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
+
+    unit_ids = {unit["id"] for unit in context["placement_units"]}
+    assert "layer:layer.1" in unit_ids
+    assert "nonlinear:layer.1:attention_softmax" in unit_ids
+    assert "layer:pooler" in unit_ids
+    waterline = context["waterline_profile"]
+    assert waterline["ckks"]["input_waterline"] == 40
+    assert waterline["whole_graph"]["output_scale_lower_bounds"] == {"40": 3}
+    assert waterline["by_layer"]["layer.1"]["output_scale_lower_bounds"] == {"40": 1}
+    assert waterline["by_layer"]["pooler"]["output_scale_lower_bounds"] == {"40": 1}
+
+
 def test_component_bootstrap_alignment_scores_non_linear_budget(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = Tdag(params, "unit_graph")
@@ -1682,7 +2389,68 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
     assert component["policy"]["bootstrap_anchor_count"] >= 3
     assert component["policy"]["selection_objective"] == "component_budget_fit"
     assert component["policy"]["prefer_component_budget_fit"] is True
-    assert component["policy"]["force_bootstrap_anchors"] is True
+    assert component["policy"]["force_bootstrap_anchors"] is False
+
+
+def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        scale_floor_policy="estimator-relaxed",
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": params.lvl_ub, "in_scl": params.Sw}], params)
+
+    actions = candidate_actions(context, action_cap=12)
+    names = [action["name"] for action in actions]
+    sampled_names = [
+        action["name"] for action in oe_backend._sampled_lightweight_mcts_actions(actions)
+    ]
+
+    assert "estimator_relaxed_floor_36" in names
+    assert "estimator_relaxed_floor_32" in names
+    assert "estimator_relaxed_floor_28" in names
+    assert "estimator_relaxed_floor_36" in sampled_names[:8]
+
+
+def test_scale_floor_hints_normalize_to_configured_candidates(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        scale_floor_policy="estimator-relaxed",
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+
+    assert oe_backend._scale_floor_bits_from_hints(params, {"scale_floor_bits": 34}) == 36
+    assert oe_backend._scale_floor_bits_from_hints(params, {"scale_floor_bits": 27}) == 28
+    assert oe_backend._scale_floor_bits_from_hints(params, {}) == 40
+
+
+def test_assign_check_uses_active_estimator_relaxed_scale_floor(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        scale_floor_policy="estimator-relaxed",
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+    graph = Tdag(params, "scale_floor_add")
+    graph.add_node("arg0", op="input", weight=1, level=None, scale=None, op_descr={}, comment="")
+    graph.add_node("0", op="add", weight=1, level=None, scale=None, op_descr={"single": 1}, comment="")
+    graph.add_edge("arg0", "0", weight=1)
+    graph.inputs = {"arg0"}
+    graph.outputs = {"0"}
+    assign = Assign(graph)
+    for node in ("arg0", "0"):
+        assign.v_lvl_out[node] = params.lvl_ub
+        assign.v_scl_out[node] = 28
+    assign.v_lvl_in["arg0"] = params.lvl_ub
+    assign.v_scl_in["arg0"] = 28
+    assign.e_lvl_out[("arg0", "0")] = params.lvl_ub
+    assign.e_scl_out[("arg0", "0")] = 28
+
+    with pytest.raises(ValueError, match="below local lower bound 40"):
+        assign.check_assign()
+
+    oe_backend._apply_active_scale_floor_from_hints(params, {"scale_floor_bits": 28})
+    assert assign.check_assign() is True
 
 
 def test_force_bootstrap_anchor_selects_refresh_transition(toy_cost_json: str):
@@ -1773,7 +2541,104 @@ def test_component_budget_selection_prefers_budget_fit_over_low_cost(toy_cost_js
         policy,
     )
 
-    assert oe_backend._best_candidate_attempt([low_attempt, maintained_attempt], params) is maintained_attempt
+    assert (
+        oe_backend._best_candidate_attempt([low_attempt, maintained_attempt], params, policy)
+        is maintained_attempt
+    )
+
+
+def test_min_bootstrap_selection_prefers_fewer_refreshes(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = Tdag(params, "min_bootstrap_selection")
+    graph.add_node("x", op="input", weight=1, op_descr={}, comment="scope=test.x")
+    graph.inputs = {"x"}
+    graph.outputs = {"x"}
+
+    no_refresh = Assign(graph)
+    no_refresh.v_lvl_in["x"] = params.lvl_ub
+    no_refresh.v_scl_in["x"] = params.Sw
+    no_refresh.v_lvl_out["x"] = params.lvl_ub
+    no_refresh.v_scl_out["x"] = params.Sw
+
+    refresh = Assign(graph)
+    refresh.v_lvl_in["x"] = params.bts_lb
+    refresh.v_scl_in["x"] = params.Sw
+    refresh.v_lvl_out["x"] = params.bts_lb + 1
+    refresh.v_scl_out["x"] = params.Sf
+
+    policy = {"selection_objective": "min_bootstrap"}
+    no_refresh_attempt = oe_backend._BudgetAttempt(
+        "candidate:no_refresh",
+        no_refresh,
+        100.0,
+        (params.lvl_ub, params.Sw),
+        (params.lvl_ub, params.Sw),
+        100.0,
+        policy,
+    )
+    refresh_attempt = oe_backend._BudgetAttempt(
+        "candidate:refresh",
+        refresh,
+        1.0,
+        (params.bts_lb, params.Sw),
+        (params.bts_lb + 1, params.Sf),
+        1.0,
+        policy,
+    )
+
+    assert (
+        oe_backend._best_candidate_attempt([refresh_attempt, no_refresh_attempt], params, policy)
+        is no_refresh_attempt
+    )
+
+
+def test_cost_root_ignores_exploratory_non_cost_action_objectives(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
+    graph = Tdag(params, "cost_root_selection")
+    graph.add_node("x", op="input", weight=1, op_descr={}, comment="scope=test.x")
+    graph.inputs = {"x"}
+    graph.outputs = {"x"}
+
+    low_cost = Assign(graph)
+    low_cost.v_lvl_in["x"] = params.lvl_ub
+    low_cost.v_scl_in["x"] = params.Sw
+    low_cost.v_lvl_out["x"] = params.lvl_ub
+    low_cost.v_scl_out["x"] = params.Sw
+
+    non_cost = Assign(graph)
+    non_cost.v_lvl_in["x"] = params.bts_lb
+    non_cost.v_scl_in["x"] = params.Sw
+    non_cost.v_lvl_out["x"] = params.bts_lb + 1
+    non_cost.v_scl_out["x"] = params.Sf
+
+    root_policy = {"selection_objective": "cost"}
+    low_cost_attempt = oe_backend._BudgetAttempt(
+        "candidate:cost",
+        low_cost,
+        1.0,
+        (params.lvl_ub, params.Sw),
+        (params.lvl_ub, params.Sw),
+        1.0,
+        {"selection_objective": "cost"},
+    )
+    non_cost_attempt = oe_backend._BudgetAttempt(
+        "candidate:min_bootstrap",
+        non_cost,
+        10.0,
+        (params.bts_lb, params.Sw),
+        (params.bts_lb + 1, params.Sf),
+        10.0,
+        {"selection_objective": "min_bootstrap"},
+    )
+
+    assert (
+        oe_backend._best_candidate_attempt(
+            [non_cost_attempt, low_cost_attempt],
+            params,
+            root_policy,
+        )
+        is low_cost_attempt
+    )
 
 
 def test_component_budget_mcts_does_not_stop_at_too_few_bootstraps(toy_cost_json: str):
@@ -1862,7 +2727,7 @@ def place(context):
     hints = oe_backend._load_candidate_hints(program_path, context)
 
     assert hints["strategy"] == "level_preserving"
-    assert hints["max_scale_candidates"] == 32
+    assert hints["max_scale_candidates"] == 64
     assert len(hints["unit_policies"]) == 1
     assert hints["unit_policies"][0]["policy"]["min_internal_level"] == params.lvl_ub
     assert hints["unit_policies"][0]["policy"]["beam_width"] == 8
@@ -2153,6 +3018,10 @@ def test_compile_invalid_metrics_cover_configured_feature_dimensions(
         "component_bootstrap_score",
         "candidate_qbp_coverage",
         "boundary_group_validity",
+        "placement_effect_score",
+        "policy_effect_score",
+        "action_effect_score",
+        "seed_equivalent_policy",
         "rescale_count",
         "fallback_selected_budgets",
         "profile_risk",
@@ -2171,6 +3040,7 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     config = worker._openevolve_config_arg()
 
     assert config.random_seed == 7
+    assert config.max_code_length == 50_000
     assert config.database.random_seed == 7
     assert config.llm.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert config.llm.models[0].name == "gemini-3.1-flash-lite"
@@ -2184,13 +3054,21 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     assert config.evaluator.timeout == 180
     assert config.evaluator.parallel_evaluations == 1
     assert config.checkpoint_interval == 5
+    assert config.prompt.max_artifact_bytes == 48 * 1024
     assert config.database.feature_dimensions == [
+        "objective_cost_usec",
+        "objective_cost_ratio_vs_seed",
+        "boundary_group_validity",
+        "candidate_direct_group_coverage",
+        "unsolved_reachable_boundary_groups",
+        "total_frontier_cost_usec",
         "final_latency_usec",
-        "boundary_quality",
         "bootstrap_count",
         "component_bootstrap_score",
-        "candidate_qbp_coverage",
-        "boundary_group_validity",
+        "placement_effect_score",
+        "policy_effect_score",
+        "action_effect_score",
+        "seed_equivalent_policy",
         "rescale_count",
         "fallback_selected_budgets",
         "profile_risk",
@@ -2536,7 +3414,7 @@ def test_compile_harness_reruns_best_candidate_on_full_bundle(
     assert (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").is_file()
 
 
-def test_full_bundle_finalist_prefers_seed_over_bootstrap_regression(
+def test_full_bundle_finalist_prefers_lower_latency_over_bootstrap_regression(
     toy_cost_json: str,
     tmp_path: Path,
     monkeypatch,
@@ -2594,12 +3472,113 @@ def test_full_bundle_finalist_prefers_seed_over_bootstrap_regression(
     )
 
     summary = json.loads((tmp_path / "finalists" / "full_bundle_summary.json").read_text())
-    assert selected["level_drop_penalty"] == 111.0
+    assert selected["level_drop_penalty"] == 999.0
     assert summary["finalist_gate"]["seed_bootstrap_count"] == 44
     assert any(
         item.get("finalist_gate", {}).get("bootstrap_regression") is True
         for item in summary["candidates"]
     )
+    assert summary["selected_index"] == 1
+
+
+def test_full_bundle_finalist_dedupes_seed_equivalent_selected_path(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_finalists=2,
+        openevolve_search_mode="bootstrap-mcts",
+        noise_estimator="off",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    initial_hints = {
+        "strategy": "level_preserving",
+        "level_drop_penalty": 111.0,
+        "allow_seed_fallback": False,
+    }
+    dup_code = (
+        "def place(context):\n"
+        "    return {'strategy': 'level_preserving', 'level_drop_penalty': 111.0, "
+        "'allow_seed_fallback': False}\n"
+    )
+    distinct_code = (
+        "def place(context):\n"
+        "    return {'strategy': 'level_preserving', 'level_drop_penalty': 222.0, "
+        "'max_scale_candidates': 33, 'allow_seed_fallback': False}\n"
+    )
+
+    monkeypatch.setattr(
+        oe_backend,
+        "_discover_finalist_codes",
+        lambda _output_dir, _best_code, _limit: [dup_code, distinct_code],
+    )
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        is_distinct = hints.get("level_drop_penalty") == 222.0
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "final_latency_usec": 40.0 if is_distinct else 50.0,
+            "objective_cost_usec": 40.0 if is_distinct else 50.0,
+            "total_frontier_cost_usec": 40.0 if is_distinct else 50.0,
+            "bootstrap_count": 9 if is_distinct else 10,
+            "rescale_count": 2,
+            "boundary_quality": 1.0,
+            "profile_risk": 0.0,
+            "placement_runtime_sec": 0.01,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "candidate_qbp_coverage": 1.0,
+            "selected_output_state": {"out_lvl": 1, "out_scl": 40},
+            "reserve_summary": {},
+            "assignment": {"v_lvl_out": {"x": 2 if is_distinct else 1}},
+            "bootstrap_locations": {},
+            "rescale_locations": {},
+            "bottleneck_summary": [],
+            "diagnostics": {
+                "requested_boundary_groups": 1,
+                "solved_boundary_groups": 1,
+                "candidate_solved_boundary_groups": 1,
+                "fallback_selected_boundary_groups": 0,
+                "boundary_group_summaries": [
+                    {
+                        "group_key": {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                        "requested_output_levels": [1],
+                        "reachable_budgets": 1,
+                        "solved_budgets": 1,
+                        "candidate_solved_budgets": 1,
+                        "fallback_selected_budgets": 0,
+                        "candidate_complete": True,
+                        "complete": True,
+                            "min_cost_usec": 40.0 if is_distinct else 50.0,
+                            "min_bootstrap": 9 if is_distinct else 10,
+                        "min_rescale": 2,
+                        "selected_source_counts": {"candidate:unit-test": 1},
+                    }
+                ],
+            },
+            "log_tail": "",
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    selected = oe_backend._run_full_bundle_finalists(
+        tmp_path,
+        tmp_path / "openevolve_output",
+        context,
+        dup_code,
+        params,
+        initial_hints,
+    )
+
+    summary = json.loads((tmp_path / "finalists" / "full_bundle_summary.json").read_text())
+    assert selected["level_drop_penalty"] == 222.0
+    assert summary["selected_index"] == 2
+    assert summary["effective_dedupe"]["duplicate_candidates"] >= 1
+    assert summary["candidates"][1]["effective_duplicate_of_index"] == 0
 
 
 def test_compile_harness_reuses_existing_output_without_llm(
@@ -2839,7 +3818,7 @@ def test_full_bundle_finalist_gate_ignores_legacy_min_bootstrap_count(
         (tmp_path / "compile_oe_toy" / "finalists" / "full_bundle_summary.json").read_text()
     )
     assert summary["finalist_gate"]["forced_bootstrap_floor"] is None
-    assert summary["selected_index"] == 0
+    assert summary["selected_index"] == 1
 
 
 def test_full_bundle_finalist_gate_honors_explicit_forced_bootstrap_floor(
@@ -3081,10 +4060,21 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
     worker.get_qbp(graph, [{"in_lvl": -1, "in_scl": 40}])
 
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] >= 2
-    assert captured["mcts_action_cap"] <= 2
-    assert captured["boundary_state_cap"] == 1
-    assert captured["selection_bootstrap_penalty"] > 0
+    assert captured["mcts_rollout_budget"] >= 8
+    assert captured["mcts_action_cap"] == 8
+    assert captured["mcts_action_allowlist"] == [
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "latency_mcts_repair",
+        "component_budget_repair",
+        "minimal_bootstrap_repair",
+        "waterline_budget_repair",
+    ]
+    assert captured["boundary_state_cap"] == 4
+    assert captured["selection_objective"] == "cost"
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

@@ -184,6 +184,12 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
             "repair",
             "--openevolve-max-unit-samples",
             "32",
+            "--scale-floor-policy",
+            "estimator-relaxed",
+            "--scale-floor-min-bits",
+            "28",
+            "--openevolve-scale-floor-candidates",
+            "40,36,32,28",
         ],
     )
 
@@ -232,6 +238,9 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["noise_estimator_alpha"] == 14.0
     assert init["noise_estimator_max_trace_message_bits"] == 20.0
     assert init["noise_estimator_require_trace_safe"] is False
+    assert init["scale_floor_policy"] == "estimator-relaxed"
+    assert init["scale_floor_min_bits"] == 28
+    assert init["openevolve_scale_floor_candidates"] == "40,36,32,28"
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

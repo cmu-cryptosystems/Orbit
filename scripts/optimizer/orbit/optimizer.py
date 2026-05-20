@@ -298,6 +298,24 @@ def main():
         help='Treat whole-trace precision/message warnings as hard finalist rejections',
     )
     parser.add_argument(
+        '--scale-floor-policy',
+        choices=['waterline', 'estimator-relaxed'],
+        default='waterline',
+        help='Scale lower-bound policy for OpenEvolve candidate evaluation',
+    )
+    parser.add_argument(
+        '--scale-floor-min-bits',
+        type=int,
+        default=None,
+        help='Minimum relaxed scale floor; defaults to max(24, Sw - 12) under estimator-relaxed',
+    )
+    parser.add_argument(
+        '--openevolve-scale-floor-candidates',
+        type=str,
+        default=None,
+        help='Comma-separated OpenEvolve scale floor candidates, e.g. 40,36,32,28',
+    )
+    parser.add_argument(
         '--resilience-profile',
         type=str,
         default=None,
@@ -395,7 +413,10 @@ def main():
                     noise_estimator_min_output_margin_bits=args.noise_estimator_min_output_margin_bits,
                     noise_estimator_alpha=args.noise_estimator_alpha,
                     noise_estimator_max_trace_message_bits=args.noise_estimator_max_trace_message_bits,
-                    noise_estimator_require_trace_safe=args.noise_estimator_require_trace_safe)
+                    noise_estimator_require_trace_safe=args.noise_estimator_require_trace_safe,
+                    scale_floor_policy=args.scale_floor_policy,
+                    scale_floor_min_bits=args.scale_floor_min_bits,
+                    openevolve_scale_floor_candidates=args.openevolve_scale_floor_candidates)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

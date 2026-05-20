@@ -61,6 +61,9 @@ if __name__ == "__main__":
     parser.add_argument('--noise-estimator-alpha', type=float, default=14.0)
     parser.add_argument('--noise-estimator-max-trace-message-bits', type=float, default=20.0)
     parser.add_argument('--noise-estimator-require-trace-safe', action='store_true')
+    parser.add_argument('--scale-floor-policy', choices=['waterline', 'estimator-relaxed'], default='waterline')
+    parser.add_argument('--scale-floor-min-bits', type=int, default=None)
+    parser.add_argument('--openevolve-scale-floor-candidates', type=str, default=None)
     parser.add_argument('--resilience-profile', type=str, default=None)
     parser.add_argument('--resilience-mode', choices=['waterline', 'error-state'], default='waterline')
     parser.add_argument('--allow-empty-resilience-match', action='store_true')
@@ -154,6 +157,14 @@ if __name__ == "__main__":
             cmds.append("--noise-estimator-require-trace-safe")
         if args.noise_estimator_binary:
             cmds += ["--noise-estimator-binary", args.noise_estimator_binary]
+        cmds += ["--scale-floor-policy", args.scale_floor_policy]
+        if args.scale_floor_min_bits is not None:
+            cmds += ["--scale-floor-min-bits", str(args.scale_floor_min_bits)]
+        if args.openevolve_scale_floor_candidates:
+            cmds += [
+                "--openevolve-scale-floor-candidates",
+                args.openevolve_scale_floor_candidates,
+            ]
         if args.openevolve_reference_json:
             cmds += ["--openevolve-reference-json", args.openevolve_reference_json]
         if args.openevolve_api_base:

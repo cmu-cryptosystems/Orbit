@@ -21,6 +21,17 @@ DEFAULT_RESILIENCE_ERROR_MODEL = {
     "max_error_abs": 1.0,
 }
 
+
+def _parse_scale_floor_candidates(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [int(item.strip()) for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
 class Params:
     def __init__(
         self,
@@ -86,6 +97,9 @@ class Params:
         noise_estimator_alpha=14.0,
         noise_estimator_max_trace_message_bits=20.0,
         noise_estimator_require_trace_safe=False,
+        scale_floor_policy=None,
+        scale_floor_min_bits=None,
+        openevolve_scale_floor_candidates=None,
     ):
         if le_json is None:
             return # should be filled later
@@ -433,6 +447,57 @@ class Params:
                 self.Sw = relaxed_sw
                 if self._constant_scale_is_default:
                     self.Csw = relaxed_sw
+        self.scale_floor_policy = (
+            scale_floor_policy
+            if scale_floor_policy is not None
+            else json_parsed.get("scale_floor_policy", "waterline")
+        )
+        if self.scale_floor_policy not in ("waterline", "estimator-relaxed"):
+            raise ValueError(
+                "scale_floor_policy must be 'waterline' or 'estimator-relaxed', "
+                f"got {self.scale_floor_policy!r}"
+            )
+        default_floor = (
+            max(24, int(self.Sw) - 12)
+            if self.scale_floor_policy == "estimator-relaxed"
+            else int(self.Sw)
+        )
+        self.scale_floor_min_bits = max(
+            0,
+            min(
+                int(self.Sw),
+                int(
+                    scale_floor_min_bits
+                    if scale_floor_min_bits is not None
+                    else json_parsed.get("scale_floor_min_bits", default_floor)
+                ),
+            ),
+        )
+        raw_floor_candidates = (
+            openevolve_scale_floor_candidates
+            if openevolve_scale_floor_candidates is not None
+            else json_parsed.get("openevolve_scale_floor_candidates")
+        )
+        parsed_floor_candidates = _parse_scale_floor_candidates(raw_floor_candidates)
+        if self.scale_floor_policy == "estimator-relaxed":
+            if parsed_floor_candidates is None:
+                parsed_floor_candidates = [
+                    int(self.Sw),
+                    max(self.scale_floor_min_bits, int(self.Sw) - 4),
+                    max(self.scale_floor_min_bits, int(self.Sw) - 8),
+                    self.scale_floor_min_bits,
+                ]
+            candidates = []
+            for item in parsed_floor_candidates:
+                value = max(self.scale_floor_min_bits, min(int(self.Sw), int(item)))
+                if value not in candidates:
+                    candidates.append(value)
+            if int(self.Sw) not in candidates:
+                candidates.insert(0, int(self.Sw))
+            self.openevolve_scale_floor_candidates = candidates or [int(self.Sw)]
+        else:
+            self.openevolve_scale_floor_candidates = [int(self.Sw)]
+        self._active_scale_floor_bits = None
         assert resilience_mode in ["waterline", "error-state"], (
             "resilience_mode must be either 'waterline' or 'error-state'"
         )
@@ -489,17 +554,28 @@ class Params:
             and scale <= self.decryptable_scale_bound(level)
         )
 
+    def active_scale_floor_bits(self) -> int:
+        if self.scale_floor_policy != "estimator-relaxed":
+            return int(self.Sw)
+        raw_floor = getattr(self, "_active_scale_floor_bits", None)
+        if raw_floor is None:
+            return int(self.Sw)
+        return max(self.scale_floor_min_bits, min(int(self.Sw), int(raw_floor)))
+
     def scale_lower_bound(self, node_label: str, node_attrs: dict, port: str) -> int:
+        active_floor = self.active_scale_floor_bits()
         if self.resilience_profile is None:
-            return self.Sw
+            return active_floor
         profile_bound = self.resilience_profile.scale_lower_bound(
             node_label,
             node_attrs,
             self.Sw,
             port,
         )
+        if self.resilience_constraint_policy == "hard-tau":
+            return profile_bound
         if self.resilience_constraint_policy == "relax-only":
-            return min(self.Sw, profile_bound)
+            return min(active_floor, profile_bound)
         return profile_bound
         
     def check_res(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:

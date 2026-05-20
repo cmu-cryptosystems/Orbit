@@ -49,6 +49,9 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.noise_estimator_alpha == 14.0
     assert p.noise_estimator_max_trace_message_bits == 20.0
     assert p.noise_estimator_require_trace_safe is False
+    assert p.scale_floor_policy == "waterline"
+    assert p.scale_floor_min_bits == p.Sw
+    assert p.openevolve_scale_floor_candidates == [p.Sw]
     assert p.mode == "compile"
 
 
@@ -111,6 +114,74 @@ def test_params_rejects_bad_openevolve_eval_suite(toy_cost_json: str):
 def test_params_rejects_bad_noise_estimator(toy_cost_json: str):
     with pytest.raises(ValueError, match="noise_estimator"):
         Params(toy_cost_json, "Orbit", "compile", noise_estimator="always")
+
+
+def test_params_rejects_bad_scale_floor_policy(toy_cost_json: str):
+    with pytest.raises(ValueError, match="scale_floor_policy"):
+        Params(toy_cost_json, "Orbit", "compile", scale_floor_policy="unsafe")
+
+
+def test_estimator_relaxed_scale_floor_defaults_and_no_profile_bound(toy_cost_json: str):
+    p = Params(toy_cost_json, "Orbit", "compile", Sw=40, scale_floor_policy="estimator-relaxed")
+    assert p.scale_floor_min_bits == 28
+    assert p.openevolve_scale_floor_candidates == [40, 36, 32, 28]
+    assert p.scale_lower_bound("0", {"op": "add"}, "out") == 40
+
+    p._active_scale_floor_bits = 32
+    assert p.active_scale_floor_bits() == 32
+    assert p.scale_lower_bound("0", {"op": "add"}, "out") == 32
+
+
+def test_estimator_relaxed_scale_floor_hard_tau_is_not_relaxed(
+    toy_cost_json: str, tmp_path: Path
+):
+    profile = {
+        "schema_version": "orbit-resilience-constraints-v0",
+        "constraints": [{"node": "0", "min_scale": 35, "ports": ["in", "out"]}],
+    }
+    profile_path = tmp_path / "constraints.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    p = Params(
+        toy_cost_json,
+        "Orbit",
+        "compile",
+        Sw=40,
+        resilience_profile=str(profile_path),
+        resilience_constraint_policy="hard-tau",
+        scale_floor_policy="estimator-relaxed",
+        scale_floor_min_bits=28,
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+    p._active_scale_floor_bits = 28
+
+    assert p.scale_lower_bound("0", {"op": "add"}, "out") == 35
+
+
+def test_estimator_relaxed_scale_floor_relax_only_can_drop_profile_bound(
+    toy_cost_json: str, tmp_path: Path
+):
+    profile = {
+        "schema_version": "orbit-resilience-constraints-v0",
+        "constraints": [{"node": "0", "min_scale": 35, "ports": ["in", "out"]}],
+    }
+    profile_path = tmp_path / "constraints.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    p = Params(
+        toy_cost_json,
+        "Orbit",
+        "compile",
+        Sw=40,
+        resilience_profile=str(profile_path),
+        resilience_constraint_policy="relax-only",
+        scale_floor_policy="estimator-relaxed",
+        scale_floor_min_bits=28,
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+    p._active_scale_floor_bits = 28
+
+    assert p.scale_lower_bound("0", {"op": "add"}, "out") == 28
 
 
 def test_relax_only_lowers_default_constant_scale(

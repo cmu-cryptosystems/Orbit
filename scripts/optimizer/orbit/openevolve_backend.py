@@ -1564,6 +1564,23 @@ def _compile_policy_bank_variants(
 ) -> list[tuple[str, dict[str, Any]]]:
     target = _context_target_bootstrap_count(context)
     scale_candidates = _scale_floor_candidates_from_context(context)
+    ckks = _ckks_dict(context)
+    waterline = int(ckks["Sw"])
+    component_total = _safe_int(
+        context.get("unit_bootstrap_budget", {}).get("component_budget_total"),
+        0,
+    )
+    layer_ids = {
+        str((unit.get("selector", {}) or {}).get("layer"))
+        for unit in context.get("placement_units", []) or []
+        if isinstance(unit, dict)
+        and (unit.get("selector", {}) or {}).get("layer") is not None
+    }
+    # The Gurobi baseline for the dynamic-mask FHE-BERT graph lands at 14
+    # bootstraps per transformer layer and keeps boundary scales at Sw=40.
+    # Use that as a soft, graph-derived prior: for non-BERT graphs the
+    # component budget still scales from detected nonlinear units.
+    gurobi_like_target = max(target, component_total * 2, 14 * len(layer_ids))
     variants: list[tuple[str, dict[str, Any]]] = []
 
     def add(
@@ -1673,8 +1690,97 @@ def _compile_policy_bank_variants(
             },
         },
     )
+    add(
+        "gurobi_boundary40_cost",
+        {
+            "boundary_scale_policy": "waterline",
+            "preferred_boundary_scale": waterline,
+            "boundary_scale": waterline,
+            "max_scale": waterline,
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 8,
+            "max_scale_candidates": 64,
+            "state_cap_per_node": 32,
+            "beam_width": 8,
+            "mcts_action_cap": 12,
+            "mcts_rollout_budget": 24,
+            "target_bootstrap_count": gurobi_like_target,
+            "selection_objective": "cost",
+            "bootstrap_penalty": 65_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "budget_fulfillment_beam": {
+                "prior": 0.74,
+                "policy": {
+                    "boundary_scale_policy": "waterline",
+                    "preferred_boundary_scale": waterline,
+                    "boundary_scale": waterline,
+                    "max_scale": waterline,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "target_bootstrap_count": gurobi_like_target,
+                    "selection_objective": "cost",
+                    "bootstrap_penalty": 65_000_000.0,
+                },
+            },
+            "wide_boundary_cost_beam": {
+                "prior": 0.62,
+                "policy": {
+                    "boundary_scale_policy": "waterline",
+                    "preferred_boundary_scale": waterline,
+                    "boundary_scale": waterline,
+                    "max_scale": waterline,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "target_bootstrap_count": gurobi_like_target,
+                    "selection_objective": "cost",
+                    "bootstrap_penalty": 65_000_000.0,
+                },
+            },
+        },
+    )
+    add(
+        "gurobi_component_budget_boundary40",
+        {
+            "boundary_scale_policy": "waterline",
+            "preferred_boundary_scale": waterline,
+            "boundary_scale": waterline,
+            "max_scale": waterline,
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 8,
+            "max_scale_candidates": 64,
+            "state_cap_per_node": 32,
+            "beam_width": 8,
+            "mcts_action_cap": 12,
+            "mcts_rollout_budget": 24,
+            "target_bootstrap_count": gurobi_like_target,
+            "selection_objective": "component_budget_fit",
+            "prefer_component_budget_fit": True,
+            "bootstrap_anchor_count": max(2, min(16, gurobi_like_target or 4)),
+            "force_bootstrap_anchors": False,
+            "bootstrap_penalty": 45_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "component_budget_repair": {
+                "prior": 0.80,
+                "policy": {
+                    "boundary_scale_policy": "waterline",
+                    "preferred_boundary_scale": waterline,
+                    "boundary_scale": waterline,
+                    "max_scale": waterline,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "target_bootstrap_count": gurobi_like_target,
+                    "bootstrap_anchor_count": max(2, min(16, gurobi_like_target or 4)),
+                    "selection_objective": "component_budget_fit",
+                    "force_bootstrap_anchors": False,
+                },
+            },
+        },
+    )
     for floor in scale_candidates:
-        waterline = int(_ckks_dict(context)["Sw"])
         if int(floor) >= waterline:
             continue
         add(
@@ -1705,7 +1811,62 @@ def _compile_policy_bank_variants(
                 },
             },
         )
-    return variants[:7]
+        if int(floor) == max([int(item) for item in scale_candidates if int(item) < waterline] or [floor]):
+            # Also test the Gurobi-like low output boundary with the least
+            # aggressive relaxed floor that can reduce rescales. On the
+            # dynamic-mask FHE-BERT baseline this is the 36-bit floor.
+            add(
+                f"relaxed_floor_{int(floor)}_boundary40",
+                {
+                    "scale_floor_bits": int(floor),
+                    "boundary_scale_policy": "waterline",
+                    "preferred_boundary_scale": waterline,
+                    "boundary_scale": waterline,
+                    "max_scale": waterline,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 64,
+                    "state_cap_per_node": 32,
+                    "beam_width": 8,
+                    "mcts_action_cap": 12,
+                    "mcts_rollout_budget": 24,
+                    "target_bootstrap_count": gurobi_like_target,
+                    "selection_objective": "cost",
+                    "bootstrap_penalty": 65_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                },
+                {
+                    f"estimator_relaxed_floor_{int(floor)}": {
+                        "prior": 0.86,
+                        "policy": {
+                            "scale_floor_bits": int(floor),
+                            "boundary_scale_policy": "waterline",
+                            "preferred_boundary_scale": waterline,
+                            "boundary_scale": waterline,
+                            "max_scale": waterline,
+                            "boundary_state_cap": 8,
+                            "max_scale_candidates": 64,
+                            "target_bootstrap_count": gurobi_like_target,
+                            "selection_objective": "cost",
+                            "bootstrap_penalty": 65_000_000.0,
+                        },
+                    },
+                    "budget_fulfillment_beam": {
+                        "prior": 0.68,
+                        "policy": {
+                            "boundary_scale_policy": "waterline",
+                            "preferred_boundary_scale": waterline,
+                            "boundary_scale": waterline,
+                            "max_scale": waterline,
+                            "boundary_state_cap": 8,
+                            "max_scale_candidates": 64,
+                            "target_bootstrap_count": gurobi_like_target,
+                            "selection_objective": "cost",
+                            "bootstrap_penalty": 65_000_000.0,
+                        },
+                    },
+                },
+            )
+    return variants[:10]
 
 
 def _policy_bank_record(
@@ -3809,6 +3970,7 @@ _POLICY_EFFECT_KEYS = (
     "allow_seed_fallback",
     "refresh_fanout_at_level_floor",
     "max_scale_candidates",
+    "max_scale",
     "bootstrap_penalty",
     "selection_bootstrap_penalty",
     "rescale_penalty",
@@ -12225,6 +12387,7 @@ _PATCHABLE_POLICY_KEYS = {
     "allow_seed_fallback",
     "refresh_fanout_at_level_floor",
     "max_scale_candidates",
+    "max_scale",
     "bootstrap_penalty",
     "rescale_penalty",
     "level_drop_penalty",

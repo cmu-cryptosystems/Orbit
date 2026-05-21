@@ -1930,12 +1930,7 @@ def _run_compile_policy_bank_prepass(
             pass
     records: list[dict[str, Any]] = []
     best_improved: tuple[float, dict[str, Any], dict[str, Any]] | None = None
-    workers_raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "").strip()
-    try:
-        workers = max(1, int(workers_raw)) if workers_raw else 1
-    except ValueError:
-        workers = 1
-    workers = min(workers, max(1, len(variants)))
+    workers = _policy_bank_worker_count(params, len(variants))
     print(
         "OpenEvolve compile harness: evaluating policy bank "
         f"variants={len(variants)} workers={workers}.",
@@ -2023,6 +2018,24 @@ def _run_compile_policy_bank_prepass(
         "initial_hints": best_improved[1] if best_improved is not None else None,
         "selected_record": best_improved[2] if best_improved is not None else None,
     }
+
+
+def _policy_bank_worker_count(params: Params, variant_count: int) -> int:
+    workers_raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "").strip()
+    try:
+        if workers_raw:
+            workers = max(1, int(workers_raw))
+        else:
+            workers = max(
+                1,
+                int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+            )
+    except ValueError:
+        workers = max(
+            1,
+            int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+        )
+    return min(workers, max(1, int(variant_count or 0)))
 
 
 def _graph_maintenance_anchor_hint(context: dict[str, Any]) -> int:

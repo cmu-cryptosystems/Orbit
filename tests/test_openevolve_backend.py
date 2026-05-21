@@ -2627,6 +2627,26 @@ def test_policy_bank_includes_relaxed_scale_floor_variants(toy_cost_json: str):
     assert len(variants) > 12
 
 
+def test_policy_bank_worker_count_uses_parallel_evaluations(
+    toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_parallel_evaluations=8,
+    )
+
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", raising=False)
+    assert oe_backend._policy_bank_worker_count(params, 22) == 8
+    assert oe_backend._policy_bank_worker_count(params, 3) == 3
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "4")
+    assert oe_backend._policy_bank_worker_count(params, 22) == 4
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "bad")
+    assert oe_backend._policy_bank_worker_count(params, 22) == 8
+
+
 def test_policy_bank_prepass_enabled_by_default(
     toy_cost_json: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

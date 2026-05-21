@@ -2484,8 +2484,8 @@ def _policy_bank_record(
         ),
         "effective_qbp_digest": str(artifacts.get("effective_qbp_digest", ""))[:24],
         "selected_path_digest": str(
-            artifacts.get("sampled_selected_path_digest")
-            or artifacts.get("selected_path_digest")
+            artifacts.get("selected_path_digest")
+            or artifacts.get("sampled_selected_path_digest")
             or ""
         )[:24],
         "path_digest": str(artifacts.get("sampled_selected_path_digest", ""))[:24],
@@ -2956,6 +2956,8 @@ def evaluate_compile_candidate_program(
                 "scale_floor_summary": json.dumps(scale_floor_summary, sort_keys=True),
                 "scale_floor_bits": str(scale_floor_bits),
                 "scale_floor_delta_bits": str(scale_floor_delta_bits),
+                "effective_qbp_digest": str(effective_path.get("effective_qbp_digest", "")),
+                "selected_path_digest": str(effective_path.get("selected_path_digest", "")),
                 "sampled_selected_path_bootstraps": str(
                     result.get("sampled_selected_path_bootstraps", "none")
                 ),

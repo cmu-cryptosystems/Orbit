@@ -2649,6 +2649,7 @@ def test_policy_bank_prepass_enabled_by_default(
             "artifacts": {
                 "correctness_gate": {"reasons": []},
                 "sampled_selected_path_digest": "policy-bank-path",
+                "selected_path_digest": "policy-bank-path",
                 "effective_qbp_digest": "policy-bank-qbp",
             },
         }

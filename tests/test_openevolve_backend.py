@@ -2656,6 +2656,18 @@ def test_policy_bank_worker_count_uses_parallel_evaluations(
     assert oe_backend._policy_bank_worker_count(params, 22) == 4
 
 
+def test_policy_bank_full_validation_timeout_follows_evaluator_timeout(
+    toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
+):
+    params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=900)
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_FULL_VALIDATION_TIMEOUT_SEC", raising=False)
+    assert oe_backend._policy_bank_full_validation_timeout_sec(params) == 900
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_FULL_VALIDATION_TIMEOUT_SEC", "1200")
+    assert oe_backend._policy_bank_full_validation_timeout_sec(params) == 1200
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_FULL_VALIDATION_TIMEOUT_SEC", "bad")
+    assert oe_backend._policy_bank_full_validation_timeout_sec(params) == 900
+
+
 def test_policy_bank_prepass_enabled_by_default(
     toy_cost_json: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -3715,10 +3727,14 @@ def test_policy_bank_replay_hints_extract_dominant_boundary_action():
 def test_parallel_qbp_worker_count_uses_threads_and_env(toy_cost_json: str, monkeypatch):
     params = _params(toy_cost_json)
     params.threads = 96
-    assert oe_backend._parallel_qbp_worker_count(params, 100) == 32
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", raising=False)
+    assert oe_backend._parallel_qbp_worker_count(params, 100) == 96
     assert oe_backend._parallel_qbp_worker_count(params, 7) == 7
     monkeypatch.setenv("ORBIT_OPENEVOLVE_QBP_WORKERS", "12")
     assert oe_backend._parallel_qbp_worker_count(params, 100) == 12
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_QBP_WORKERS", raising=False)
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", "32")
+    assert oe_backend._parallel_qbp_worker_count(params, 100) == 32
     monkeypatch.setenv("ORBIT_OPENEVOLVE_QBP_WORKERS", "bad")
     assert oe_backend._parallel_qbp_worker_count(params, 100) == 32
 

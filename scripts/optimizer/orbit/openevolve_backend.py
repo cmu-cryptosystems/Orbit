@@ -2025,7 +2025,7 @@ def _policy_bank_full_validation_timeout_sec(params: Params) -> int:
         except ValueError:
             pass
     evaluator_timeout = int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180)
-    return max(60, min(600, evaluator_timeout))
+    return max(60, min(1800, evaluator_timeout))
 
 
 def _mp_context():
@@ -2165,8 +2165,22 @@ def _run_policy_bank_full_validation_variant(
         ),
     )
     proc.start()
-    proc.join(timeout_sec)
-    if proc.is_alive():
+    deadline = time.time() + float(timeout_sec)
+    payload: dict[str, Any] | None = None
+    while time.time() < deadline:
+        try:
+            payload = result_queue.get(timeout=min(0.5, max(0.0, deadline - time.time())))
+            break
+        except queue_module.Empty:
+            if not proc.is_alive():
+                break
+    if payload is None:
+        proc.join(0)
+        try:
+            payload = result_queue.get_nowait()
+        except queue_module.Empty:
+            payload = None
+    if payload is None and proc.is_alive():
         if hasattr(os, "killpg"):
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -2191,11 +2205,10 @@ def _run_policy_bank_full_validation_variant(
             "sampled_reject_reason": sampled_reject_reason,
             "error": f"full validation timed out after {timeout_sec}s",
             "timed_out": True,
+            "timeout_sec": timeout_sec,
             "policy_summary": _compact_policy_summary(replay_hints),
         }
-    try:
-        payload = result_queue.get_nowait()
-    except queue_module.Empty:
+    if payload is None:
         return {
             "index": idx,
             "label": label,
@@ -2205,6 +2218,16 @@ def _run_policy_bank_full_validation_variant(
             "worker_exitcode": proc.exitcode,
             "policy_summary": _compact_policy_summary(replay_hints),
         }
+    proc.join(5)
+    if proc.is_alive():
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
+        else:
+            proc.terminate()
+        proc.join(5)
     record = payload.get("record") if isinstance(payload, dict) else None
     if isinstance(record, dict):
         return record
@@ -8984,6 +9007,7 @@ def _solve_budget_batch_boundary_mcts_parallel(
 
 def _parallel_qbp_worker_count(params: Params, group_count: int) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_QBP_WORKERS", "").strip()
+    cap_raw = os.environ.get("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", "").strip()
     try:
         if raw:
             requested = int(raw)
@@ -8991,7 +9015,12 @@ def _parallel_qbp_worker_count(params: Params, group_count: int) -> int:
             requested = int(getattr(params, "threads", 1) or 1)
     except ValueError:
         requested = int(getattr(params, "threads", 1) or 1)
-    return max(1, min(int(group_count or 0), requested, 32))
+    try:
+        worker_cap = int(cap_raw) if cap_raw else 96
+    except ValueError:
+        worker_cap = 96
+    worker_cap = max(1, min(worker_cap, 128))
+    return max(1, min(int(group_count or 0), requested, worker_cap))
 
 
 def _run_boundary_group_replay_payload(

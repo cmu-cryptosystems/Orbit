@@ -4802,6 +4802,19 @@ def _experience_probe_limit() -> int:
         return 4
 
 
+def _experience_probe_every() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_EVERY", "").strip()
+    try:
+        return max(1, min(10_000, int(raw))) if raw else 16
+    except ValueError:
+        return 16
+
+
+def _experience_probe_threshold() -> float:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_THRESHOLD", "").strip()
+    return max(0.0, min(1.0, _finite_float(raw, 0.82))) if raw else 0.82
+
+
 def _boundary_group_key_from_dict(item: dict[str, Any]) -> str:
     return _boundary_group_key_string(
         (
@@ -4876,6 +4889,123 @@ def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any
     return selected, float(reference_cost if reference_cost > 0 else float("inf"))
 
 
+def _experience_surrogate_summary(
+    context: dict[str, Any],
+    eval_hints: dict[str, Any],
+    policy_effect: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _policy_effect_payload(eval_hints)
+    policy = payload.get("policy", {}) if isinstance(payload.get("policy"), dict) else {}
+    actions = [
+        item
+        for item in payload.get("mcts_actions", []) or []
+        if isinstance(item, dict)
+    ]
+    action_names = [str(item.get("name", "")) for item in actions if str(item.get("name", ""))]
+    preferred_actions = {
+        "wide_boundary_cost_beam",
+        "budget_fulfillment_beam",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "component_budget_repair",
+        "latency_mcts_repair",
+        "profile_waterline_repair",
+    }
+    action_overlap = len(preferred_actions & set(action_names)) / max(1, len(preferred_actions))
+    targeted_count = int(payload.get("unit_policy_count", 0) or 0) + int(
+        payload.get("boundary_group_policy_count", 0) or 0
+    )
+    lattice_keys = {
+        "boundary_state_cap",
+        "max_scale_candidates",
+        "scale_floor_bits",
+        "scale_lattice",
+        "boundary_scale_policy",
+        "bootstrap_anchor_selector",
+        "bootstrap_penalty",
+        "selection_bootstrap_penalty",
+        "rescale_penalty",
+        "level_drop_penalty",
+    }
+    lattice_changed = len(lattice_keys & set(policy))
+    action_cost_objective = any(
+        str(item.get("policy", {}).get("selection_objective", "")).lower() == "cost"
+        for item in actions
+        if isinstance(item.get("policy"), dict)
+    )
+    cost_objective = (
+        str(policy.get("selection_objective", "")).lower() == "cost"
+        or action_cost_objective
+    )
+    examples = context.get("harness", {}).get("candidate_examples", [])
+    trace_example_bonus = 0.0
+    if isinstance(examples, list) and examples:
+        trace_example_bonus = 0.05
+    effect_score = float(policy_effect.get("effect_score", 0.0) or 0.0)
+    score = min(
+        1.0,
+        0.20 * effect_score
+        + 0.22 * min(1.0, action_overlap)
+        + 0.18 * min(1.0, targeted_count / 2.0)
+        + 0.20 * min(1.0, lattice_changed / 3.0)
+        + (0.15 if cost_objective else 0.0)
+        + trace_example_bonus,
+    )
+    digest = _hint_digest(payload)
+    seed_equivalent = bool(policy_effect.get("seed_equivalent", False))
+    every = _experience_probe_every()
+    hash_promote = int(digest[:8], 16) % every == 0
+    threshold = _experience_probe_threshold()
+    promote = (not seed_equivalent) and (score >= threshold or hash_promote)
+    return {
+        "score": float(score),
+        "digest": digest[:24],
+        "seed_equivalent": seed_equivalent,
+        "promote_to_probe": bool(promote),
+        "promotion_reason": (
+            "surrogate_score_threshold"
+            if score >= threshold
+            else ("hash_exploration" if hash_promote else "feature_only")
+        ),
+        "promotion_threshold": float(threshold),
+        "probe_every": int(every),
+        "action_names": action_names[:12],
+        "action_overlap": float(action_overlap),
+        "targeted_policy_count": int(targeted_count),
+        "lattice_changed_count": int(lattice_changed),
+        "cost_objective": bool(cost_objective),
+    }
+
+
+def _experience_surrogate_only_result(
+    raw_hints: dict[str, Any],
+    policy_effect: dict[str, Any],
+    surrogate: dict[str, Any],
+) -> dict[str, Any]:
+    reason = "experience_surrogate_feature_only"
+    result = _invalid_compile_result(reason, [reason])
+    score = max(1e-6, min(0.49, 0.05 + 0.40 * float(surrogate.get("score", 0.0))))
+    metrics = result.setdefault("metrics", {})
+    metrics.update(
+        {
+            "combined_score": float(score),
+            "experience_surrogate_score": float(surrogate.get("score", 0.0)),
+            "experience_probe_promoted": 0.0,
+            "experience_probe_task_count": 0.0,
+            "policy_effect_score": float(policy_effect.get("effect_score", 0.0)),
+            "seed_equivalent_policy": float(bool(policy_effect.get("seed_equivalent", False))),
+        }
+    )
+    result.setdefault("artifacts", {})["experience_surrogate"] = json.dumps(
+        {
+            **surrogate,
+            "policy_summary": json.loads(_compact_policy_summary(raw_hints)),
+        },
+        sort_keys=True,
+    )
+    return result
+
+
 def _experience_probe_skip_result(
     context: dict[str, Any],
     raw_hints: dict[str, Any],
@@ -4890,6 +5020,9 @@ def _experience_probe_skip_result(
         return None
     if eval_suite == "polybert-full" or not context.get("sampled_budget_tasks"):
         return None
+    surrogate = _experience_surrogate_summary(context, eval_hints, policy_effect)
+    if not bool(surrogate.get("promote_to_probe", False)):
+        return _experience_surrogate_only_result(raw_hints, policy_effect, surrogate)
     selected_tasks, reference_cost = _experience_probe_tasks(context)
     if not selected_tasks or not math.isfinite(reference_cost):
         return None
@@ -4957,6 +5090,7 @@ def _experience_probe_skip_result(
             "boundary_validity": boundary_validity,
             "task_count": len(selected_tasks),
             "policy_summary": json.loads(_compact_policy_summary(raw_hints)),
+            "surrogate": surrogate,
             "diagnostics": {
                 "sampled_task_cache_hits": int(
                     probe_result.get("sampled_task_cache_hits", 0) or 0

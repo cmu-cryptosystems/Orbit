@@ -5448,6 +5448,7 @@ def test_seed_equivalent_candidate_skips_expensive_sampled_replay(
 def test_experience_probe_uses_top_groups_before_full_sampled_replay(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_EVERY", "1")
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)
     context["sampled_budget_tasks"] = [
@@ -5506,6 +5507,50 @@ def test_experience_probe_uses_top_groups_before_full_sampled_replay(
     assert result is not None
     assert result["artifacts"]["failure_stage"] == "experience_probe_no_latency_improvement"
     assert result["metrics"]["experience_probe_cost_usec"] == 120.0
+
+
+def test_experience_surrogate_skips_unpromising_candidate_without_qbp(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_EVERY", "9999")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_THRESHOLD", "1.0")
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+
+    def fail_sampled(*_args, **_kwargs):
+        raise AssertionError("unpromising feature-only candidate should not run QBP")
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fail_sampled)
+
+    result = oe_backend._experience_probe_skip_result(
+        context,
+        {"strategy": "bootstrap_mcts", "boundary_state_cap": 4},
+        {"strategy": "bootstrap_mcts", "boundary_state_cap": 4},
+        "polybert-sampled",
+        {"seed_equivalent": False, "effect_score": 0.2},
+        suppress_output=True,
+    )
+
+    assert result is not None
+    assert result["artifacts"]["failure_stage"] == "experience_surrogate_feature_only"
+    assert 0.0 < result["metrics"]["combined_score"] < 0.5
+    assert result["metrics"]["experience_probe_promoted"] == 0.0
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

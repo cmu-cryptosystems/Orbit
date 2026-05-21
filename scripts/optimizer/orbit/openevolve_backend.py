@@ -5287,6 +5287,8 @@ def _result_effective_summary(
         reference = harness["sampled_seed_baseline"]
     reference_qbp = str(reference.get("effective_qbp_digest", "") or "")
     reference_path = str(reference.get("selected_path_digest", "") or "")
+    qbp_cmp = qbp_digest[: len(reference_qbp)] if reference_qbp else qbp_digest
+    path_cmp = path_digest[: len(reference_path)] if reference_path else path_digest
     changed_groups = 0
     if isinstance(diagnostics, dict):
         for item in diagnostics.get("boundary_group_summaries", []) or []:
@@ -5299,10 +5301,10 @@ def _result_effective_summary(
         "selected_path_digest": path_digest[:24],
         "reference_qbp_digest": reference_qbp[:24],
         "reference_selected_path_digest": reference_path[:24],
-        "effective_qbp_changed_vs_seed": bool(reference_qbp and qbp_digest != reference_qbp),
-        "selected_path_changed_vs_seed": bool(reference_path and path_digest != reference_path),
+        "effective_qbp_changed_vs_seed": bool(reference_qbp and qbp_cmp != reference_qbp),
+        "selected_path_changed_vs_seed": bool(reference_path and path_cmp != reference_path),
         "seed_equivalent_path": bool(
-            reference_path and path_digest == reference_path
+            reference_path and path_cmp == reference_path
         ),
         "changed_boundary_groups_vs_seed": int(changed_groups),
         "selected_path_payload": _selected_path_payload(result, diagnostics),

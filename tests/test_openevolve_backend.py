@@ -2693,7 +2693,7 @@ def test_policy_bank_active_seed_becomes_latency_reference():
             },
             "active_seed_baseline": {
                 "objective_cost_usec": 90.0,
-                "selected_path_digest": active_digest,
+                "selected_path_digest": active_digest[:24],
             },
         },
     }

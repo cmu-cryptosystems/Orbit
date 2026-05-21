@@ -543,7 +543,7 @@ def place(context):
         ]
         if name in available
     ]
-    if not isinstance(context.get("harness", {}).get("initial_policy_hints"), dict):
+    if not bool(context.get("harness", {}).get("enable_trace_patch_initial", False)):
         compact_names = [
             name
             for name in [

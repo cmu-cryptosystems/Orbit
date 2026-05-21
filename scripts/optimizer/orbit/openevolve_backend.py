@@ -3034,6 +3034,68 @@ def _compile_policy_bank_variants(
                 },
                 replace_presets=True,
             )
+        forced_reference_count = max(4, min(32, len(reference_patterns)))
+        forced_reference_policy = {
+            **reference_action_base,
+            "bootstrap_anchor_count": forced_reference_count,
+            "force_bootstrap_anchors": True,
+            "boundary_scale_policy": "frontier",
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 12,
+            "max_scale_candidates": 80,
+            "bootstrap_penalty": 50_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        }
+        add(
+            "reference_location_forced_sparse_cost",
+            {
+                **forced_reference_policy,
+                "strategy": "bootstrap_mcts",
+                "budget_aggressive": True,
+                "mcts_action_cap": 10,
+                "mcts_rollout_budget": 20,
+                "mcts_exploration_weight": 1.1,
+                "mcts_max_repair_bootstraps": 128,
+                "mcts_prior_order": True,
+                "mcts_actions": [
+                    {
+                        "name": "reference_forced_boundary_cost_beam",
+                        "prior": 0.95,
+                        "policy": forced_reference_policy,
+                    },
+                    {
+                        "name": "budget_fulfillment_beam",
+                        "prior": 0.55,
+                        "policy": {
+                            **forced_reference_policy,
+                            "force_bootstrap_anchors": False,
+                            "bootstrap_anchor_count": 0,
+                            "bootstrap_anchor_selector": "",
+                        },
+                    },
+                ],
+                "mcts_action_allowlist": [
+                    "reference_forced_boundary_cost_beam",
+                    "budget_fulfillment_beam",
+                ],
+            },
+            {
+                "reference_forced_boundary_cost_beam": {
+                    "prior": 0.95,
+                    "policy": forced_reference_policy,
+                },
+                "budget_fulfillment_beam": {
+                    "prior": 0.55,
+                    "policy": {
+                        **forced_reference_policy,
+                        "force_bootstrap_anchors": False,
+                        "bootstrap_anchor_count": 0,
+                        "bootstrap_anchor_selector": "",
+                    },
+                },
+            },
+            replace_presets=True,
+        )
     for floor in scale_candidates:
         if int(floor) >= waterline:
             continue

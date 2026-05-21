@@ -2618,6 +2618,28 @@ def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_j
     )
 
 
+def test_policy_bank_includes_sparse_reference_anchor_variant(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context.setdefault("harness", {})["reference_json"] = {
+        "bootstrap_locations": {
+            "layer=layer.0;op=inv_sqrt_seed": 2,
+            "layer=layer.0;op=attention_value_combined_output": 1,
+        }
+    }
+    initial = oe_backend._bootstrap_mcts_initial_policy_for_context(context)
+
+    variants = dict(oe_backend._compile_policy_bank_variants(initial, context, params))
+    forced = variants["reference_location_forced_sparse_cost"]
+
+    assert forced["selection_objective"] == "cost"
+    assert forced["target_bootstrap_count"] == 0
+    assert forced["bootstrap_anchor_selector"] == "reference_bootstrap_locations"
+    assert forced["force_bootstrap_anchors"] is True
+    assert forced["bootstrap_anchor_count"] >= 4
+    assert "reference_forced_boundary_cost_beam" in forced["mcts_action_allowlist"]
+
+
 def test_policy_bank_includes_relaxed_scale_floor_variants(toy_cost_json: str):
     params = _params(
         toy_cost_json,

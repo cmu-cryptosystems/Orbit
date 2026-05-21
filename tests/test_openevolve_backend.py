@@ -770,16 +770,16 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
 
     assert hints["strategy"] == "bootstrap_mcts"
     assert hints["include_seed_repair_actions"] is True
-    assert hints["mcts_rollout_budget"] == 24
-    assert hints["mcts_action_cap"] == 6
+    assert hints["mcts_rollout_budget"] == 16
+    assert hints["mcts_action_cap"] == 10
     assert hints["mcts_action_allowlist"] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
-        "minimal_bootstrap_repair",
+        "latency_mcts_repair",
     ]
     assert hints["mcts_exploration_weight"] == 1.25
-    assert hints["mcts_max_repair_bootstraps"] == 16
+    assert hints["mcts_max_repair_bootstraps"] == 128
     assert hints["boundary_group_policies"] == []
     raw_budget_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
@@ -791,24 +791,23 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     ]
     assert wide_beams
     presets = hints["mcts_action_presets"]
-    assert presets["budget_fulfillment_beam"]["prior"] == 0.65
-    assert presets["budget_fulfillment_beam"]["policy"]["beam_width"] == 12
+    assert presets["budget_fulfillment_beam"]["prior"] == 0.60
+    assert presets["budget_fulfillment_beam"]["policy"]["beam_width"] == 10
     assert presets["budget_fulfillment_beam"]["policy"]["boundary_state_cap"] == 8
-    assert presets["wide_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 10
-    assert presets["wide_boundary_cost_beam"]["policy"]["max_scale_candidates"] == 64
-    assert presets["dense_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 20
-    assert presets["minimal_bootstrap_repair"]["policy"]["selection_objective"] == "min_bootstrap"
+    assert presets["wide_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 8
+    assert presets["wide_boundary_cost_beam"]["policy"]["max_scale_candidates"] == 48
+    assert presets["dense_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 16
+    assert presets["dense_boundary_cost_beam"]["policy"]["direct_budget_policy"] is True
     capped_names = [
         action["name"]
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
     ]
     assert "budget_fulfillment_beam" in capped_names
-    assert sampled["mcts_action_cap"] <= 6
+    assert sampled["mcts_action_cap"] <= 10
     assert set(hints["mcts_action_presets"]) == {
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
-        "minimal_bootstrap_repair",
     }
 
 
@@ -2926,7 +2925,7 @@ def test_placement_mcts_boundary_group_policy_defaults_to_direct_latency_beam():
     assert policy["max_scale_candidates"] == 80
 
 
-def test_initial_compile_seed_uses_trace_boundary_group_policies(
+def test_initial_compile_seed_mentions_trace_without_forcing_boundary_group_policies(
     toy_cost_json: str, tmp_path: Path
 ):
     params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
@@ -2958,18 +2957,14 @@ def test_initial_compile_seed_uses_trace_boundary_group_policies(
         }
     ]
     program_path = tmp_path / "initial_trace.py"
-    program_path.write_text(
-        oe_backend._initial_compile_program_source("bootstrap-mcts"),
-        encoding="utf-8",
-    )
+    source = oe_backend._initial_compile_program_source("bootstrap-mcts")
+    program_path.write_text(source, encoding="utf-8")
 
     hints = oe_backend._load_candidate_hints(program_path, context)
 
-    assert hints["boundary_group_policies"]
-    first = hints["boundary_group_policies"][0]
-    assert first["selector"]["in_lvl"] == params.lvl_ub
-    assert first["policy"]["selection_objective"] == "cost"
-    assert first["policy"]["boundary_state_cap"] >= 8
+    assert "top_costly_boundary_groups" in source
+    assert hints["boundary_group_policies"] == []
+    assert "budget_fulfillment_beam" in hints["mcts_action_allowlist"]
 
 
 def test_policy_bank_record_carries_boundary_trace_examples():
@@ -3934,12 +3929,30 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
 
     slower_score = oe_backend._latency_only_combined_score(slower, correct=True)
     equal_score = oe_backend._latency_only_combined_score(equal, correct=True)
+    seed_equivalent_score = oe_backend._latency_only_combined_score(
+        equal,
+        correct=True,
+        correctness_gate={
+            "seed_equivalent_path": True,
+            "objective_improved_vs_seed": False,
+        },
+    )
     improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
+    seed_equivalent_improved_score = oe_backend._latency_only_combined_score(
+        improved,
+        correct=True,
+        correctness_gate={
+            "seed_equivalent_path": True,
+            "objective_improved_vs_seed": True,
+        },
+    )
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
     assert slower_score == pytest.approx(1000.0 / 1001.0)
     assert equal_score == 1.0
+    assert seed_equivalent_score == 0.0
     assert improved_score > 1.0
+    assert seed_equivalent_improved_score == improved_score
     assert 0.0 < slower_score < equal_score
     assert equal_score > slower_score
     assert improved_score > slower_score

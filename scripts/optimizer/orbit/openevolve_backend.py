@@ -891,10 +891,22 @@ def place(context):
     # Promote the best deterministic policy-bank seed into the default program.
     # This avoids spending every short OpenEvolve smoke rediscovering the same
     # compact low-latency prior before mutations can explore around it.
-    policy["mcts_action_cap"] = 6
-    policy["mcts_rollout_budget"] = 24
+    policy.update(
+        {
+            "allow_seed_fallback": True,
+            "max_scale_candidates": 24,
+            "bootstrap_penalty": 25_000_000.0,
+            "reserve_penalty": 75_000.0,
+            "min_transition_reserve": 1,
+            "min_decryptability_reserve": 1,
+            "boundary_scale_policy": "waterline",
+        }
+    )
+    policy["boundary_group_policies"] = []
+    policy["mcts_action_cap"] = 10
+    policy["mcts_rollout_budget"] = 16
     policy["mcts_exploration_weight"] = 1.25
-    policy["mcts_max_repair_bootstraps"] = 16
+    policy["mcts_max_repair_bootstraps"] = 128
     policy["mcts_prior_order"] = True
     policy["include_seed_repair_actions"] = True
     policy["selection_objective"] = "cost"
@@ -903,74 +915,82 @@ def place(context):
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
         *reference_action_names,
-        "minimal_bootstrap_repair",
+        "latency_mcts_repair",
     ]
     policy["mcts_action_presets"] = mcts.action_presets(
         budget_fulfillment_beam={
-            "prior": 0.65,
+            "prior": 0.60,
             "policy": {
-                "beam_width": 12,
-                "state_cap_per_node": 48,
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 32,
                 "boundary_state_cap": 8,
                 "max_scale_candidates": 48,
-                "bootstrap_penalty": 150_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "boundary_scale_policy": "waterline",
+                "target_bootstrap_count": 0,
             },
         },
         wide_boundary_cost_beam={
-            "prior": 0.45,
+            "prior": 0.40,
             "policy": {
-                "beam_width": 12,
-                "state_cap_per_node": 48,
-                "boundary_state_cap": 10,
-                "max_scale_candidates": 64,
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 32,
+                "boundary_state_cap": 8,
+                "max_scale_candidates": 48,
                 "boundary_scale_policy": "frontier",
-                "bootstrap_penalty": 30_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "target_bootstrap_count": 0,
             },
         },
         dense_boundary_cost_beam={
             "prior": 0.50,
             "policy": {
                 "strategy": "latency_beam",
-                "beam_width": 16,
+                "beam_width": 10,
                 "state_cap_per_node": 48,
-                "boundary_state_cap": 20,
+                "boundary_state_cap": 16,
                 "max_scale_candidates": 96,
                 "scale_lattice": "dense",
                 "boundary_scale_policy": "frontier",
-                "bootstrap_penalty": 15_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "target_bootstrap_count": 0,
             },
         },
         **{
             name: {
-                "prior": 0.55,
+                "prior": 0.50,
                 "policy": {
                     "strategy": "latency_beam",
-                    "beam_width": 14,
+                    "beam_width": 10,
                     "state_cap_per_node": 48,
-                    "boundary_state_cap": 14,
-                    "max_scale_candidates": 88,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
                     "boundary_scale_policy": "frontier",
                     "scale_lattice": "waterline_sf",
                     "bootstrap_anchor_selector": "reference_bootstrap_locations",
                     "force_bootstrap_anchors": False,
-                    "bootstrap_penalty": 25_000_000.0,
+                    "bootstrap_penalty": 30_000_000.0,
                     "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                    "target_bootstrap_count": 0,
                 },
             }
             for name in reference_action_names
-        },
-        minimal_bootstrap_repair={
-            "prior": 0.10,
-            "policy": {
-                "bootstrap_anchor_count": 0,
-                "boundary_state_cap": 2,
-                "bootstrap_penalty": 5_000_000_000.0,
-                "selection_objective": "min_bootstrap",
-            },
         },
     )
     return policy
@@ -3688,6 +3708,7 @@ def evaluate_compile_candidate_program(
         latency_only_score = _latency_only_combined_score(
             objective,
             correct=bool(correctness_gate["correct"]),
+            correctness_gate=correctness_gate,
         )
         quality_score = (
             0.35 * latency_score
@@ -5207,9 +5228,11 @@ def _latency_only_combined_score(
     objective: dict[str, Any],
     *,
     correct: bool,
+    correctness_gate: dict[str, Any] | None = None,
 ) -> float:
     if not correct:
         return 0.0
+    correctness_gate = correctness_gate if isinstance(correctness_gate, dict) else {}
     cost = _finite_float(objective.get("objective_cost_usec"), float("inf"))
     reference = _finite_float(objective.get("reference_objective_cost_usec"), float("inf"))
     if not math.isfinite(reference) or reference <= 0:
@@ -5217,6 +5240,14 @@ def _latency_only_combined_score(
     if not math.isfinite(cost) or cost <= 0:
         return 0.0
     ratio = reference / cost
+    improved = bool(correctness_gate.get("objective_improved_vs_seed", False))
+    seed_equivalent_path = bool(correctness_gate.get("seed_equivalent_path", False))
+    if seed_equivalent_path and not improved:
+        # A syntactically changed policy that replays the seed path gives
+        # OpenEvolve no useful placement signal. The seed itself is still
+        # available through fail-open/recovery, but these clones should not win
+        # sampled search or consume finalist slots.
+        return 0.0
     if ratio < 1.0:
         # Keep the score purely latency-based after correctness: slower valid
         # candidates rank below the seed, but remain distinguishable from
@@ -5983,10 +6014,22 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
             },
         },
     )
-    policy["mcts_action_cap"] = 6
-    policy["mcts_rollout_budget"] = 24
+    policy.update(
+        {
+            "allow_seed_fallback": True,
+            "max_scale_candidates": 24,
+            "bootstrap_penalty": 25_000_000.0,
+            "reserve_penalty": 75_000.0,
+            "min_transition_reserve": 1,
+            "min_decryptability_reserve": 1,
+            "boundary_scale_policy": "waterline",
+        }
+    )
+    policy["boundary_group_policies"] = []
+    policy["mcts_action_cap"] = 10
+    policy["mcts_rollout_budget"] = 16
     policy["mcts_exploration_weight"] = 1.25
-    policy["mcts_max_repair_bootstraps"] = 16
+    policy["mcts_max_repair_bootstraps"] = 128
     policy["mcts_prior_order"] = True
     policy["include_seed_repair_actions"] = True
     policy["selection_objective"] = "cost"
@@ -5995,74 +6038,82 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
         *reference_action_names,
-        "minimal_bootstrap_repair",
+        "latency_mcts_repair",
     ]
     policy["mcts_action_presets"] = mcts.action_presets(
         budget_fulfillment_beam={
-            "prior": 0.65,
+            "prior": 0.60,
             "policy": {
-                "beam_width": 12,
-                "state_cap_per_node": 48,
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 32,
                 "boundary_state_cap": 8,
                 "max_scale_candidates": 48,
-                "bootstrap_penalty": 150_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "boundary_scale_policy": "waterline",
+                "target_bootstrap_count": 0,
             },
         },
         wide_boundary_cost_beam={
-            "prior": 0.45,
+            "prior": 0.40,
             "policy": {
-                "beam_width": 12,
-                "state_cap_per_node": 48,
-                "boundary_state_cap": 10,
-                "max_scale_candidates": 64,
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 32,
+                "boundary_state_cap": 8,
+                "max_scale_candidates": 48,
                 "boundary_scale_policy": "frontier",
-                "bootstrap_penalty": 30_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "target_bootstrap_count": 0,
             },
         },
         dense_boundary_cost_beam={
             "prior": 0.50,
             "policy": {
                 "strategy": "latency_beam",
-                "beam_width": 16,
+                "beam_width": 10,
                 "state_cap_per_node": 48,
-                "boundary_state_cap": 20,
+                "boundary_state_cap": 16,
                 "max_scale_candidates": 96,
                 "scale_lattice": "dense",
                 "boundary_scale_policy": "frontier",
-                "bootstrap_penalty": 15_000_000.0,
+                "bootstrap_penalty": 25_000_000.0,
+                "rescale_penalty": 0.0,
+                "level_drop_penalty": 20_000_000.0,
                 "selection_objective": "cost",
+                "direct_budget_policy": True,
+                "target_bootstrap_count": 0,
             },
         },
         **{
             name: {
-                "prior": 0.55,
+                "prior": 0.50,
                 "policy": {
                     "strategy": "latency_beam",
-                    "beam_width": 14,
+                    "beam_width": 10,
                     "state_cap_per_node": 48,
-                    "boundary_state_cap": 14,
-                    "max_scale_candidates": 88,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
                     "boundary_scale_policy": "frontier",
                     "scale_lattice": "waterline_sf",
                     "bootstrap_anchor_selector": "reference_bootstrap_locations",
                     "force_bootstrap_anchors": False,
-                    "bootstrap_penalty": 25_000_000.0,
+                    "bootstrap_penalty": 30_000_000.0,
                     "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                    "target_bootstrap_count": 0,
                 },
             }
             for name in reference_action_names
-        },
-        minimal_bootstrap_repair={
-            "prior": 0.10,
-            "policy": {
-                "bootstrap_anchor_count": 0,
-                "boundary_state_cap": 2,
-                "bootstrap_penalty": 5_000_000_000.0,
-                "selection_objective": "min_bootstrap",
-            },
         },
     )
     return policy

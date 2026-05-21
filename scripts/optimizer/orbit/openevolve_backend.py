@@ -9922,6 +9922,27 @@ def _promotion_eval_timeout_sec(params: Params) -> int:
     return max(0, min(3_600, value))
 
 
+def _promotion_probe_limit() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", "").strip()
+    try:
+        value = int(raw) if raw else 1
+    except ValueError:
+        value = 1
+    return max(1, min(16, value))
+
+
+def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
+    old_value = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS")
+    os.environ["ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS"] = str(_promotion_probe_limit())
+    try:
+        return _experience_probe_tasks(context)
+    finally:
+        if old_value is None:
+            os.environ.pop("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS", None)
+        else:
+            os.environ["ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS"] = old_value
+
+
 def _promotion_result_direct_valid(result: dict[str, Any]) -> bool:
     if not bool(result.get("valid", False)):
         return False
@@ -10014,6 +10035,10 @@ def _promotion_record_summary(
         "sampled_task_cache_misses": int(result.get("sampled_task_cache_misses", 0) or 0)
         if result
         else 0,
+        "timed_out": bool(result.get("timed_out", False)) if result else False,
+        "timeout_sec": result.get("timeout_sec") if result else None,
+        "error": str(result.get("error", ""))[:500] if result else "",
+        "worker_exitcode": result.get("worker_exitcode") if result else None,
         "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
         "policy_summary": _compact_policy_summary(hints or {}),
     }
@@ -10167,7 +10192,7 @@ def _run_sampled_promotion_pass(
     started_at = time.monotonic()
     timeout_sec = _promotion_timeout_sec(params)
     eval_timeout_sec = _promotion_eval_timeout_sec(params)
-    selected_probe_tasks, probe_reference_cost = _experience_probe_tasks(context)
+    selected_probe_tasks, probe_reference_cost = _promotion_probe_tasks(context)
     if not selected_probe_tasks or not math.isfinite(probe_reference_cost):
         return None
 
@@ -10388,6 +10413,7 @@ def _run_sampled_promotion_pass(
     summary = {
         "candidate_count": len(codes),
         "evaluated_count": len(seen),
+        "probe_task_count": len(selected_probe_tasks),
         "probe_reference_latency_usec": probe_reference_cost,
         "sampled_reference_latency_usec": full_reference_cost,
         "selected": best is not None,

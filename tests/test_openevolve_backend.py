@@ -5614,9 +5614,13 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     def fake_static(_context, _hints):
         return {"valid": True, "reasons": []}
 
+    probe_task_counts = []
+
     def fake_eval(sampled_context, hints, *, timeout_sec):
         assert timeout_sec >= 0
         is_probe = bool(sampled_context.get("harness", {}).get("experience_probe"))
+        if is_probe:
+            probe_task_counts.append(len(sampled_context.get("sampled_budget_tasks", [])))
         marker = hints["marker"]
         latency = 80.0 if marker == "fast" else 120.0
         if is_probe and marker == "slow":
@@ -5660,6 +5664,8 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
     assert summary["selected"] is True
     assert summary["selected_latency_usec"] == 80.0
+    assert summary["probe_task_count"] == 1
+    assert probe_task_counts == [1, 1]
     progress = json.loads((tmp_path / "sampled_promotion" / "promotion_progress.json").read_text())
     assert progress["current_stage"] == "done"
     assert progress["selected"] is True
@@ -5795,6 +5801,78 @@ def test_sampled_promotion_timeout_writes_progress(
     assert summary["timed_out"] is True
     progress = json.loads((tmp_path / "sampled_promotion" / "promotion_progress.json").read_text())
     assert progress["timed_out"] is True
+
+
+def test_promotion_probe_task_limit_uses_one_top_group_by_default(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 300.0, "objective_cost_usec": 300.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": idx,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": scale, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": scale}]},
+        }
+        for idx, scale in enumerate((40, 41, 42))
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": f"in_lvl=-1;in_scl={scale};maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": scale, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0 - idx,
+        }
+        for idx, scale in enumerate((40, 41, 42))
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'fast'}\n"
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", raising=False)
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(oe_backend, "_hints_from_code", lambda *_args: {"marker": "fast"})
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    probe_task_counts = []
+
+    def fake_eval(sampled_context, _hints, *, timeout_sec):
+        is_probe = bool(sampled_context.get("harness", {}).get("experience_probe"))
+        if is_probe:
+            probe_task_counts.append(len(sampled_context.get("sampled_budget_tasks", [])))
+            latency = 90.0
+        else:
+            latency = 200.0
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": latency,
+            "objective_cost_usec": latency,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert probe_task_counts == [1]
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["probe_task_count"] == 1
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

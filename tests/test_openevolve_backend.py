@@ -768,61 +768,47 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
-    assert hints["include_seed_repair_actions"] is False
+    assert hints["include_seed_repair_actions"] is True
     assert hints["mcts_rollout_budget"] == 24
-    assert hints["mcts_action_cap"] == 8
+    assert hints["mcts_action_cap"] == 6
     assert hints["mcts_action_allowlist"] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
-        "waterline_cost_beam",
         "dense_boundary_cost_beam",
-        "nonlinear_phase_boundary_beam",
-        "profile_waterline_repair",
-        "tuneinsight_avgcase_cost_beam",
-        "tuneinsight_deferred_bootstrap_beam",
-        "latency_mcts_repair",
-        "component_budget_repair",
         "minimal_bootstrap_repair",
-        "waterline_budget_repair",
     ]
-    assert hints["mcts_exploration_weight"] == 1.15
+    assert hints["mcts_exploration_weight"] == 1.25
+    assert hints["mcts_max_repair_bootstraps"] == 16
+    assert hints["boundary_group_policies"] == []
     raw_budget_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
     ]
     assert raw_budget_beams
     assert raw_budget_beams[0]["prior"] == 0.54
-    assert raw_budget_beams[0]["policy"]["beam_width"] == 8
     wide_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "wide_boundary_cost_beam"
     ]
     assert wide_beams
-    assert wide_beams[0]["policy"]["boundary_state_cap"] == 8
-    assert wide_beams[0]["policy"]["max_scale_candidates"] == 64
-    tuneinsight_beams = [
-        action for action in hints["mcts_actions"] if action.get("name") == "tuneinsight_avgcase_cost_beam"
-    ]
-    assert tuneinsight_beams
-    assert tuneinsight_beams[0]["policy"]["noise_slack_model"] == "tuneinsight_avgcase"
-    deferred_beams = [
-        action
-        for action in hints["mcts_actions"]
-        if action.get("name") == "tuneinsight_deferred_bootstrap_beam"
-    ]
-    assert deferred_beams
-    assert deferred_beams[0]["policy"]["bootstrap_penalty"] == 650_000_000.0
-    assert deferred_beams[0]["policy"]["selection_objective"] == "cost"
-    assert raw_budget_beams[0]["policy"]["selection_objective"] == "cost"
+    presets = hints["mcts_action_presets"]
+    assert presets["budget_fulfillment_beam"]["prior"] == 0.65
+    assert presets["budget_fulfillment_beam"]["policy"]["beam_width"] == 12
+    assert presets["budget_fulfillment_beam"]["policy"]["boundary_state_cap"] == 8
+    assert presets["wide_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 10
+    assert presets["wide_boundary_cost_beam"]["policy"]["max_scale_candidates"] == 64
+    assert presets["dense_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 20
+    assert presets["minimal_bootstrap_repair"]["policy"]["selection_objective"] == "min_bootstrap"
     capped_names = [
         action["name"]
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
     ]
     assert "budget_fulfillment_beam" in capped_names
-    assert "tuneinsight_deferred_bootstrap_beam" in capped_names
-    assert "minimal_bootstrap_repair" not in capped_names
-    assert sampled["mcts_action_cap"] <= 8
-    assert any(action["name"] == "latency_mcts_repair" for action in sampled["mcts_actions"])
-    assert any(action["name"] == "component_budget_repair" for action in sampled["mcts_actions"])
-    assert "component_budget_repair" in hints["mcts_action_presets"]
+    assert sampled["mcts_action_cap"] <= 6
+    assert set(hints["mcts_action_presets"]) == {
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "dense_boundary_cost_beam",
+        "minimal_bootstrap_repair",
+    }
 
 
 def test_mcts_action_presets_change_effective_action_policy(toy_cost_json: str):

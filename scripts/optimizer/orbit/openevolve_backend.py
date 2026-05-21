@@ -895,6 +895,7 @@ def place(context):
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
+        *reference_action_names,
         "minimal_bootstrap_repair",
     ]
     policy["mcts_action_presets"] = mcts.action_presets(
@@ -934,6 +935,26 @@ def place(context):
                 "bootstrap_penalty": 15_000_000.0,
                 "selection_objective": "cost",
             },
+        },
+        **{
+            name: {
+                "prior": 0.55,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 14,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 14,
+                    "max_scale_candidates": 88,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 25_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            }
+            for name in reference_action_names
         },
         minimal_bootstrap_repair={
             "prior": 0.10,
@@ -5471,6 +5492,7 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
+        *reference_action_names,
         "minimal_bootstrap_repair",
     ]
     policy["mcts_action_presets"] = mcts.action_presets(
@@ -5510,6 +5532,26 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
                 "bootstrap_penalty": 15_000_000.0,
                 "selection_objective": "cost",
             },
+        },
+        **{
+            name: {
+                "prior": 0.55,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 14,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 14,
+                    "max_scale_candidates": 88,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 25_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            }
+            for name in reference_action_names
         },
         minimal_bootstrap_repair={
             "prior": 0.10,

@@ -785,7 +785,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
         action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
     ]
     assert raw_budget_beams
-    assert raw_budget_beams[0]["prior"] == 0.54
+    assert raw_budget_beams[0]["prior"] == 0.60
     wide_beams = [
         action for action in hints["mcts_actions"] if action.get("name") == "wide_boundary_cost_beam"
     ]

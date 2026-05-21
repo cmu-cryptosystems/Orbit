@@ -506,7 +506,10 @@ def place(context):
     from top_costly_boundary_groups and bounded policy overrides for
     boundary_state_cap, boundary_scale_policy, scale_lattice, max_scale_candidates,
     bootstrap_penalty, and MCTS action presets. Bootstrap counts are diagnostics
-    only; do not optimize toward a fixed count.
+    only; do not optimize toward a fixed count. Candidate examples include
+    candidate_mlir_preview values. Treat those as execution traces: compare
+    orbit.trace.bootstrap, orbit.trace.rescale, and selected-source operations
+    against objective_cost_usec, then mutate the active policy below.
     """
     mcts = PlacementMCTS(context)
     actions = mcts.candidate_actions(action_cap=12)
@@ -515,6 +518,129 @@ def place(context):
         for action in actions
         if str(action.get("name", "")) == "reference_boundary_cost_beam"
     ]
+    active_action_names = [
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "dense_boundary_cost_beam",
+        *reference_action_names,
+        "latency_mcts_repair",
+    ]
+    active_actions = [
+        action for action in actions if str(action.get("name", "")) in set(active_action_names)
+    ]
+    for action in active_actions:
+        name = str(action.get("name", ""))
+        if name == "budget_fulfillment_beam":
+            action["prior"] = 0.60
+        elif name == "wide_boundary_cost_beam":
+            action["prior"] = 0.40
+        elif name == "dense_boundary_cost_beam":
+            action["prior"] = 0.50
+        elif name == "latency_mcts_repair":
+            action["prior"] = 0.19
+        elif name in reference_action_names:
+            action["prior"] = 0.50
+    policy = {
+        "strategy": "bootstrap_mcts",
+        "budget_aggressive": True,
+        "allow_seed_fallback": True,
+        "max_scale_candidates": 24,
+        "bootstrap_penalty": 25_000_000.0,
+        "reserve_penalty": 75_000.0,
+        "min_transition_reserve": 1,
+        "min_decryptability_reserve": 1,
+        "boundary_scale_policy": "waterline",
+        "boundary_group_policies": [],
+        "mcts_actions": active_actions,
+        "mcts_action_allowlist": active_action_names,
+        "mcts_action_cap": 10,
+        "mcts_rollout_budget": 16,
+        "mcts_exploration_weight": 1.25,
+        "mcts_max_repair_bootstraps": 128,
+        "mcts_prior_order": True,
+        "include_seed_repair_actions": True,
+        "selection_objective": "cost",
+        "mcts_action_presets": mcts.action_presets(
+            budget_fulfillment_beam={
+                "prior": 0.60,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 32,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "bootstrap_penalty": 25_000_000.0,
+                    "rescale_penalty": 0.0,
+                    "level_drop_penalty": 20_000_000.0,
+                    "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                    "boundary_scale_policy": "waterline",
+                    "target_bootstrap_count": 0,
+                },
+            },
+            wide_boundary_cost_beam={
+                "prior": 0.40,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 32,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "boundary_scale_policy": "frontier",
+                    "bootstrap_penalty": 25_000_000.0,
+                    "rescale_penalty": 0.0,
+                    "level_drop_penalty": 20_000_000.0,
+                    "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                    "target_bootstrap_count": 0,
+                },
+            },
+            dense_boundary_cost_beam={
+                "prior": 0.50,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 16,
+                    "max_scale_candidates": 96,
+                    "scale_lattice": "dense",
+                    "boundary_scale_policy": "frontier",
+                    "bootstrap_penalty": 25_000_000.0,
+                    "rescale_penalty": 0.0,
+                    "level_drop_penalty": 20_000_000.0,
+                    "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                    "target_bootstrap_count": 0,
+                },
+            },
+            **{
+                name: {
+                    "prior": 0.50,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "beam_width": 10,
+                        "state_cap_per_node": 48,
+                        "boundary_state_cap": 12,
+                        "max_scale_candidates": 80,
+                        "boundary_scale_policy": "frontier",
+                        "scale_lattice": "waterline_sf",
+                        "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                        "force_bootstrap_anchors": False,
+                        "bootstrap_penalty": 30_000_000.0,
+                        "selection_bootstrap_penalty": 0.0,
+                        "selection_objective": "cost",
+                        "direct_budget_policy": True,
+                        "target_bootstrap_count": 0,
+                    },
+                }
+                for name in reference_action_names
+            },
+        ),
+    }
+    return policy
+
+    # Legacy reference surface kept below for OpenEvolve context only. The
+    # active policy above returns before this code runs.
     for action in actions:
         policy = action.get("policy", {})
         name = action.get("name", "")
@@ -894,14 +1020,30 @@ def place(context):
     policy.update(
         {
             "allow_seed_fallback": True,
+            "allow_bootstrap": False,
+            "refresh_fanout_at_level_floor": True,
             "max_scale_candidates": 24,
             "bootstrap_penalty": 25_000_000.0,
+            "rescale_penalty": 0.0,
+            "level_drop_penalty": 20_000_000.0,
             "reserve_penalty": 75_000.0,
             "min_transition_reserve": 1,
             "min_decryptability_reserve": 1,
             "boundary_scale_policy": "waterline",
+            "beam_width": 10,
+            "state_cap_per_node": 32,
+            "boundary_state_cap": 12,
         }
     )
+    for key in (
+        "component_bootstrap_budgets",
+        "enable_direct_budget_beam",
+        "forbid_bootstrap",
+        "scale_lattice",
+        "selection_bootstrap_penalty",
+        "target_bootstrap_count",
+    ):
+        policy.pop(key, None)
     policy["boundary_group_policies"] = []
     policy["mcts_action_cap"] = 10
     policy["mcts_rollout_budget"] = 16
@@ -910,13 +1052,30 @@ def place(context):
     policy["mcts_prior_order"] = True
     policy["include_seed_repair_actions"] = True
     policy["selection_objective"] = "cost"
-    policy["mcts_action_allowlist"] = [
+    active_action_names = [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
         *reference_action_names,
         "latency_mcts_repair",
     ]
+    active_actions = [
+        action for action in actions if str(action.get("name", "")) in set(active_action_names)
+    ]
+    for action in active_actions:
+        name = str(action.get("name", ""))
+        if name == "budget_fulfillment_beam":
+            action["prior"] = 0.60
+        elif name == "wide_boundary_cost_beam":
+            action["prior"] = 0.40
+        elif name == "dense_boundary_cost_beam":
+            action["prior"] = 0.50
+        elif name == "latency_mcts_repair":
+            action["prior"] = 0.19
+        elif name in reference_action_names:
+            action["prior"] = 0.50
+    policy["mcts_actions"] = active_actions
+    policy["mcts_action_allowlist"] = active_action_names
     policy["mcts_action_presets"] = mcts.action_presets(
         budget_fulfillment_beam={
             "prior": 0.60,
@@ -6217,14 +6376,30 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
     policy.update(
         {
             "allow_seed_fallback": True,
+            "allow_bootstrap": False,
+            "refresh_fanout_at_level_floor": True,
             "max_scale_candidates": 24,
             "bootstrap_penalty": 25_000_000.0,
+            "rescale_penalty": 0.0,
+            "level_drop_penalty": 20_000_000.0,
             "reserve_penalty": 75_000.0,
             "min_transition_reserve": 1,
             "min_decryptability_reserve": 1,
             "boundary_scale_policy": "waterline",
+            "beam_width": 10,
+            "state_cap_per_node": 32,
+            "boundary_state_cap": 12,
         }
     )
+    for key in (
+        "component_bootstrap_budgets",
+        "enable_direct_budget_beam",
+        "forbid_bootstrap",
+        "scale_lattice",
+        "selection_bootstrap_penalty",
+        "target_bootstrap_count",
+    ):
+        policy.pop(key, None)
     policy["boundary_group_policies"] = []
     policy["mcts_action_cap"] = 10
     policy["mcts_rollout_budget"] = 16
@@ -6233,13 +6408,30 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
     policy["mcts_prior_order"] = True
     policy["include_seed_repair_actions"] = True
     policy["selection_objective"] = "cost"
-    policy["mcts_action_allowlist"] = [
+    active_action_names = [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
         *reference_action_names,
         "latency_mcts_repair",
     ]
+    active_actions = [
+        action for action in actions if str(action.get("name", "")) in set(active_action_names)
+    ]
+    for action in active_actions:
+        name = str(action.get("name", ""))
+        if name == "budget_fulfillment_beam":
+            action["prior"] = 0.60
+        elif name == "wide_boundary_cost_beam":
+            action["prior"] = 0.40
+        elif name == "dense_boundary_cost_beam":
+            action["prior"] = 0.50
+        elif name == "latency_mcts_repair":
+            action["prior"] = 0.19
+        elif name in reference_action_names:
+            action["prior"] = 0.50
+    policy["mcts_actions"] = active_actions
+    policy["mcts_action_allowlist"] = active_action_names
     policy["mcts_action_presets"] = mcts.action_presets(
         budget_fulfillment_beam={
             "prior": 0.60,

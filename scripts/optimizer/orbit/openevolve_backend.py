@@ -8455,18 +8455,27 @@ def _solve_budget_batch_boundary_mcts_parallel(
     dict[tuple[int, int], dict[tuple[int, int], Assign]],
     dict[tuple[int, int], dict[tuple[int, int], float]],
 ] | None:
-    groups = list(_budget_boundary_groups(io_budgets_list).values())
-    workers = _parallel_qbp_worker_count(params, len(groups))
-    if workers <= 1 or len(groups) <= 1:
+    grouped_budgets = list(_budget_boundary_groups(io_budgets_list).values())
+    if len(grouped_budgets) > 1:
+        task_budgets = grouped_budgets
+        task_kind = "boundary_groups"
+    elif len(io_budgets_list) > 1:
+        task_budgets = [[dict(budget)] for budget in io_budgets_list]
+        task_kind = "output_budgets"
+    else:
+        task_budgets = grouped_budgets
+        task_kind = "single"
+    workers = _parallel_qbp_worker_count(params, len(task_budgets))
+    if workers <= 1 or len(task_budgets) <= 1:
         return None
     print(
         "OpenEvolve QBP parallel boundary replay: "
-        f"pdag={pdag.name} groups={len(groups)} workers={workers}",
+        f"pdag={pdag.name} tasks={len(task_budgets)} kind={task_kind} workers={workers}",
         flush=True,
     )
     payloads = [
         (build_context(pdag, [dict(budget) for budget in budgets], params), hints)
-        for budgets in groups
+        for budgets in task_budgets
     ]
     io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
     io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}

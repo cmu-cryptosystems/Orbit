@@ -2637,14 +2637,14 @@ def test_policy_bank_worker_count_uses_parallel_evaluations(
     )
 
     monkeypatch.delenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", raising=False)
-    assert oe_backend._policy_bank_worker_count(params, 22) == 8
+    assert oe_backend._policy_bank_worker_count(params, 22) == 4
     assert oe_backend._policy_bank_worker_count(params, 3) == 3
 
-    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "4")
-    assert oe_backend._policy_bank_worker_count(params, 22) == 4
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "8")
+    assert oe_backend._policy_bank_worker_count(params, 22) == 8
 
     monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "bad")
-    assert oe_backend._policy_bank_worker_count(params, 22) == 8
+    assert oe_backend._policy_bank_worker_count(params, 22) == 4
 
 
 def test_policy_bank_prepass_enabled_by_default(

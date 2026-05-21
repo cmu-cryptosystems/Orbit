@@ -2028,12 +2028,18 @@ def _policy_bank_worker_count(params: Params, variant_count: int) -> int:
         else:
             workers = max(
                 1,
-                int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+                min(
+                    4,
+                    int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+                ),
             )
     except ValueError:
         workers = max(
             1,
-            int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+            min(
+                4,
+                int(getattr(params, "openevolve_parallel_evaluations", 1) or 1),
+            ),
         )
     return min(workers, max(1, int(variant_count or 0)))
 

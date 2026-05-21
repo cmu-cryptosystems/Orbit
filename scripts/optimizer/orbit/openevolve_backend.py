@@ -2054,6 +2054,31 @@ def _policy_bank_full_validation_record(
     fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
     fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
     invalid_reasons = diagnostics.get("invalid_reasons", {})
+    diagnostic_summary = {
+        key: diagnostics.get(key)
+        for key in (
+            "requested_budgets",
+            "solved_budgets",
+            "candidate_solved_budgets",
+            "fallback_selected_budgets",
+            "requested_boundary_groups",
+            "solved_boundary_groups",
+            "partial_boundary_groups",
+            "candidate_solved_boundary_groups",
+            "fallback_selected_boundary_groups",
+            "invalid_boundary_groups",
+            "unreachable_boundary_groups",
+            "selected_source_counts",
+            "mcts_action_attempt_counts",
+            "mcts_action_success_counts",
+            "mcts_action_invalid_counts",
+            "candidate_invalid_reasons",
+        )
+        if key in diagnostics
+    }
+    diagnostic_summary["boundary_group_summaries"] = list(
+        diagnostics.get("boundary_group_summaries", []) or []
+    )[:32]
     return {
         "index": idx,
         "label": label,
@@ -2071,6 +2096,7 @@ def _policy_bank_full_validation_record(
         "effective_qbp_digest": _effective_qbp_digest(diagnostics),
         "selected_path_digest": _selected_path_digest(result, diagnostics),
         "invalid_reasons": invalid_reasons if isinstance(invalid_reasons, dict) else {},
+        "diagnostic_summary": diagnostic_summary,
         "log_tail": str(result.get("log_tail", ""))[-2000:],
         "policy_summary": _compact_policy_summary(replay_hints),
     }

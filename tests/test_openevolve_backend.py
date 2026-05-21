@@ -2777,7 +2777,16 @@ def test_boundary_group_policy_overlay_targets_sampled_group():
 
     normalized = oe_backend._normalize_boundary_group_policies(raw, context)
     merged = oe_backend._apply_boundary_group_policy_overlays(
-        {"boundary_scale_policy": "frontier", "boundary_group_policies": normalized},
+        {
+            "boundary_scale_policy": "frontier",
+            "mcts_action_allowlist": ["budget_fulfillment_beam"],
+            "mcts_action_presets": {
+                "budget_fulfillment_beam": {
+                    "policy": {"boundary_scale_policy": "frontier", "boundary_state_cap": 4}
+                }
+            },
+            "boundary_group_policies": normalized,
+        },
         group_key,
     )
 
@@ -2785,6 +2794,30 @@ def test_boundary_group_policy_overlay_targets_sampled_group():
     assert merged["boundary_scale_policy"] == "waterline"
     assert merged["boundary_state_cap"] == 9
     assert merged["bootstrap_penalty"] == 45_000_000.0
+    budget_preset = merged["mcts_action_presets"]["budget_fulfillment_beam"]["policy"]
+    assert budget_preset["boundary_scale_policy"] == "waterline"
+    assert budget_preset["boundary_state_cap"] == 9
+    assert budget_preset["bootstrap_penalty"] == 45_000_000.0
+
+
+def test_placement_mcts_boundary_group_policy_defaults_to_direct_latency_beam():
+    mcts = PlacementMCTS({"harness": {}})
+    patch = mcts.boundary_group_policy(
+        {"group_key": {"in_lvl": 8, "in_scl": 51, "maino_v": "", "main_dag_size": 0}},
+        boundary_state_cap=12,
+        max_scale_candidates=80,
+    )
+
+    policy = patch["policy"]
+    assert policy["strategy"] == "latency_beam"
+    assert policy["allow_bootstrap"] is True
+    assert policy["allow_seed_fallback"] is False
+    assert policy["direct_budget_policy"] is True
+    assert policy["refresh_fanout_at_level_floor"] is True
+    assert policy["min_transition_reserve"] == 0
+    assert policy["min_decryptability_reserve"] == 0
+    assert policy["boundary_state_cap"] == 12
+    assert policy["max_scale_candidates"] == 80
 
 
 def test_initial_compile_seed_uses_trace_boundary_group_policies(
@@ -3618,9 +3651,10 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
     improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
-    assert slower_score == 0.0
+    assert slower_score == pytest.approx(1000.0 / 1001.0)
     assert equal_score == 1.0
     assert improved_score > 1.0
+    assert 0.0 < slower_score < equal_score
     assert equal_score > slower_score
     assert improved_score > slower_score
     assert much_better_score > improved_score

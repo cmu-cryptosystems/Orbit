@@ -4715,11 +4715,10 @@ def _latency_only_combined_score(
         return 0.0
     ratio = reference / cost
     if ratio < 1.0:
-        # Candidate examples and traces still record slower path-changing
-        # programs, but the maximized OpenEvolve objective is now purely
-        # latency after correctness. A slower valid candidate cannot outrank
-        # the current best seed/reference.
-        return 0.0
+        # Keep the score purely latency-based after correctness: slower valid
+        # candidates rank below the seed, but remain distinguishable from
+        # invalid candidates so OpenEvolve can still learn from changed paths.
+        return max(0.0, float(ratio))
     if math.isclose(ratio, 1.0, rel_tol=1e-12, abs_tol=1e-12):
         return 1.0
     # OpenEvolve maximizes a single score, and raw latency ratios for sampled
@@ -8700,6 +8699,18 @@ def _apply_boundary_group_policy_overlays(
                 presets,
                 replace=_bool_hint(patch.get("replace_mcts_action_presets"), False),
             )
+        action_patch = _boundary_group_action_patch(patch)
+        if action_patch:
+            action_names = _boundary_group_overlay_action_names(merged)
+            if action_names:
+                merged["mcts_action_presets"] = _merge_mcts_action_presets(
+                    merged.get("mcts_action_presets"),
+                    {
+                        name: {"policy": dict(action_patch)}
+                        for name in action_names
+                    },
+                    replace=False,
+                )
         for key, value in patch.items():
             if key in {
                 "selector",
@@ -8732,6 +8743,76 @@ def _apply_boundary_group_policy_overlays(
             }:
                 merged[key] = value
     return merged
+
+
+def _boundary_group_action_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    """Project a local boundary overlay onto direct MCTS action policies."""
+
+    if not isinstance(patch, dict):
+        return {}
+    action_patch: dict[str, Any] = {}
+    for key, value in patch.items():
+        if key in {
+            "selector",
+            "policy",
+            "mcts_action_presets",
+            "replace_mcts_action_presets",
+            "boundary_group_policies",
+            "mcts_action_allowlist",
+            "mcts_action_blocklist",
+            "mcts_action_cap",
+            "mcts_rollout_budget",
+            "mcts_prior_order",
+        }:
+            continue
+        if key in _PATCHABLE_POLICY_KEYS or key in {
+            "direct_budget_policy",
+            "forbid_bootstrap",
+            "budget_aggressive",
+            "boundary_scale_policy",
+            "boundary_state_cap",
+            "bootstrap_anchor_count",
+            "bootstrap_anchor_level",
+            "bootstrap_anchor_selector",
+            "bootstrap_anchor_include_patterns",
+            "bootstrap_anchor_exclude_patterns",
+            "force_bootstrap_anchors",
+            "selection_objective",
+            "prefer_component_budget_fit",
+            "noise_slack_model",
+        }:
+            action_patch[key] = value
+    return action_patch
+
+
+def _boundary_group_overlay_action_names(hints: dict[str, Any]) -> list[str]:
+    direct_actions = {
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "dense_boundary_cost_beam",
+        "reference_boundary_cost_beam",
+        "waterline_cost_beam",
+        "nonlinear_phase_boundary_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "latency_mcts_repair",
+    }
+    allowlist = [
+        str(item)
+        for item in hints.get("mcts_action_allowlist", []) or []
+        if str(item)
+    ]
+    if allowlist:
+        names = [name for name in allowlist if name in direct_actions]
+        if names:
+            return names
+    presets = hints.get("mcts_action_presets")
+    if isinstance(presets, dict):
+        names = [str(name) for name in presets if str(name) in direct_actions]
+        if names:
+            return names
+    return ["budget_fulfillment_beam"]
 
 
 def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
@@ -13110,6 +13191,13 @@ class PlacementMCTS:
         """Return high-impact boundary-state knobs for cost-focused MCTS actions."""
 
         return {
+            "strategy": "latency_beam",
+            "allow_bootstrap": True,
+            "allow_seed_fallback": False,
+            "refresh_fanout_at_level_floor": True,
+            "direct_budget_policy": True,
+            "min_transition_reserve": 0,
+            "min_decryptability_reserve": 0,
             "boundary_state_cap": int(boundary_state_cap),
             "max_scale_candidates": int(max_scale_candidates),
             "boundary_scale_policy": str(boundary_scale_policy),

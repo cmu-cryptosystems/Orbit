@@ -5,8 +5,10 @@ import concurrent.futures
 import io
 import json
 import math
+import multiprocessing
 import os
 import hashlib
+import queue as queue_module
 import shutil
 import tempfile
 import time
@@ -1986,6 +1988,163 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
 
 def _evaluate_policy_bank_program(context_path: str, program_path: str) -> dict[str, Any]:
     return evaluate_compile_candidate_program(Path(context_path), Path(program_path))
+
+
+def _policy_bank_full_validation_timeout_sec(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_FULL_VALIDATION_TIMEOUT_SEC", "").strip()
+    if raw:
+        try:
+            return max(30, int(float(raw)))
+        except ValueError:
+            pass
+    evaluator_timeout = int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180)
+    return max(60, min(600, evaluator_timeout))
+
+
+def _mp_context():
+    try:
+        return multiprocessing.get_context("fork")
+    except ValueError:
+        return multiprocessing.get_context()
+
+
+def _policy_bank_full_validation_record(
+    idx: int,
+    label: str,
+    full_context: dict[str, Any],
+    replay_hints: dict[str, Any],
+    sampled_reject_reason: str,
+) -> dict[str, Any]:
+    result = _evaluate_compile_hints(
+        full_context,
+        replay_hints,
+        suppress_output=True,
+        evaluating_candidate=False,
+    )
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    valid = bool(result.get("valid", False))
+    fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
+    fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
+    invalid_reasons = diagnostics.get("invalid_reasons", {})
+    return {
+        "index": idx,
+        "label": label,
+        "valid": valid,
+        "sampled_reject_reason": sampled_reject_reason,
+        "final_latency_usec": result.get("final_latency_usec"),
+        "objective_cost_usec": result.get(
+            "objective_cost_usec", result.get("final_latency_usec")
+        ),
+        "bootstrap_count": result.get("bootstrap_count"),
+        "rescale_count": result.get("rescale_count"),
+        "fallback_selected_groups": fallback_groups,
+        "fallback_selected_budgets": fallback_budgets,
+        "candidate_qbp_coverage": result.get("candidate_qbp_coverage"),
+        "effective_qbp_digest": _effective_qbp_digest(diagnostics),
+        "selected_path_digest": _selected_path_digest(result, diagnostics),
+        "invalid_reasons": invalid_reasons if isinstance(invalid_reasons, dict) else {},
+        "log_tail": str(result.get("log_tail", ""))[-2000:],
+        "policy_summary": _compact_policy_summary(replay_hints),
+    }
+
+
+def _policy_bank_full_validation_worker(
+    result_queue,
+    idx: int,
+    label: str,
+    full_context: dict[str, Any],
+    replay_hints: dict[str, Any],
+    sampled_reject_reason: str,
+) -> None:
+    try:
+        record = _policy_bank_full_validation_record(
+            idx,
+            label,
+            full_context,
+            replay_hints,
+            sampled_reject_reason,
+        )
+        result_queue.put({"ok": True, "record": record})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "record": {
+                    "index": idx,
+                    "label": label,
+                    "valid": False,
+                    "sampled_reject_reason": sampled_reject_reason,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "traceback": traceback.format_exc()[-4000:],
+                    "policy_summary": _compact_policy_summary(replay_hints),
+                },
+            }
+        )
+
+
+def _run_policy_bank_full_validation_variant(
+    idx: int,
+    label: str,
+    full_context: dict[str, Any],
+    replay_hints: dict[str, Any],
+    sampled_reject_reason: str,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    ctx = _mp_context()
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_policy_bank_full_validation_worker,
+        args=(
+            result_queue,
+            idx,
+            label,
+            full_context,
+            replay_hints,
+            sampled_reject_reason,
+        ),
+    )
+    proc.start()
+    proc.join(timeout_sec)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive() and hasattr(proc, "kill"):
+            proc.kill()
+            proc.join(5)
+        return {
+            "index": idx,
+            "label": label,
+            "valid": False,
+            "sampled_reject_reason": sampled_reject_reason,
+            "error": f"full validation timed out after {timeout_sec}s",
+            "timed_out": True,
+            "policy_summary": _compact_policy_summary(replay_hints),
+        }
+    try:
+        payload = result_queue.get_nowait()
+    except queue_module.Empty:
+        return {
+            "index": idx,
+            "label": label,
+            "valid": False,
+            "sampled_reject_reason": sampled_reject_reason,
+            "error": f"full validation worker exited with code {proc.exitcode}",
+            "worker_exitcode": proc.exitcode,
+            "policy_summary": _compact_policy_summary(replay_hints),
+        }
+    record = payload.get("record") if isinstance(payload, dict) else None
+    if isinstance(record, dict):
+        return record
+    return {
+        "index": idx,
+        "label": label,
+        "valid": False,
+        "sampled_reject_reason": sampled_reject_reason,
+        "error": "full validation worker returned no record",
+        "policy_summary": _compact_policy_summary(replay_hints),
+    }
 
 
 def _run_compile_policy_bank_prepass(
@@ -7059,65 +7218,75 @@ def _full_validate_policy_bank_seed(
     full_context = json.loads(json.dumps(sampled_context))
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
     summary_path = finalist_dir / "policy_bank_full_validation.json"
+    progress_path = finalist_dir / "policy_bank_full_validation_progress.json"
     records: list[dict[str, Any]] = []
     best: tuple[float, int, int, dict[str, Any], dict[str, Any]] | None = None
-    for idx, (label, replay_hints) in enumerate(
-        _policy_bank_full_validation_variants(initial_hints)
-    ):
-        try:
-            result = _evaluate_compile_hints(
-                full_context,
-                replay_hints,
-                suppress_output=True,
-                evaluating_candidate=False,
-            )
-        except Exception as exc:
-            records.append(
-                {
-                    "index": idx,
-                    "label": label,
-                    "valid": False,
-                    "sampled_reject_reason": sampled_reject_reason,
-                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
-                    "policy_summary": _compact_policy_summary(replay_hints),
-                }
-            )
-            continue
+    variants = _policy_bank_full_validation_variants(initial_hints)
+    timeout_sec = _policy_bank_full_validation_timeout_sec(params)
+    active: dict[str, Any] = {}
 
-        diagnostics = result.get("diagnostics", {})
-        if not isinstance(diagnostics, dict):
-            diagnostics = {}
-        valid = bool(result.get("valid", False))
-        fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
-        fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
-        invalid_reasons = diagnostics.get("invalid_reasons", {})
-        record = {
-            "index": idx,
-            "label": label,
-            "valid": valid,
+    def write_progress() -> None:
+        progress = {
+            "valid": best is not None,
             "sampled_reject_reason": sampled_reject_reason,
-            "final_latency_usec": result.get("final_latency_usec"),
-            "objective_cost_usec": result.get(
-                "objective_cost_usec", result.get("final_latency_usec")
-            ),
-            "bootstrap_count": result.get("bootstrap_count"),
-            "rescale_count": result.get("rescale_count"),
-            "fallback_selected_groups": fallback_groups,
-            "fallback_selected_budgets": fallback_budgets,
-            "candidate_qbp_coverage": result.get("candidate_qbp_coverage"),
-            "effective_qbp_digest": _effective_qbp_digest(diagnostics),
-            "selected_path_digest": _selected_path_digest(result, diagnostics),
-            "invalid_reasons": invalid_reasons if isinstance(invalid_reasons, dict) else {},
-            "log_tail": str(result.get("log_tail", ""))[-2000:],
-            "policy_summary": _compact_policy_summary(replay_hints),
+            "timeout_sec": timeout_sec,
+            "active": active,
+            "records": records,
+            "updated_at": time.time(),
         }
+        progress_path.write_text(
+            json.dumps(progress, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    for idx, (label, replay_hints) in enumerate(variants):
+        active.clear()
+        active.update(
+            {
+                "index": idx,
+                "label": label,
+                "status": "running",
+                "started_at": time.time(),
+            }
+        )
+        write_progress()
+        print(
+            "OpenEvolve compile harness: full-validating sampled policy-bank "
+            f"variant {idx + 1}/{len(variants)} {label} timeout={timeout_sec}s.",
+            flush=True,
+        )
+        record = _run_policy_bank_full_validation_variant(
+            idx,
+            label,
+            full_context,
+            replay_hints,
+            sampled_reject_reason,
+            timeout_sec,
+        )
+        record["elapsed_sec"] = time.time() - float(active.get("started_at", time.time()))
         records.append(record)
-        latency = _finite_float(result.get("final_latency_usec"), float("inf"))
+        active["status"] = "done"
+        active["valid"] = bool(record.get("valid", False))
+        active["error"] = record.get("error")
+        active["elapsed_sec"] = record["elapsed_sec"]
+        write_progress()
+        print(
+            "OpenEvolve compile harness: full-validation "
+            f"{label} valid={record.get('valid')} "
+            f"latency={record.get('final_latency_usec')} "
+            f"bootstraps={record.get('bootstrap_count')} "
+            f"error={record.get('error')}.",
+            flush=True,
+        )
+        valid = bool(record.get("valid", False))
+        fallback_groups = int(record.get("fallback_selected_groups", 0) or 0)
+        fallback_budgets = int(record.get("fallback_selected_budgets", 0) or 0)
+        latency = _finite_float(record.get("final_latency_usec"), float("inf"))
         if valid and fallback_groups == 0 and fallback_budgets == 0 and math.isfinite(latency):
             item = (
                 latency,
-                int(result.get("bootstrap_count", 0) or 0),
-                int(result.get("rescale_count", 0) or 0),
+                int(record.get("bootstrap_count", 0) or 0),
+                int(record.get("rescale_count", 0) or 0),
                 replay_hints,
                 record,
             )

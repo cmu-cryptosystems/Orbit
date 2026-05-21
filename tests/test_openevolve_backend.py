@@ -5614,8 +5614,8 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     def fake_static(_context, _hints):
         return {"valid": True, "reasons": []}
 
-    def fake_eval(sampled_context, hints, *, suppress_output):
-        assert suppress_output is True
+    def fake_eval(sampled_context, hints, *, timeout_sec):
+        assert timeout_sec >= 0
         is_probe = bool(sampled_context.get("harness", {}).get("experience_probe"))
         marker = hints["marker"]
         latency = 80.0 if marker == "fast" else 120.0
@@ -5643,7 +5643,7 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
 
     monkeypatch.setattr(oe_backend, "_hints_from_code", fake_hints)
     monkeypatch.setattr(oe_backend, "_static_validate_hints", fake_static)
-    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fake_eval)
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
 
     selected = oe_backend._run_sampled_promotion_pass(
         tmp_path,
@@ -5660,6 +5660,9 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
     assert summary["selected"] is True
     assert summary["selected_latency_usec"] == 80.0
+    progress = json.loads((tmp_path / "sampled_promotion" / "promotion_progress.json").read_text())
+    assert progress["current_stage"] == "done"
+    assert progress["selected"] is True
 
 
 def test_sampled_promotion_fails_open_when_no_candidate_improves(
@@ -5691,7 +5694,8 @@ def test_sampled_promotion_fails_open_when_no_candidate_improves(
     monkeypatch.setattr(oe_backend, "_hints_from_code", lambda *_args: {"marker": "slow"})
     monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
 
-    def fake_eval(_context, _hints, *, suppress_output):
+    def fake_eval(_context, _hints, *, timeout_sec):
+        assert timeout_sec >= 0
         return {
             "valid": True,
             "boundary_group_validity": 1.0,
@@ -5707,7 +5711,7 @@ def test_sampled_promotion_fails_open_when_no_candidate_improves(
             },
         }
 
-    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fake_eval)
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
 
     selected = oe_backend._run_sampled_promotion_pass(
         tmp_path,
@@ -5721,6 +5725,76 @@ def test_sampled_promotion_fails_open_when_no_candidate_improves(
     assert selected is None
     summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
     assert summary["selected"] is False
+    assert summary["timed_out"] is False
+
+
+def test_sampled_promotion_timeout_writes_progress(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    codes = [
+        "def place(context):\n    return {'marker': 'a'}\n",
+        "def place(context):\n    return {'marker': 'b'}\n",
+    ]
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "1")
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: codes)
+    monkeypatch.setattr(oe_backend, "_hints_from_code", lambda code, _context: {"marker": code[-4]})
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    times = iter([0.0, 0.0, 2.0, 2.0, 2.0])
+    monkeypatch.setattr(oe_backend.time, "monotonic", lambda: next(times, 2.0))
+
+    def fake_eval(_context, hints, *, timeout_sec):
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 120.0,
+            "objective_cost_usec": 120.0,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        codes[0],
+        params,
+        {},
+    )
+
+    assert selected is None
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["timed_out"] is True
+    progress = json.loads((tmp_path / "sampled_promotion" / "promotion_progress.json").read_text())
+    assert progress["timed_out"] is True
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

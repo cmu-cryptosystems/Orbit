@@ -9904,6 +9904,24 @@ def _promotion_candidate_limit(params: Params) -> int:
     return max(0, min(128, value))
 
 
+def _promotion_timeout_sec(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "").strip()
+    try:
+        value = int(raw) if raw else 300
+    except ValueError:
+        value = 300
+    return max(0, min(86_400, value))
+
+
+def _promotion_eval_timeout_sec(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", "").strip()
+    try:
+        value = int(raw) if raw else int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180)
+    except (TypeError, ValueError):
+        value = 180
+    return max(0, min(3_600, value))
+
+
 def _promotion_result_direct_valid(result: dict[str, Any]) -> bool:
     if not bool(result.get("valid", False)):
         return False
@@ -10001,6 +10019,134 @@ def _promotion_record_summary(
     }
 
 
+def _write_promotion_progress(
+    promotion_dir: Path,
+    *,
+    started_at: float,
+    timeout_sec: int,
+    current_stage: str,
+    current_index: int | None,
+    total_candidates: int,
+    records: list[dict[str, Any]],
+    selected: bool,
+    timed_out: bool = False,
+) -> None:
+    payload = {
+        "current_stage": current_stage,
+        "current_index": current_index,
+        "total_candidates": total_candidates,
+        "record_count": len(records),
+        "selected": selected,
+        "timed_out": timed_out,
+        "elapsed_sec": round(time.monotonic() - started_at, 6),
+        "timeout_sec": timeout_sec,
+        "latest_records": records[-8:],
+    }
+    (promotion_dir / "promotion_progress.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _promotion_sampled_eval_worker(
+    result_queue,
+    sampled_context: dict[str, Any],
+    hints: dict[str, Any],
+) -> None:
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
+    try:
+        result = _evaluate_sampled_budget_tasks(
+            sampled_context,
+            hints,
+            suppress_output=True,
+        )
+        result_queue.put({"ok": True, "result": result})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "result": {
+                    "valid": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "traceback": traceback.format_exc()[-4000:],
+                },
+            }
+        )
+
+
+def _evaluate_sampled_budget_tasks_for_promotion(
+    sampled_context: dict[str, Any],
+    hints: dict[str, Any],
+    *,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    if timeout_sec <= 0:
+        return _evaluate_sampled_budget_tasks(
+            sampled_context,
+            hints,
+            suppress_output=True,
+        )
+    ctx = _mp_context()
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_promotion_sampled_eval_worker,
+        args=(result_queue, sampled_context, hints),
+    )
+    proc.start()
+    deadline = time.time() + float(timeout_sec)
+    payload: dict[str, Any] | None = None
+    while time.time() < deadline:
+        try:
+            payload = result_queue.get(timeout=min(0.5, max(0.0, deadline - time.time())))
+            break
+        except queue_module.Empty:
+            if not proc.is_alive():
+                break
+    if payload is None:
+        proc.join(0)
+        try:
+            payload = result_queue.get_nowait()
+        except queue_module.Empty:
+            payload = None
+    if payload is None and proc.is_alive():
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
+        else:
+            proc.terminate()
+        proc.join(5)
+        if proc.is_alive() and hasattr(proc, "kill"):
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.join(5)
+        return {
+            "valid": False,
+            "timed_out": True,
+            "timeout_sec": int(timeout_sec),
+            "error": f"promotion QBP evaluation timed out after {timeout_sec}s",
+        }
+    proc.join(5)
+    if payload is None:
+        return {
+            "valid": False,
+            "error": f"promotion QBP worker exited with code {proc.exitcode}",
+            "worker_exitcode": proc.exitcode,
+        }
+    result = payload.get("result") if isinstance(payload, dict) else None
+    return result if isinstance(result, dict) else {"valid": False, "error": "promotion QBP worker returned no result"}
+
+
 def _run_sampled_promotion_pass(
     root: Path,
     output_dir: Path,
@@ -10018,6 +10164,9 @@ def _run_sampled_promotion_pass(
         return None
     promotion_dir = root / "sampled_promotion"
     promotion_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.monotonic()
+    timeout_sec = _promotion_timeout_sec(params)
+    eval_timeout_sec = _promotion_eval_timeout_sec(params)
     selected_probe_tasks, probe_reference_cost = _experience_probe_tasks(context)
     if not selected_probe_tasks or not math.isfinite(probe_reference_cost):
         return None
@@ -10027,12 +10176,49 @@ def _run_sampled_promotion_pass(
     records: list[dict[str, Any]] = []
     best: tuple[float, float, float, int, dict[str, Any], dict[str, Any], str] | None = None
     seen: set[str] = set()
+    timed_out = False
+
+    _write_promotion_progress(
+        promotion_dir,
+        started_at=started_at,
+        timeout_sec=timeout_sec,
+        current_stage="start",
+        current_index=None,
+        total_candidates=len(codes),
+        records=records,
+        selected=False,
+    )
 
     for index, code in enumerate(codes):
+        if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
+            timed_out = True
+            records.append(
+                {
+                    "index": index,
+                    "stage": "timeout",
+                    "reason": f"promotion timeout after {timeout_sec}s",
+                }
+            )
+            break
         code_digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
         if code_digest in seen:
             continue
         seen.add(code_digest)
+        print(
+            "OpenEvolve compile harness: sampled promotion "
+            f"candidate {len(seen)}/{len(codes)} static digest={code_digest[:12]}.",
+            flush=True,
+        )
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="static",
+            current_index=index,
+            total_candidates=len(codes),
+            records=records,
+            selected=best is not None,
+        )
         hints = _hints_from_code(code, context)
         if hints is None:
             records.append(
@@ -10043,6 +10229,16 @@ def _run_sampled_promotion_pass(
                     reason="candidate_hints_not_loadable",
                     code_digest=code_digest,
                 )
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="static_rejected",
+                current_index=index,
+                total_candidates=len(codes),
+                records=records,
+                selected=best is not None,
             )
             continue
         static = _static_validate_hints(context, hints)
@@ -10056,15 +10252,40 @@ def _run_sampled_promotion_pass(
                     code_digest=code_digest,
                 )
             )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="static_rejected",
+                current_index=index,
+                total_candidates=len(codes),
+                records=records,
+                selected=best is not None,
+            )
             continue
         eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True
-        probe_result = _evaluate_sampled_budget_tasks(
+        print(
+            "OpenEvolve compile harness: sampled promotion "
+            f"candidate {len(seen)}/{len(codes)} probe_qbp timeout={eval_timeout_sec}s.",
+            flush=True,
+        )
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="probe_qbp",
+            current_index=index,
+            total_candidates=len(codes),
+            records=records,
+            selected=best is not None,
+        )
+        probe_result = _evaluate_sampled_budget_tasks_for_promotion(
             probe_context,
             eval_hints,
-            suppress_output=True,
+            timeout_sec=eval_timeout_sec,
         )
         probe_latency = _promotion_latency(probe_result)
         probe_record = _promotion_record_summary(
@@ -10077,6 +10298,16 @@ def _run_sampled_promotion_pass(
         )
         probe_record["reference_latency_usec"] = probe_reference_cost
         records.append(probe_record)
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="probe_qbp_done",
+            current_index=index,
+            total_candidates=len(codes),
+            records=records,
+            selected=best is not None,
+        )
         if not _promotion_result_direct_valid(probe_result):
             probe_record["reason"] = "probe_not_direct_valid"
             continue
@@ -10084,10 +10315,35 @@ def _run_sampled_promotion_pass(
             probe_record["reason"] = "probe_not_latency_improved"
             continue
 
-        full_result = _evaluate_sampled_budget_tasks(
+        if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
+            timed_out = True
+            records.append(
+                {
+                    "index": index,
+                    "stage": "timeout",
+                    "reason": f"promotion timeout before sampled replay after {timeout_sec}s",
+                }
+            )
+            break
+        print(
+            "OpenEvolve compile harness: sampled promotion "
+            f"candidate {len(seen)}/{len(codes)} sampled_qbp timeout={eval_timeout_sec}s.",
+            flush=True,
+        )
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="sampled_qbp",
+            current_index=index,
+            total_candidates=len(codes),
+            records=records,
+            selected=best is not None,
+        )
+        full_result = _evaluate_sampled_budget_tasks_for_promotion(
             context,
             eval_hints,
-            suppress_output=True,
+            timeout_sec=eval_timeout_sec,
         )
         full_latency = _promotion_latency(full_result)
         full_record = _promotion_record_summary(
@@ -10101,6 +10357,16 @@ def _run_sampled_promotion_pass(
         full_record["reference_latency_usec"] = full_reference_cost
         full_record["probe_latency_usec"] = probe_latency
         records.append(full_record)
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="sampled_qbp_done",
+            current_index=index,
+            total_candidates=len(codes),
+            records=records,
+            selected=best is not None,
+        )
         if not _promotion_result_direct_valid(full_result):
             full_record["reason"] = "sampled_not_direct_valid"
             continue
@@ -10128,11 +10394,26 @@ def _run_sampled_promotion_pass(
         "selected_index": None if best is None else best[3],
         "selected_latency_usec": None if best is None else best[0],
         "selected_record": None if best is None else best[5],
+        "timed_out": timed_out,
+        "elapsed_sec": round(time.monotonic() - started_at, 6),
+        "timeout_sec": timeout_sec,
+        "eval_timeout_sec": eval_timeout_sec,
         "records": records,
     }
     (promotion_dir / "promotion_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
+    )
+    _write_promotion_progress(
+        promotion_dir,
+        started_at=started_at,
+        timeout_sec=timeout_sec,
+        current_stage="done",
+        current_index=None,
+        total_candidates=len(codes),
+        records=records,
+        selected=best is not None,
+        timed_out=timed_out,
     )
     print(
         "OpenEvolve compile harness: sampled promotion "

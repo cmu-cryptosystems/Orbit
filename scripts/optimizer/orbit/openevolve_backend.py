@@ -2337,6 +2337,72 @@ def _compile_policy_bank_variants(
         },
     )
     add(
+        "compact_prior_order_cost",
+        {
+            "mcts_action_cap": 6,
+            "mcts_rollout_budget": 24,
+            "mcts_exploration_weight": 1.25,
+            "mcts_max_repair_bootstraps": 16,
+            "mcts_prior_order": True,
+            "include_seed_repair_actions": True,
+            "selection_objective": "cost",
+            "mcts_action_allowlist": [
+                "budget_fulfillment_beam",
+                "wide_boundary_cost_beam",
+                "dense_boundary_cost_beam",
+                "minimal_bootstrap_repair",
+            ],
+        },
+        {
+            "budget_fulfillment_beam": {
+                "prior": 0.65,
+                "policy": {
+                    "beam_width": 12,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "bootstrap_penalty": 150_000_000.0,
+                    "selection_objective": "cost",
+                },
+            },
+            "wide_boundary_cost_beam": {
+                "prior": 0.45,
+                "policy": {
+                    "beam_width": 12,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 10,
+                    "max_scale_candidates": 64,
+                    "boundary_scale_policy": "frontier",
+                    "bootstrap_penalty": 30_000_000.0,
+                    "selection_objective": "cost",
+                },
+            },
+            "dense_boundary_cost_beam": {
+                "prior": 0.50,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 16,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 20,
+                    "max_scale_candidates": 96,
+                    "scale_lattice": "dense",
+                    "boundary_scale_policy": "frontier",
+                    "bootstrap_penalty": 15_000_000.0,
+                    "selection_objective": "cost",
+                },
+            },
+            "minimal_bootstrap_repair": {
+                "prior": 0.10,
+                "policy": {
+                    "bootstrap_anchor_count": 0,
+                    "boundary_state_cap": 2,
+                    "bootstrap_penalty": 5_000_000_000.0,
+                    "selection_objective": "min_bootstrap",
+                },
+            },
+        },
+    )
+    add(
         "maintenance_pressure_cost",
         {
             "boundary_state_cap": 6,

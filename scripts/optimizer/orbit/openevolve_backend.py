@@ -1901,7 +1901,16 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
 
     worker = OpenEvolvePlacementWorker(params, le)
     if getattr(params, "openevolve_reuse_output", False):
+        print(
+            f"OpenEvolve compile harness: loading reusable program from {output_dir}.",
+            flush=True,
+        )
         best_code = _load_reusable_best_code(output_dir)
+        print(
+            "OpenEvolve compile harness: reusable program "
+            f"{'loaded' if best_code else 'missing'}.",
+            flush=True,
+        )
         if not best_code:
             if not params.openevolve_fail_open:
                 raise PlacementError(
@@ -7840,9 +7849,6 @@ def _discover_finalist_codes(output_dir: Path, best_code: str, limit: int) -> li
 def _load_reusable_best_code(output_dir: Path) -> str | None:
     """Load the best available program from a completed OpenEvolve workspace."""
 
-    candidates = _discover_finalist_codes(output_dir, "", 1)
-    if candidates:
-        return candidates[0]
     for program in (
         output_dir / "best" / "best_program.py",
         output_dir / "best_program.py",
@@ -7856,6 +7862,9 @@ def _load_reusable_best_code(output_dir: Path) -> str | None:
             continue
         if code.strip():
             return code
+    candidates = _discover_finalist_codes(output_dir, "", 1)
+    if candidates:
+        return candidates[0]
     return None
 
 

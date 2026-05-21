@@ -3639,6 +3639,62 @@ def test_fail_open_preserves_full_validated_policy_bank_seed():
     assert "policy_bank_lightweight" not in fallback
 
 
+def test_full_validate_policy_bank_seed_promotes_only_valid_full_replay(
+    toy_cost_json: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_finalists=1,
+        openevolve_eval_suite="polybert-sampled",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    initial = {
+        "strategy": "bootstrap_mcts",
+        "policy_bank_validated_initial": True,
+        "policy_bank_selected_label": "sampled_policy",
+        "policy_bank_lightweight": True,
+        "mcts_actions": [
+            {"name": "budget_fulfillment_beam", "policy": {"strategy": "latency_beam"}},
+        ],
+        "mcts_action_allowlist": ["budget_fulfillment_beam"],
+    }
+
+    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+        assert _context["harness"]["eval_suite"] == "polybert-full"
+        assert hints["policy_bank_full_compile_replay"] is True
+        return {
+            "valid": True,
+            "final_latency_usec": 123.0,
+            "objective_cost_usec": 123.0,
+            "bootstrap_count": 5,
+            "rescale_count": 7,
+            "fallback_selected_budgets": 0,
+            "candidate_qbp_coverage": 1.0,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "boundary_group_summaries": [],
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fake_evaluate_compile_hints)
+
+    promoted = oe_backend._full_validate_policy_bank_seed(
+        tmp_path,
+        context,
+        params,
+        initial,
+        "sampled_best_seed_equivalent_path",
+    )
+
+    assert promoted is not None
+    assert promoted["policy_bank_full_validated_initial"] is True
+    assert promoted["policy_bank_full_validation_latency_usec"] == 123.0
+    assert "policy_bank_lightweight" not in promoted
+    assert (tmp_path / "finalists" / "policy_bank_full_validation.json").is_file()
+
+
 def test_policy_bank_replay_hints_extract_dominant_boundary_action():
     assert (
         oe_backend._dominant_boundary_mcts_action(

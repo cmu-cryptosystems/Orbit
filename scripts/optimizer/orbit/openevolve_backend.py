@@ -1953,6 +1953,15 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 fail_open=False,
                 selected_sampled_best=False,
             )
+            validated_policy_bank = _full_validate_policy_bank_seed(
+                root,
+                context,
+                params,
+                initial_hints,
+                sampled_reject_reason,
+            )
+            if validated_policy_bank is not None:
+                return validated_policy_bank
             return _bounded_fail_open_hints(initial_hints)
         finalist_hints = _run_full_bundle_finalists(
             root,
@@ -7008,6 +7017,100 @@ def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, 
                     initial_hints.get("policy_bank_selected_label")
                 )
     return fallback
+
+
+def _full_validate_policy_bank_seed(
+    root: Path,
+    sampled_context: dict[str, Any],
+    params: Params,
+    initial_hints: dict[str, Any] | None,
+    sampled_reject_reason: str,
+) -> dict[str, Any] | None:
+    """Promote a sampled policy-bank seed only after a full replay succeeds.
+
+    The policy-bank prepass is intentionally sampled and can find useful path
+    changes before OpenEvolve has a better candidate. It is not sufficient for
+    final MLIR generation, though: a sampled winner may omit downstream
+    boundary states that the full Orbit DP later needs. When the sampled best is
+    seed-equivalent to the policy-bank initial program, run one full replay and
+    only return those hints if the full assignment is valid.
+    """
+
+    if not initial_hints:
+        return None
+    if not _bool_hint(initial_hints.get("policy_bank_validated_initial"), False):
+        return None
+    if _bool_hint(initial_hints.get("policy_bank_full_validated_initial"), False):
+        return initial_hints
+    if sampled_reject_reason not in {
+        "sampled_best_seed_equivalent_path",
+        "sampled_best_not_latency_improved",
+    }:
+        return None
+    if int(getattr(params, "openevolve_finalists", 0) or 0) <= 0:
+        return None
+
+    finalist_dir = root / "finalists"
+    finalist_dir.mkdir(parents=True, exist_ok=True)
+    full_context = json.loads(json.dumps(sampled_context))
+    full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
+    replay_hints = _policy_bank_full_compile_replay_hints(initial_hints)
+    summary_path = finalist_dir / "policy_bank_full_validation.json"
+    try:
+        result = _evaluate_compile_hints(full_context, replay_hints, suppress_output=True)
+    except Exception as exc:
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "valid": False,
+                    "sampled_reject_reason": sampled_reject_reason,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "policy_summary": _compact_policy_summary(replay_hints),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return None
+
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    valid = bool(result.get("valid", False))
+    fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
+    fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
+    summary = {
+        "valid": valid,
+        "sampled_reject_reason": sampled_reject_reason,
+        "final_latency_usec": result.get("final_latency_usec"),
+        "objective_cost_usec": result.get(
+            "objective_cost_usec", result.get("final_latency_usec")
+        ),
+        "bootstrap_count": result.get("bootstrap_count"),
+        "rescale_count": result.get("rescale_count"),
+        "fallback_selected_groups": fallback_groups,
+        "fallback_selected_budgets": fallback_budgets,
+        "candidate_qbp_coverage": result.get("candidate_qbp_coverage"),
+        "effective_qbp_digest": _effective_qbp_digest(diagnostics),
+        "selected_path_digest": _selected_path_digest(result, diagnostics),
+        "policy_summary": _compact_policy_summary(replay_hints),
+    }
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if not valid or fallback_groups > 0 or fallback_budgets > 0:
+        return None
+
+    promoted = deepcopy(replay_hints)
+    promoted["policy_bank_full_validated_initial"] = True
+    promoted["policy_bank_full_validation_latency_usec"] = result.get("final_latency_usec")
+    promoted["policy_bank_full_validation_bootstrap_count"] = result.get("bootstrap_count")
+    promoted["policy_bank_full_validation_rescale_count"] = result.get("rescale_count")
+    promoted["policy_bank_full_validation_digest"] = summary["selected_path_digest"]
+    return promoted
 
 
 def _policy_bank_full_compile_replay_hints(hints: dict[str, Any]) -> dict[str, Any]:

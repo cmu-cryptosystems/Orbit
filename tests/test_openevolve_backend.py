@@ -2608,6 +2608,25 @@ def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_j
     )
 
 
+def test_policy_bank_includes_relaxed_scale_floor_variants(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        scale_floor_policy="estimator-relaxed",
+        openevolve_scale_floor_candidates="40,36,32,28",
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    initial = oe_backend._bootstrap_mcts_initial_policy_for_context(context)
+
+    variants = oe_backend._compile_policy_bank_variants(initial, context, params)
+    labels = [label for label, _hints in variants]
+
+    assert "relaxed_floor_36_frontier" in labels
+    assert "relaxed_floor_32_frontier" in labels
+    assert "relaxed_floor_36_waterline_boundary" in labels
+    assert len(variants) > 12
+
+
 def test_policy_bank_prepass_enabled_by_default(
     toy_cost_json: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

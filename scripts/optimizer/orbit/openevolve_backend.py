@@ -2471,7 +2471,7 @@ def _compile_policy_bank_variants(
                     },
                 },
             )
-    return variants[:12]
+    return variants
 
 
 def _policy_bank_record(

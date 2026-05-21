@@ -2206,22 +2206,59 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     evaluator_path = root / "evaluator.py"
     output_dir = root / "openevolve_output"
     print(f"OpenEvolve compile workspace: {root}", flush=True)
+    harness_start = time.perf_counter()
+    harness_last = harness_start
+    harness_timings: dict[str, float] = {}
+
+    def record_harness_timing(stage: str) -> None:
+        nonlocal harness_last
+        now = time.perf_counter()
+        elapsed = float(now - harness_last)
+        harness_timings[stage] = elapsed
+        harness_last = now
+        total = float(now - harness_start)
+        print(
+            f"OpenEvolve timing: {stage}={elapsed:.3f}s total={total:.3f}s",
+            flush=True,
+        )
+        try:
+            (root / "compile_harness_timing.json").write_text(
+                json.dumps(
+                    {
+                        "stages_sec": harness_timings,
+                        "total_sec": total,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     cached_context = _load_cached_compile_context(context_path, dag, params)
+    record_harness_timing("load_cached_context")
     context = build_compile_context(dag, params)
     context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
+    context.setdefault("harness", {})["timing_log_enabled"] = True
+    record_harness_timing("build_compile_context")
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
     )
     initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
     initial_path.write_text(initial_source, encoding="utf-8")
+    record_harness_timing("initial_program")
     seed_trace_examples: list[dict[str, Any]] = []
     if cached_context is not None:
         print("OpenEvolve compile harness: reusing cached seed replay/context.", flush=True)
         _merge_cached_compile_context(context, cached_context, params)
+        record_harness_timing("merge_cached_context")
     else:
         print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
         context_collection_hints = _context_collection_seed_hints(initial_hints, params)
         reference = _evaluate_compile_hints(context, context_collection_hints, suppress_output=True)
+        record_harness_timing("seed_context_collection_replay")
         context["reference"] = {
             "final_latency_usec": reference.get("final_latency_usec"),
             "objective_cost_usec": reference.get(
@@ -2248,6 +2285,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                     _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
                     suppress_output=True,
                 )
+                record_harness_timing("sampled_seed_replay")
                 sampled_baseline = _placement_baseline_from_result(sampled_reference)
                 sampled_baseline["source"] = "sampled_initial_seed"
                 sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
@@ -2281,6 +2319,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             f"bootstraps={context['reference'].get('bootstrap_count')}.",
             flush=True,
         )
+        record_harness_timing("seed_trace_examples")
     context["unit_hotspots"] = _unit_hotspots_from_profile(
         context.get("placement_units", []),
         context.get("placement_profile", []),
@@ -2290,6 +2329,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             seed_trace_examples
         )
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    record_harness_timing("write_context_before_policy_bank")
     policy_bank = _run_compile_policy_bank_prepass(
         context_path,
         context,
@@ -2297,6 +2337,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         output_dir,
         params,
     )
+    record_harness_timing("policy_bank_prepass")
     if policy_bank.get("initial_hints") is not None:
         # A sampled policy-bank winner is a better latency reference and prompt
         # example, but it can be too broad for OpenEvolve's required initial
@@ -2355,6 +2396,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initial_path.write_text(initial_source, encoding="utf-8")
     evaluator_path.write_text(_compile_evaluator_source(context_path), encoding="utf-8")
+    record_harness_timing("write_evaluator")
     print(
         "OpenEvolve compile harness: starting evolution "
         f"iterations={params.openevolve_iterations} "
@@ -2398,14 +2440,17 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                     output_dir=str(output_dir),
                     cleanup=False,
                 )
+                record_harness_timing("run_evolution")
         except Exception as exc:
             if not params.openevolve_fail_open:
                 raise
             _write_recovery_summary(root, exc)
+            record_harness_timing("recover_after_evolution_failure")
             return _recover_compile_hints(output_dir, context, initial_hints, params)
         best_code = result.best_code
     best_program = root / "best_program.py"
     best_program.write_text(best_code, encoding="utf-8")
+    record_harness_timing("write_best_program")
     try:
         sampled_reject_reason = _sampled_best_invalid_reason(output_dir)
         if (
@@ -2419,6 +2464,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 fail_open=True,
                 selected_sampled_best=sampled_reject_reason is None,
             )
+            record_harness_timing("sampled_selection")
             return _bounded_fail_open_hints(initial_hints)
         if sampled_reject_reason is not None:
             _write_sampled_selection_summary(
@@ -2436,7 +2482,9 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 sampled_reject_reason,
             )
             if validated_policy_bank is not None:
+                record_harness_timing("validated_policy_bank")
                 return validated_policy_bank
+            record_harness_timing("sampled_reject_fail_open")
             return _bounded_fail_open_hints(initial_hints)
         finalist_hints = _run_full_bundle_finalists(
             root,
@@ -2447,12 +2495,15 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             initial_hints,
         )
         if finalist_hints is not None:
+            record_harness_timing("full_bundle_finalists")
             return finalist_hints
+        record_harness_timing("load_best_candidate")
         return _load_candidate_hints(best_program, context)
     except Exception as exc:
         if not params.openevolve_fail_open:
             raise
         _write_recovery_summary(root, exc)
+        record_harness_timing("recover_after_selection_failure")
         return _recover_compile_hints(output_dir, context, initial_hints, params, best_code)
     finally:
         if not params.openevolve_keep_workdir and params.openevolve_output_dir is None:
@@ -4871,6 +4922,16 @@ def evaluate_compile_candidate_program(
                 "sampled_task_solve_max_sec": float(
                     result.get("sampled_task_solve_max_sec", 0.0)
                 ),
+                "compile_replay_solve_partition_sec": float(
+                    result.get("diagnostics", {})
+                    .get("compile_replay_timing_sec", {})
+                    .get("solve_partition", 0.0)
+                ),
+                "compile_replay_total_sec": float(
+                    result.get("diagnostics", {})
+                    .get("compile_replay_timing_sec", {})
+                    .get("total", 0.0)
+                ),
                 "fallback_selected_budgets": float(result["fallback_selected_budgets"]),
                 "requested_boundary_groups": float(requested_groups),
                 "solved_boundary_groups": float(solved_groups),
@@ -5066,6 +5127,10 @@ def evaluate_compile_candidate_program(
                     result["diagnostics"].get("sampled_task_timing_sec", {}),
                     sort_keys=True,
                 )[:4000],
+                "compile_replay_timing": json.dumps(
+                    result["diagnostics"].get("compile_replay_timing_sec", {}),
+                    sort_keys=True,
+                )[:4000],
                 "boundary_group_unsolved_summary": json.dumps(
                     _boundary_group_unsolved_summary(
                         result["diagnostics"].get("boundary_group_summaries", [])
@@ -5182,6 +5247,24 @@ def _evaluate_compile_hints(
     from .iterative_partition import solve_partition
     from .qbp_manager import QBPManager
 
+    timing_enabled = bool(context.get("harness", {}).get("timing_log_enabled", False))
+    timing_start = time.perf_counter()
+    timing_last = timing_start
+    replay_timings: dict[str, float] = {}
+
+    def mark_replay_timing(stage: str) -> None:
+        nonlocal timing_last
+        now = time.perf_counter()
+        replay_timings[stage] = float(now - timing_last)
+        timing_last = now
+        if timing_enabled:
+            print(
+                "OpenEvolve timing: full_replay "
+                f"{stage}={replay_timings[stage]:.3f}s "
+                f"total={float(now - timing_start):.3f}s",
+                flush=True,
+            )
+
     tdag = tdag_from_context(context)
     params = tdag.params
     params.openevolve_iterations = 0
@@ -5195,16 +5278,29 @@ def _evaluate_compile_hints(
     )
     le = LatencyEstimator(params)
     qbp_manager = QBPManager(params, le)
+    mark_replay_timing("setup")
     log_buffer = io.StringIO()
     start = time.time()
     try:
         stream = log_buffer if suppress_output else None
         try:
+            if timing_enabled:
+                print("OpenEvolve timing: full_replay solve_partition start", flush=True)
+            solve_start = time.perf_counter()
             if stream is None:
                 partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
             else:
                 with redirect_stdout(stream), redirect_stderr(stream):
                     partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+            replay_timings["solve_partition"] = float(time.perf_counter() - solve_start)
+            timing_last = time.perf_counter()
+            if timing_enabled:
+                print(
+                    "OpenEvolve timing: full_replay "
+                    f"solve_partition={replay_timings['solve_partition']:.3f}s "
+                    f"total={float(timing_last - timing_start):.3f}s",
+                    flush=True,
+                )
         except (AssertionError, RuntimeError) as exc:
             if params.bpsdepth is None or not _is_retryable_bypass_failure(exc):
                 raise
@@ -5220,11 +5316,26 @@ def _evaluate_compile_hints(
                 )
             params.bpsdepth = None
             qbp_manager = QBPManager(params, le)
+            if timing_enabled:
+                print(
+                    "OpenEvolve timing: full_replay retry_solve_partition start",
+                    flush=True,
+                )
+            solve_start = time.perf_counter()
             if stream is None:
                 partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
             else:
                 with redirect_stdout(stream), redirect_stderr(stream):
                     partition_result = solve_partition(tdag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
+            replay_timings["retry_solve_partition"] = float(time.perf_counter() - solve_start)
+            timing_last = time.perf_counter()
+            if timing_enabled:
+                print(
+                    "OpenEvolve timing: full_replay "
+                    f"retry_solve_partition={replay_timings['retry_solve_partition']:.3f}s "
+                    f"total={float(timing_last - timing_start):.3f}s",
+                    flush=True,
+                )
         if partition_result is None:
             raise PlacementError("compile replay produced no valid final partitioning")
         io_to_assign, io_to_cost = partition_result
@@ -5239,9 +5350,20 @@ def _evaluate_compile_hints(
         locations = _maintenance_locations(assign)
         reserve_summary = _assignment_reserve_summary(assign, tdag, params)
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
+        mark_replay_timing("collect_diagnostics")
         requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
         scored_groups = _scored_boundary_group_count(diagnostics)
         final_latency_usec = float(estimate_assign(assign, le))
+        mark_replay_timing("estimate_final_assign")
+        sample_tasks = _sampled_budget_tasks_from_qbp_manager(
+            qbp_manager,
+            params,
+        )
+        mark_replay_timing("sampled_budget_task_export")
+        diagnostics["compile_replay_timing_sec"] = {
+            **replay_timings,
+            "total": float(time.perf_counter() - timing_start),
+        }
         return {
             "valid": True,
             "validity": 1.0,
@@ -5287,15 +5409,17 @@ def _evaluate_compile_hints(
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
             "diagnostics": diagnostics,
-            "sampled_budget_tasks": _sampled_budget_tasks_from_qbp_manager(
-                qbp_manager,
-                params,
-            ),
+            "sampled_budget_tasks": sample_tasks,
             "log_tail": log_buffer.getvalue()[-3000:],
         }
     except Exception as exc:
         tb = traceback.format_exc()
         diagnostics = _collect_qbp_diagnostics(qbp_manager)
+        replay_timings["exception_total"] = float(time.perf_counter() - timing_start)
+        diagnostics["compile_replay_timing_sec"] = {
+            **replay_timings,
+            "total": float(time.perf_counter() - timing_start),
+        }
         assignments = list(diagnostics.get("assignments", []))
         if (
             eval_suite != "polybert-full"

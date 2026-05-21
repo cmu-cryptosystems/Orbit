@@ -1509,9 +1509,11 @@ def _run_compile_policy_bank_prepass(
         flush=True,
     )
     for idx, (label, hints) in enumerate(variants):
+        eval_hints = dict(hints)
+        eval_hints["policy_bank_lightweight"] = True
         program_path = bank_dir / f"{idx:02d}_{_safe_filename(label)}.py"
         program_path.write_text(
-            _program_source_from_hints(hints, f"Policy-bank candidate {label}."),
+            _program_source_from_hints(eval_hints, f"Policy-bank candidate {label}."),
             encoding="utf-8",
         )
         evaluation = evaluate_compile_candidate_program(context_path, program_path)
@@ -4612,6 +4614,7 @@ def _action_effect_score(diagnostics: dict[str, Any]) -> float:
 def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     bounded = _with_default_policy(hints)
     portfolio = bounded.pop("portfolio", None)
+    policy_bank_lightweight = _bool_hint(bounded.pop("policy_bank_lightweight", False), False)
     budget_aggressive = _bool_hint(bounded.get("budget_aggressive"), False)
     mcts_broad = str(bounded.get("strategy")) == "bootstrap_mcts"
     # Sampled evolution is intentionally lenient: failed direct candidate budgets
@@ -4622,24 +4625,30 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     bounded["allow_bootstrap"] = _bool_hint(bounded.get("allow_bootstrap"), budget_aggressive)
     bounded["refresh_fanout_at_level_floor"] = True
     bounded["max_scale_candidates"] = min(
-        32 if (budget_aggressive or mcts_broad) else 16,
+        16 if policy_bank_lightweight else (32 if (budget_aggressive or mcts_broad) else 16),
         _int_hint(
             bounded.get("max_scale_candidates"),
-            32 if mcts_broad else (20 if budget_aggressive else 16),
+            16
+            if policy_bank_lightweight
+            else (32 if mcts_broad else (20 if budget_aggressive else 16)),
         ),
     )
     bounded["state_cap_per_node"] = min(
-        24 if (budget_aggressive or mcts_broad) else 8,
+        8 if policy_bank_lightweight else (24 if (budget_aggressive or mcts_broad) else 8),
         _int_hint(
             bounded.get("state_cap_per_node"),
-            24 if mcts_broad else (12 if budget_aggressive else 8),
+            8
+            if policy_bank_lightweight
+            else (24 if mcts_broad else (12 if budget_aggressive else 8)),
         ),
     )
     bounded["beam_width"] = min(
-        8 if (budget_aggressive or mcts_broad) else 4,
+        4 if policy_bank_lightweight else (8 if (budget_aggressive or mcts_broad) else 4),
         _int_hint(
             bounded.get("beam_width"),
-            8 if mcts_broad else (5 if budget_aggressive else 4),
+            4
+            if policy_bank_lightweight
+            else (8 if mcts_broad else (5 if budget_aggressive else 4)),
         ),
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
@@ -4648,23 +4657,32 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 bounded.get("mcts_actions")
             )
         bounded["mcts_rollout_budget"] = min(
-            12 if budget_aggressive else 8,
-            _int_hint(bounded.get("mcts_rollout_budget"), 12 if budget_aggressive else 8),
+            4 if policy_bank_lightweight else (12 if budget_aggressive else 8),
+            _int_hint(
+                bounded.get("mcts_rollout_budget"),
+                4 if policy_bank_lightweight else (12 if budget_aggressive else 8),
+            ),
         )
         bounded["mcts_action_cap"] = min(
-            10 if budget_aggressive else 6,
-            _int_hint(bounded.get("mcts_action_cap"), 10 if budget_aggressive else 6),
+            2 if policy_bank_lightweight else (10 if budget_aggressive else 6),
+            _int_hint(
+                bounded.get("mcts_action_cap"),
+                2 if policy_bank_lightweight else (10 if budget_aggressive else 6),
+            ),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
-            64 if budget_aggressive else 16,
+            4 if policy_bank_lightweight else (64 if budget_aggressive else 16),
             _int_hint(
                 bounded.get("mcts_max_repair_bootstraps"),
-                64 if budget_aggressive else 16,
+                4 if policy_bank_lightweight else (64 if budget_aggressive else 16),
             ),
         )
         bounded["boundary_state_cap"] = min(
-            8 if budget_aggressive else 6,
-            _int_hint(bounded.get("boundary_state_cap"), 8 if budget_aggressive else 6),
+            2 if policy_bank_lightweight else (8 if budget_aggressive else 6),
+            _int_hint(
+                bounded.get("boundary_state_cap"),
+                2 if policy_bank_lightweight else (8 if budget_aggressive else 6),
+            ),
         )
     if isinstance(portfolio, list) and portfolio:
         sampled_portfolio = [

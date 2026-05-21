@@ -1314,6 +1314,11 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
     assert captured["mcts_action_cap"] <= 4
     assert captured["mcts_max_repair_bootstraps"] <= 32
     assert captured["boundary_state_cap"] == 8
+    assert result["metrics"]["timing_load_candidate_sec"] >= 0.0
+    assert result["metrics"]["timing_evaluate_compile_hints_sec"] >= 0.0
+    assert result["metrics"]["timing_total_sec"] >= result["metrics"]["timing_context_load_sec"]
+    timing_artifact = json.loads(result["artifacts"]["component_timing"])
+    assert timing_artifact["evaluate_compile_hints_sec"] >= 0.0
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(

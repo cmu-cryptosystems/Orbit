@@ -4514,23 +4514,60 @@ def _safe_filename(value: str) -> str:
 def evaluate_compile_candidate_program(
     context_path: str | Path, program_path: str | Path
 ) -> dict[str, Any]:
+    total_start = time.perf_counter()
+    last_mark = total_start
+    timings: dict[str, float] = {}
+
+    def mark_timing(name: str) -> None:
+        nonlocal last_mark
+        now = time.perf_counter()
+        timings[name] = float(now - last_mark)
+        last_mark = now
+
+    def attach_timings(evaluation: dict[str, Any]) -> dict[str, Any]:
+        timings["total"] = float(time.perf_counter() - total_start)
+        metrics = evaluation.setdefault("metrics", {})
+        for key, value in timings.items():
+            metrics[f"timing_{key}_sec"] = float(value)
+        artifacts = evaluation.setdefault("artifacts", {})
+        artifacts["component_timing"] = json.dumps(
+            {f"{key}_sec": float(value) for key, value in sorted(timings.items())},
+            sort_keys=True,
+        )
+        return evaluation
+
     context = json.loads(Path(context_path).read_text(encoding="utf-8"))
+    mark_timing("context_load")
     try:
         hints = _load_candidate_hints(Path(program_path), context)
+        mark_timing("load_candidate")
         static = _static_validate_hints(context, hints)
+        mark_timing("static_validate")
         if not static["valid"]:
             result = _invalid_compile_result("compile_static_gate", static["reasons"])
+            attach_timings(result)
+            trace_start = time.perf_counter()
             _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
+            timings["record_trace"] = float(time.perf_counter() - trace_start)
+            attach_timings(result)
             return result
         sampled_reasons = _sampled_policy_static_reasons(context, hints)
+        mark_timing("sampled_static_gate")
         if sampled_reasons:
             result = _invalid_compile_result("compile_sampled_policy_gate", sampled_reasons)
+            attach_timings(result)
+            trace_start = time.perf_counter()
             _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
+            timings["record_trace"] = float(time.perf_counter() - trace_start)
+            attach_timings(result)
             return result
         eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
         eval_hints = _compile_hints_for_eval_suite(hints, eval_suite)
+        mark_timing("compile_hints")
         policy_effect = _policy_effect_summary(context, hints, eval_hints, eval_suite)
+        mark_timing("policy_effect")
         result = _evaluate_compile_hints(context, eval_hints, suppress_output=True)
+        mark_timing("evaluate_compile_hints")
         result["static"] = static
         diagnostics = result.get("diagnostics", {})
         requested_budgets = max(1, int(diagnostics.get("requested_budgets", 1)))
@@ -4652,6 +4689,7 @@ def evaluate_compile_candidate_program(
             correct=bool(correctness_gate["correct"]),
             correctness_gate=correctness_gate,
         )
+        mark_timing("metrics_scoring")
         quality_score = (
             0.35 * latency_score
             + 0.08 * bootstrap_score
@@ -4692,6 +4730,7 @@ def evaluate_compile_candidate_program(
             scale_floor_summary,
             correctness_gate,
         )
+        mark_timing("execution_trace")
         candidate_artifacts = _maybe_write_candidate_mlir_artifacts(
             context,
             Path(program_path),
@@ -4701,6 +4740,7 @@ def evaluate_compile_candidate_program(
             correctness_gate,
             execution_trace,
         )
+        mark_timing("candidate_artifacts")
         if not str(candidate_artifacts.get("mlir_preview", "")).strip():
             trace_preview = _mlir_trace_preview_from_result(result, diagnostics)
             candidate_artifacts = dict(candidate_artifacts)
@@ -4722,6 +4762,7 @@ def evaluate_compile_candidate_program(
             effective_path,
             candidate_trace_features,
         )
+        mark_timing("trace_features_feedback")
         evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
@@ -4818,6 +4859,18 @@ def evaluate_compile_candidate_program(
                 ),
                 "profile_risk": float(result["profile_risk"]),
                 "placement_runtime_sec": float(result["placement_runtime_sec"]),
+                "sampled_task_total_runtime_sec": float(
+                    result.get("sampled_task_total_runtime_sec", 0.0)
+                ),
+                "sampled_task_max_runtime_sec": float(
+                    result.get("sampled_task_max_runtime_sec", 0.0)
+                ),
+                "sampled_task_solve_total_sec": float(
+                    result.get("sampled_task_solve_total_sec", 0.0)
+                ),
+                "sampled_task_solve_max_sec": float(
+                    result.get("sampled_task_solve_max_sec", 0.0)
+                ),
                 "fallback_selected_budgets": float(result["fallback_selected_budgets"]),
                 "requested_boundary_groups": float(requested_groups),
                 "solved_boundary_groups": float(solved_groups),
@@ -5009,6 +5062,10 @@ def evaluate_compile_candidate_program(
                     result["diagnostics"].get("boundary_group_count_summary", {}),
                     sort_keys=True,
                 ),
+                "sampled_task_timing": json.dumps(
+                    result["diagnostics"].get("sampled_task_timing_sec", {}),
+                    sort_keys=True,
+                )[:4000],
                 "boundary_group_unsolved_summary": json.dumps(
                     _boundary_group_unsolved_summary(
                         result["diagnostics"].get("boundary_group_summaries", [])
@@ -5054,11 +5111,16 @@ def evaluate_compile_candidate_program(
                 "execution_trace": json.dumps(execution_trace, sort_keys=True)[:12000],
             },
         }
+        attach_timings(evaluation)
+        trace_start = time.perf_counter()
         _record_compile_trace(context, Path(program_path), eval_hints, evaluation, "CLEAR_ONLY")
+        timings["record_trace"] = float(time.perf_counter() - trace_start)
+        attach_timings(evaluation)
         return evaluation
     except Exception as exc:
         tb = traceback.format_exc()
-        return {
+        mark_timing("exception")
+        return attach_timings({
             "metrics": {
                 "combined_score": 0.0,
                 "validity": 0.0,
@@ -5103,7 +5165,7 @@ def evaluate_compile_candidate_program(
                     sort_keys=True,
                 ),
             },
-        }
+        })
 
 
 def _evaluate_compile_hints(
@@ -5548,8 +5610,15 @@ def _evenly_spaced_items(items: list[Any], limit: int) -> list[Any]:
 def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str]) -> dict[str, Any]:
     task_context, eval_hints, eval_suite = payload
     log_buffer = io.StringIO()
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def elapsed_since(start: float) -> float:
+        return float(time.perf_counter() - start)
+
     try:
         with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+            stage_start = time.perf_counter()
             task_tdag = tdag_from_context(task_context)
             task_params = task_tdag.params
             task_params.openevolve_iterations = 0
@@ -5558,21 +5627,28 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
             task_params.openevolve_evaluating_candidate = True
             task_params.openevolve_eval_suite = eval_suite
             _apply_active_scale_floor_from_hints(task_params, eval_hints)
+            timings["deserialize_context"] = elapsed_since(stage_start)
+            stage_start = time.perf_counter()
             task_le = LatencyEstimator(task_params)
+            timings["latency_estimator"] = elapsed_since(stage_start)
+            stage_start = time.perf_counter()
             budgets = [
                 _io_budget_from_json(item)
                 for item in task_context.get("io_budgets", [])
                 if isinstance(item, dict)
             ]
+            timings["budget_parse"] = elapsed_since(stage_start)
             if not budgets:
+                timings["total"] = elapsed_since(total_start)
                 return {
                     "task_context": task_context,
-                    "diagnostics": {},
+                    "diagnostics": {"sampled_task_timing_sec": timings},
                     "assignments": [],
                     "costs": [],
                     "log_tail": log_buffer.getvalue()[-2000:],
                 }
             task_diag: dict[str, Any] = {}
+            stage_start = time.perf_counter()
             solve_budget_batch(
                 task_tdag,
                 budgets,
@@ -5581,13 +5657,18 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
                 eval_hints,
                 task_diag,
             )
+            timings["solve_budget_batch"] = elapsed_since(stage_start)
+        stage_start = time.perf_counter()
         assignments = [
             _serialize_assign(assign)
             for assign in task_diag.get("assignments", [])
             if isinstance(assign, Assign)
         ]
+        timings["serialize_assignments"] = elapsed_since(stage_start)
+        timings["total"] = elapsed_since(total_start)
         diagnostics = dict(task_diag)
         diagnostics.pop("assignments", None)
+        diagnostics["sampled_task_timing_sec"] = timings
         return {
             "task_context": task_context,
             "diagnostics": diagnostics,
@@ -5596,11 +5677,13 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
             "log_tail": log_buffer.getvalue()[-2000:],
         }
     except Exception as exc:
+        timings["total"] = elapsed_since(total_start)
         return {
             "task_context": task_context,
             "diagnostics": {
                 "invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1},
                 "traceback": traceback.format_exc()[-3000:],
+                "sampled_task_timing_sec": timings,
             },
             "assignments": [],
             "costs": [],
@@ -5664,6 +5747,9 @@ def _evaluate_sampled_budget_tasks(
     best_assign: Assign | None = None
     best_cost = float("inf")
     best_task_context: dict[str, Any] | None = None
+    task_timing_totals: dict[str, float] = {}
+    task_timing_max: dict[str, float] = {}
+    task_timing_rows: list[dict[str, Any]] = []
     log_buffer = io.StringIO()
     stdout_context = redirect_stdout(log_buffer) if suppress_output else nullcontext()
     stderr_context = redirect_stderr(log_buffer) if suppress_output else nullcontext()
@@ -5720,6 +5806,29 @@ def _evaluate_sampled_budget_tasks(
                 if not task_diag:
                     continue
                 total["sampled_task_count"] += 1
+                task_timing = task_diag.get("sampled_task_timing_sec", {})
+                if isinstance(task_timing, dict):
+                    normalized_timing = {
+                        str(name): float(value)
+                        for name, value in task_timing.items()
+                        if isinstance(value, (int, float))
+                    }
+                    for name, value in normalized_timing.items():
+                        task_timing_totals[name] = task_timing_totals.get(name, 0.0) + value
+                        task_timing_max[name] = max(task_timing_max.get(name, 0.0), value)
+                    task_timing_rows.append(
+                        {
+                            "task_index": len(task_timing_rows),
+                            "total_sec": float(normalized_timing.get("total", 0.0)),
+                            "solve_budget_batch_sec": float(
+                                normalized_timing.get("solve_budget_batch", 0.0)
+                            ),
+                            "requested_budgets": int(task_diag.get("requested_budgets", 0)),
+                            "requested_boundary_groups": int(
+                                task_diag.get("requested_boundary_groups", 0)
+                            ),
+                        }
+                    )
                 for key in (
                     "requested_budgets",
                     "solved_budgets",
@@ -5777,6 +5886,21 @@ def _evaluate_sampled_budget_tasks(
         )
         total["assignment_count_summary"] = count_summary
         total["boundary_group_count_summary"] = group_summary
+        task_timing_top = sorted(
+            task_timing_rows,
+            key=lambda item: float(item.get("total_sec", 0.0)),
+            reverse=True,
+        )[:8]
+        task_count = max(1, len(task_timing_rows))
+        total["sampled_task_timing_sec"] = {
+            "totals": task_timing_totals,
+            "max": task_timing_max,
+            "avg": {
+                name: float(value / task_count)
+                for name, value in task_timing_totals.items()
+            },
+            "top_slow_tasks": task_timing_top,
+        }
         sampled_avg_bootstrap_count = (
             group_summary["frontier_bootstrap"]
             if group_summary["boundary_group_count"]
@@ -5842,6 +5966,14 @@ def _evaluate_sampled_budget_tasks(
             "boundary_quality": 0.0,
             "profile_risk": float(_profile_risk(assignments, params)) if assignments else 1.0,
             "placement_runtime_sec": time.time() - start,
+            "sampled_task_total_runtime_sec": float(task_timing_totals.get("total", 0.0)),
+            "sampled_task_max_runtime_sec": float(task_timing_max.get("total", 0.0)),
+            "sampled_task_solve_total_sec": float(
+                task_timing_totals.get("solve_budget_batch", 0.0)
+            ),
+            "sampled_task_solve_max_sec": float(
+                task_timing_max.get("solve_budget_batch", 0.0)
+            ),
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
             "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
@@ -5878,6 +6010,14 @@ def _evaluate_sampled_budget_tasks(
             "boundary_quality": 0.0,
             "profile_risk": 1.0,
             "placement_runtime_sec": time.time() - start,
+            "sampled_task_total_runtime_sec": float(task_timing_totals.get("total", 0.0)),
+            "sampled_task_max_runtime_sec": float(task_timing_max.get("total", 0.0)),
+            "sampled_task_solve_total_sec": float(
+                task_timing_totals.get("solve_budget_batch", 0.0)
+            ),
+            "sampled_task_solve_max_sec": float(
+                task_timing_max.get("solve_budget_batch", 0.0)
+            ),
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
             "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),

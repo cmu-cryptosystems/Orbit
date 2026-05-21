@@ -3651,8 +3651,25 @@ def _seed_mlir_trace_examples(
         correctness_gate,
         execution_trace,
     )
-    if not bool(artifacts.get("written", False)):
-        return []
+    if bool(artifacts.get("written", False)):
+        mlir_digest = str(artifacts.get("mlir_digest", ""))
+        mlir_path = str(artifacts.get("mlir_path", ""))
+        mlir_preview = str(artifacts.get("mlir_preview", ""))[:2500]
+        execution_trace_path = str(artifacts.get("execution_trace_path", ""))
+        artifact_reason = ""
+    else:
+        mlir_preview = _mlir_trace_preview_from_result(result, diagnostics)
+        mlir_digest = hashlib.sha256(mlir_preview.encode("utf-8")).hexdigest()
+        mlir_path = ""
+        execution_trace_path = ""
+        artifact_reason = str(artifacts.get("reason", "mlir_artifact_not_written"))
+    context.setdefault("harness", {})["seed_mlir_trace_summary"] = {
+        "written": bool(artifacts.get("written", False)),
+        "reason": artifact_reason,
+        "candidate_mlir_digest": mlir_digest,
+        "candidate_mlir_path": mlir_path,
+        "mlir_preview_bytes": len(mlir_preview.encode("utf-8")),
+    }
     return [
         {
             "kind": "seed_mlir_trace_reference",
@@ -3664,14 +3681,66 @@ def _seed_mlir_trace_examples(
             "selected_path_digest": selected_path_digest[:24],
             "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
             "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
-            "candidate_mlir_digest": str(artifacts.get("mlir_digest", "")),
-            "candidate_mlir_path": str(artifacts.get("mlir_path", "")),
-            "candidate_mlir_preview": str(artifacts.get("mlir_preview", ""))[:2500],
-            "execution_trace_path": str(artifacts.get("execution_trace_path", "")),
+            "candidate_mlir_digest": mlir_digest,
+            "candidate_mlir_path": mlir_path,
+            "candidate_mlir_preview": mlir_preview[:2500],
+            "candidate_mlir_artifact_reason": artifact_reason,
+            "execution_trace_path": execution_trace_path,
             "why_it_lost": "seed_reference_for_latency_and_trace_comparison",
             "top_costly_boundary_groups": execution_trace["top_costly_boundary_groups"][:4],
         }
     ]
+
+
+def _mlir_trace_preview_from_result(
+    result: dict[str, Any],
+    diagnostics: dict[str, Any],
+    *,
+    limit: int = 80,
+) -> str:
+    """Build a compact MLIR-like placement trace when full MLIR emission fails."""
+
+    lines = [
+        'module attributes {orbit.trace = "placement"} {',
+        f'  // objective_cost_usec = {_finite_float(result.get("objective_cost_usec"), 0.0):.3f}',
+        f'  // selected_path_digest = {str(result.get("sampled_selected_path_digest", ""))[:32]}',
+        f'  // bootstrap_count = {_finite_float(result.get("bootstrap_count"), 0.0):.3f}',
+        f'  // rescale_count = {_finite_float(result.get("rescale_count"), 0.0):.3f}',
+    ]
+
+    def add_locations(kind: str, locations: Any) -> None:
+        if not isinstance(locations, dict):
+            return
+        count = 0
+        for node, attrs in sorted(locations.items(), key=lambda item: str(item[0])):
+            if count >= limit:
+                lines.append(f"  // {kind}: truncated")
+                return
+            if isinstance(attrs, dict):
+                level = attrs.get("level", attrs.get("lvl", ""))
+                scale = attrs.get("scale", attrs.get("scl", ""))
+            else:
+                level = ""
+                scale = ""
+            node_text = str(node).replace('"', '\\"')[:160]
+            lines.append(
+                f'  "orbit.trace.{kind}"() '
+                f'{{node = "{node_text}", level = "{level}", scale = "{scale}"}} : () -> ()'
+            )
+            count += 1
+
+    add_locations("bootstrap", result.get("bootstrap_locations", {}))
+    add_locations("rescale", result.get("rescale_locations", {}))
+    source_counts = diagnostics.get("selected_source_counts", {})
+    if isinstance(source_counts, dict) and source_counts:
+        for source, count in sorted(source_counts.items(), key=lambda item: str(item[0]))[:24]:
+            source_text = str(source).replace('"', '\\"')[:160]
+            lines.append(
+                f'  "orbit.trace.selected_source"() '
+                f'{{source = "{source_text}", count = {int(count or 0)}}} : () -> ()'
+            )
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 def _policy_bank_loss_reason(item: dict[str, Any]) -> str:

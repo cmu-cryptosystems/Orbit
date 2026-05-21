@@ -1492,6 +1492,20 @@ def _run_compile_policy_bank_prepass(
     output_dir: Path,
     params: Params,
 ) -> dict[str, Any]:
+    if os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return {
+            "examples": [],
+            "summary": {
+                "enabled": False,
+                "reason": "disabled_by_default_for_positive_evolution",
+            },
+            "initial_hints": None,
+        }
     if (
         params.openevolve_iterations <= 0
         or getattr(params, "openevolve_reuse_output", False)

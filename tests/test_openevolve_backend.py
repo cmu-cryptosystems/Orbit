@@ -5699,6 +5699,34 @@ def test_historical_context_reuse_falls_back_when_min_tasks_missing(
     assert loaded[1] == path
 
 
+def test_historical_context_selection_prefers_nontrivial_context(monkeypatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_CONTEXT_HISTORY_MIN_TASKS", "8")
+    cached = {
+        "reference": {"sampled_dp_latency_usec": 50.0},
+        "sampled_budget_tasks": [{}],
+    }
+    historical = {
+        "reference": {"sampled_dp_latency_usec": 100.0},
+        "sampled_budget_tasks": [{} for _ in range(8)],
+    }
+
+    assert oe_backend._should_use_historical_context(cached, historical)
+
+
+def test_historical_context_selection_keeps_nontrivial_cached(monkeypatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_CONTEXT_HISTORY_MIN_TASKS", "8")
+    cached = {
+        "reference": {"sampled_dp_latency_usec": 50.0},
+        "sampled_budget_tasks": [{} for _ in range(8)],
+    }
+    historical = {
+        "reference": {"sampled_dp_latency_usec": 100.0},
+        "sampled_budget_tasks": [{} for _ in range(8)],
+    }
+
+    assert not oe_backend._should_use_historical_context(cached, historical)
+
+
 def test_cached_context_reference_latency_prefers_sampled_objective(
     toy_cost_json: str,
 ):

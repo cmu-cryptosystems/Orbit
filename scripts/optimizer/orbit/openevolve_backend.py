@@ -2307,6 +2307,31 @@ def _cached_context_reference_latency(cached: dict[str, Any] | None) -> float:
     return latency if math.isfinite(latency) and latency > 0 else float("inf")
 
 
+def _cached_context_sampled_task_count(cached: dict[str, Any] | None) -> int:
+    if not isinstance(cached, dict):
+        return 0
+    tasks = cached.get("sampled_budget_tasks")
+    return len(tasks) if isinstance(tasks, list) else 0
+
+
+def _should_use_historical_context(
+    cached_context: dict[str, Any] | None,
+    historical_context: dict[str, Any],
+) -> bool:
+    if cached_context is None:
+        return True
+    min_tasks = _historical_context_min_tasks()
+    cached_tasks = _cached_context_sampled_task_count(cached_context)
+    historical_tasks = _cached_context_sampled_task_count(historical_context)
+    if historical_tasks >= min_tasks and cached_tasks < min_tasks:
+        return True
+    if cached_tasks >= min_tasks and historical_tasks < min_tasks:
+        return False
+    return _cached_context_reference_latency(historical_context) < _cached_context_reference_latency(
+        cached_context
+    )
+
+
 def _load_historical_compile_context(
     stable_context_path: Path | None,
     dag: Tdag,
@@ -2572,18 +2597,23 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             historical_context, historical_path = historical
             historical_latency = _cached_context_reference_latency(historical_context)
             cached_latency = _cached_context_reference_latency(cached_context)
-            if cached_context is None or historical_latency < cached_latency:
+            historical_tasks = _cached_context_sampled_task_count(historical_context)
+            cached_tasks = _cached_context_sampled_task_count(cached_context)
+            if _should_use_historical_context(cached_context, historical_context):
                 cached_context = historical_context
                 cache_source = f"history:{historical_path}"
                 print(
                     "OpenEvolve compile harness: selected historical sampled context "
-                    f"{historical_path} latency={historical_latency}.",
+                    f"{historical_path} latency={historical_latency} "
+                    f"tasks={historical_tasks}.",
                     flush=True,
                 )
             else:
                 print(
                     "OpenEvolve compile harness: keeping cached context over historical "
-                    f"latency={cached_latency} historical_latency={historical_latency}.",
+                    f"latency={cached_latency} tasks={cached_tasks} "
+                    f"historical_latency={historical_latency} "
+                    f"historical_tasks={historical_tasks}.",
                     flush=True,
                 )
     initial_source = _initial_compile_program_source(

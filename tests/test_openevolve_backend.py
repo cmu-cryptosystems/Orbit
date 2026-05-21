@@ -769,46 +769,36 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
-    assert hints["include_seed_repair_actions"] is True
-    assert hints["mcts_rollout_budget"] == 16
-    assert hints["mcts_action_cap"] == 10
-    assert hints["mcts_action_allowlist"] == [
-        "budget_fulfillment_beam",
-        "wide_boundary_cost_beam",
-        "dense_boundary_cost_beam",
-        "latency_mcts_repair",
-    ]
+    assert hints["include_seed_repair_actions"] is False
+    assert hints["mcts_rollout_budget"] == 24
+    assert hints["mcts_action_cap"] == 12
+    assert "budget_fulfillment_beam" in hints["mcts_action_allowlist"]
+    assert "wide_boundary_cost_beam" in hints["mcts_action_allowlist"]
+    assert "dense_boundary_cost_beam" in hints["mcts_action_allowlist"]
     assert hints["mcts_exploration_weight"] == 1.25
     assert hints["mcts_max_repair_bootstraps"] == 128
     assert hints["boundary_group_policies"] == []
-    raw_budget_beams = [
-        action for action in hints["mcts_actions"] if action.get("name") == "budget_fulfillment_beam"
-    ]
-    assert raw_budget_beams
-    assert raw_budget_beams[0]["prior"] == 0.60
-    wide_beams = [
-        action for action in hints["mcts_actions"] if action.get("name") == "wide_boundary_cost_beam"
-    ]
-    assert wide_beams
     presets = hints["mcts_action_presets"]
-    assert presets["budget_fulfillment_beam"]["prior"] == 0.60
+    assert presets["budget_fulfillment_beam"]["prior"] == 0.62
     assert presets["budget_fulfillment_beam"]["policy"]["beam_width"] == 10
-    assert presets["budget_fulfillment_beam"]["policy"]["boundary_state_cap"] == 8
-    assert presets["wide_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 8
-    assert presets["wide_boundary_cost_beam"]["policy"]["max_scale_candidates"] == 48
-    assert presets["dense_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 16
+    assert presets["budget_fulfillment_beam"]["policy"]["boundary_state_cap"] == 10
+    assert presets["wide_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 10
+    assert presets["wide_boundary_cost_beam"]["policy"]["max_scale_candidates"] == 64
+    assert presets["dense_boundary_cost_beam"]["policy"]["boundary_state_cap"] == 18
     assert presets["dense_boundary_cost_beam"]["policy"]["direct_budget_policy"] is True
     capped_names = [
-        action["name"]
-        for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
+        action.name
+        for action in oe_backend._mcts_actions_from_hints(sampled, params)[
+            : sampled["mcts_action_cap"]
+        ]
     ]
     assert "budget_fulfillment_beam" in capped_names
     assert sampled["mcts_action_cap"] <= 10
-    assert set(hints["mcts_action_presets"]) == {
+    assert {
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
         "dense_boundary_cost_beam",
-    }
+    }.issubset(set(hints["mcts_action_presets"]))
 
 
 def test_mcts_action_presets_change_effective_action_policy(toy_cost_json: str):
@@ -894,6 +884,7 @@ def test_policy_effect_summary_detects_seed_equivalent_and_changed_preset(
     )
 
     initial_hints = oe_backend._load_candidate_hints(initial_path, context)
+    context["harness"]["initial_policy_hints"] = initial_hints
     changed_hints = oe_backend._load_candidate_hints(changed_path, context)
     initial_eval = oe_backend._compile_hints_for_eval_suite(initial_hints, "polybert-sampled")
     changed_eval = oe_backend._compile_hints_for_eval_suite(changed_hints, "polybert-sampled")
@@ -906,6 +897,32 @@ def test_policy_effect_summary_detects_seed_equivalent_and_changed_preset(
     assert changed_effect["seed_equivalent"] is False
     assert changed_effect["effect_score"] > 0.0
     assert "component_budget_repair" in changed_effect["changed_actions"]
+
+
+def test_policy_effect_summary_uses_active_policy_bank_seed(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    active_seed = {
+        "strategy": "bootstrap_mcts",
+        "mcts_action_cap": 7,
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": params.lvl_ub, "in_scl": params.Sw},
+                "policy": {"boundary_state_cap": 9},
+            }
+        ],
+    }
+    context["harness"]["initial_policy_hints"] = active_seed
+
+    effect = oe_backend._policy_effect_summary(
+        context,
+        active_seed,
+        oe_backend._compile_hints_for_eval_suite(active_seed, "polybert-sampled"),
+        "polybert-sampled",
+    )
+
+    assert effect["seed_equivalent"] is True
+    assert effect["effect_score"] == 0.0
 
 
 def test_compile_score_does_not_let_seed_equivalent_policy_dominate(
@@ -2925,7 +2942,7 @@ def test_placement_mcts_boundary_group_policy_defaults_to_direct_latency_beam():
     assert policy["max_scale_candidates"] == 80
 
 
-def test_initial_compile_seed_mentions_trace_without_forcing_boundary_group_policies(
+def test_initial_compile_seed_uses_trace_cost_boundary_group_policies(
     toy_cost_json: str, tmp_path: Path
 ):
     params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
@@ -2963,7 +2980,8 @@ def test_initial_compile_seed_mentions_trace_without_forcing_boundary_group_poli
     hints = oe_backend._load_candidate_hints(program_path, context)
 
     assert "top_costly_boundary_groups" in source
-    assert hints["boundary_group_policies"] == []
+    assert len(hints["boundary_group_policies"]) >= 1
+    assert hints["boundary_group_policies"][0]["selector"]["in_lvl"] == params.lvl_ub
     assert "budget_fulfillment_beam" in hints["mcts_action_allowlist"]
 
 
@@ -3069,6 +3087,36 @@ def test_mlir_trace_features_extracts_trace_ops_and_boundaries():
     assert features["trace_kind_counts"]["boundary_group"] == 1
     assert features["bootstrap_nodes"] == ["n1"]
     assert features["selected_source_counts"]["wide_boundary_cost_beam"] == 7
+
+
+def test_trace_learning_feedback_points_seed_clone_to_boundary_overlays():
+    feedback = oe_backend._trace_learning_feedback(
+        {"harness": {}},
+        {
+            "objective_cost_usec": 1000.0,
+            "reference_objective_cost_usec": 1000.0,
+            "base_objective_cost_usec": 1000.0,
+        },
+        {
+            "correct": True,
+            "objective_improved_vs_seed": False,
+        },
+        {
+            "selected_path_changed_vs_seed": False,
+            "selected_path_digest": "seed-path",
+        },
+        {
+            "trace_kind_counts": {"boundary_group": 2},
+            "selected_source_counts": {"budget_fulfillment_beam": 3},
+            "top_boundary_groups": [
+                {"key": {"in_lvl": 16, "in_scl": 40}, "min_cost_usec": 123.0}
+            ],
+        },
+    )
+
+    assert feedback["selected_path_changed_vs_seed"] is False
+    assert feedback["objective_improved_vs_seed"] is False
+    assert any("boundary_group_policies" in item for item in feedback["directives"])
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):
@@ -3435,9 +3483,16 @@ def test_unit_policy_shape_keeps_flat_policy_compatibility(toy_cost_json: str):
 def test_sparse_candidate_inherits_initial_mcts_presets(toy_cost_json: str):
     params = _params(toy_cost_json)
     context = build_context(_toy_pdag(params), [{"in_lvl": -1, "in_scl": 40}], params)
+    context.setdefault("harness", {})["leniency"] = "strict"
     context.setdefault("harness", {})["initial_policy_hints"] = {
         "strategy": "bootstrap_mcts",
         "boundary_scale_policy": "waterline",
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": 14, "in_scl": 40},
+                "policy": {"boundary_state_cap": 7},
+            }
+        ],
         "mcts_action_presets": {
             "budget_fulfillment_beam": {
                 "prior": 0.6,
@@ -3468,6 +3523,12 @@ def test_sparse_candidate_inherits_initial_mcts_presets(toy_cost_json: str):
     assert preset["policy"]["beam_width"] == 10
     assert preset["policy"]["boundary_scale_policy"] == "waterline"
     assert preset["policy"]["max_scale_candidates"] == 32
+    assert hints["boundary_group_policies"] == [
+        {
+            "selector": {"in_lvl": 14, "in_scl": 40},
+            "policy": {"boundary_state_cap": 7},
+        }
+    ]
     assert preset["policy"]["selection_objective"] == "cost"
 
 
@@ -4017,12 +4078,12 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
     )
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
-    assert slower_score == pytest.approx(-(1.0 - (1000.0 / 1001.0)))
+    assert slower_score == pytest.approx((1000.0 / 1001.0) * 0.25)
     assert equal_score == 1.0
     assert seed_equivalent_score == 0.0
     assert improved_score > 1.0
     assert seed_equivalent_improved_score == improved_score
-    assert slower_score < seed_equivalent_score < equal_score
+    assert seed_equivalent_score < slower_score < equal_score
     assert equal_score > slower_score
     assert improved_score > slower_score
     assert much_better_score > improved_score

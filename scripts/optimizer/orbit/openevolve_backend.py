@@ -517,110 +517,166 @@ def place(context):
     seed-equivalent changes are exploration examples, not winners.
     """
     mcts = PlacementMCTS(context)
-    actions = mcts.candidate_actions(action_cap=12)
-    reference_action_names = [
-        str(action.get("name"))
-        for action in actions
-        if str(action.get("name", "")) == "reference_boundary_cost_beam"
-    ]
+    actions = mcts.candidate_actions(action_cap=16)
+    available = {str(action.get("name", "")) for action in actions}
+    reference_action_names = sorted(
+        name for name in available if name == "reference_boundary_cost_beam"
+    )
+    relaxed_floor_action_names = sorted(
+        name for name in available if name.startswith("estimator_relaxed_floor_")
+    )
     active_action_names = [
-        "budget_fulfillment_beam",
-        "wide_boundary_cost_beam",
-        "dense_boundary_cost_beam",
-        *reference_action_names,
-        "latency_mcts_repair",
+        name
+        for name in [
+            "budget_fulfillment_beam",
+            "wide_boundary_cost_beam",
+            "waterline_cost_beam",
+            "dense_boundary_cost_beam",
+            "nonlinear_phase_boundary_beam",
+            *reference_action_names,
+            "profile_waterline_repair",
+            "tuneinsight_avgcase_cost_beam",
+            "tuneinsight_deferred_bootstrap_beam",
+            *relaxed_floor_action_names,
+            "latency_mcts_repair",
+            "component_budget_repair",
+        ]
+        if name in available
     ]
-    active_actions = [
-        action for action in actions if str(action.get("name", "")) in set(active_action_names)
-    ]
-    for action in active_actions:
-        name = str(action.get("name", ""))
-        if name == "budget_fulfillment_beam":
-            action["prior"] = 0.60
-        elif name == "wide_boundary_cost_beam":
-            action["prior"] = 0.40
-        elif name == "dense_boundary_cost_beam":
-            action["prior"] = 0.50
-        elif name == "latency_mcts_repair":
-            action["prior"] = 0.19
-        elif name in reference_action_names:
-            action["prior"] = 0.50
+    boundary_group_policies = []
+    for idx, group in enumerate(mcts.top_costly_boundary_groups(limit=6)):
+        if idx % 3 == 0:
+            boundary_group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=12,
+                max_scale_candidates=80,
+                boundary_scale_policy="frontier",
+                scale_lattice="waterline_sf",
+                bootstrap_penalty=35_000_000.0,
+                beam_width=10,
+                state_cap_per_node=48,
+            ))
+        elif idx % 3 == 1:
+            boundary_group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=8,
+                max_scale_candidates=64,
+                boundary_scale_policy="waterline",
+                scale_lattice="waterline_sf",
+                bootstrap_penalty=65_000_000.0,
+                beam_width=8,
+                state_cap_per_node=40,
+            ))
+        else:
+            boundary_group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=16,
+                max_scale_candidates=96,
+                boundary_scale_policy="frontier",
+                scale_lattice="dense",
+                bootstrap_penalty=25_000_000.0,
+                beam_width=12,
+                state_cap_per_node=48,
+            ))
     policy = {
+        "inherit_initial_policy": True,
         "strategy": "bootstrap_mcts",
-        "budget_aggressive": True,
-        "allow_seed_fallback": True,
-        "max_scale_candidates": 24,
-        "bootstrap_penalty": 25_000_000.0,
-        "reserve_penalty": 75_000.0,
-        "min_transition_reserve": 1,
-        "min_decryptability_reserve": 1,
-        "boundary_scale_policy": "waterline",
-        "boundary_group_policies": [],
-        "mcts_actions": active_actions,
         "mcts_action_allowlist": active_action_names,
-        "mcts_action_cap": 10,
-        "mcts_rollout_budget": 16,
+        "mcts_action_cap": 12,
+        "mcts_rollout_budget": 24,
         "mcts_exploration_weight": 1.25,
         "mcts_max_repair_bootstraps": 128,
         "mcts_prior_order": True,
-        "include_seed_repair_actions": True,
+        "include_seed_repair_actions": False,
         "selection_objective": "cost",
+        "boundary_group_policies": boundary_group_policies,
         "mcts_action_presets": mcts.action_presets(
             budget_fulfillment_beam={
-                "prior": 0.60,
+                "prior": 0.62,
                 "policy": {
                     "strategy": "latency_beam",
                     "beam_width": 10,
-                    "state_cap_per_node": 32,
-                    "boundary_state_cap": 8,
-                    "max_scale_candidates": 48,
-                    "bootstrap_penalty": 25_000_000.0,
-                    "rescale_penalty": 0.0,
-                    "level_drop_penalty": 20_000_000.0,
+                    "state_cap_per_node": 40,
+                    "boundary_state_cap": 10,
+                    "max_scale_candidates": 64,
+                    "bootstrap_penalty": 35_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
                     "direct_budget_policy": True,
                     "boundary_scale_policy": "waterline",
-                    "target_bootstrap_count": 0,
                 },
             },
             wide_boundary_cost_beam={
+                "prior": 0.46,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 40,
+                    "boundary_state_cap": 10,
+                    "max_scale_candidates": 64,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_penalty": 35_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                },
+            },
+            dense_boundary_cost_beam={
+                "prior": 0.52,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 12,
+                    "state_cap_per_node": 56,
+                    "boundary_state_cap": 18,
+                    "max_scale_candidates": 112,
+                    "scale_lattice": "dense",
+                    "boundary_scale_policy": "frontier",
+                    "bootstrap_penalty": 25_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                    "direct_budget_policy": True,
+                },
+            },
+            nonlinear_phase_boundary_beam={
                 "prior": 0.40,
                 "policy": {
                     "strategy": "latency_beam",
                     "beam_width": 10,
-                    "state_cap_per_node": 32,
-                    "boundary_state_cap": 8,
-                    "max_scale_candidates": 48,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
                     "boundary_scale_policy": "frontier",
-                    "bootstrap_penalty": 25_000_000.0,
-                    "rescale_penalty": 0.0,
-                    "level_drop_penalty": 20_000_000.0,
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 35_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
-                    "direct_budget_policy": True,
-                    "target_bootstrap_count": 0,
                 },
             },
-            dense_boundary_cost_beam={
-                "prior": 0.50,
+            tuneinsight_deferred_bootstrap_beam={
+                "prior": 0.30,
                 "policy": {
                     "strategy": "latency_beam",
-                    "beam_width": 10,
-                    "state_cap_per_node": 48,
-                    "boundary_state_cap": 16,
-                    "max_scale_candidates": 96,
-                    "scale_lattice": "dense",
                     "boundary_scale_policy": "frontier",
-                    "bootstrap_penalty": 25_000_000.0,
-                    "rescale_penalty": 0.0,
-                    "level_drop_penalty": 20_000_000.0,
+                    "scale_lattice": "waterline_sf",
+                    "boundary_state_cap": 10,
+                    "max_scale_candidates": 80,
+                    "state_cap_per_node": 40,
+                    "beam_width": 10,
+                    "noise_slack_model": "tuneinsight_avgcase",
+                    "reserve_penalty": 0.0,
+                    "min_transition_reserve": 0,
+                    "min_decryptability_reserve": 0,
+                    "bootstrap_penalty": 350_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
-                    "direct_budget_policy": True,
-                    "target_bootstrap_count": 0,
                 },
             },
             **{
                 name: {
-                    "prior": 0.50,
+                    "prior": 0.44,
                     "policy": {
                         "strategy": "latency_beam",
                         "beam_width": 10,
@@ -635,10 +691,32 @@ def place(context):
                         "selection_bootstrap_penalty": 0.0,
                         "selection_objective": "cost",
                         "direct_budget_policy": True,
-                        "target_bootstrap_count": 0,
                     },
                 }
                 for name in reference_action_names
+            },
+            **{
+                name: {
+                    "prior": 0.26,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "boundary_scale_policy": "frontier",
+                        "scale_lattice": "estimator_relaxed",
+                        "scale_floor_bits": int(name.rsplit("_", 1)[-1]),
+                        "boundary_state_cap": 8,
+                        "max_scale_candidates": 64,
+                        "state_cap_per_node": 32,
+                        "beam_width": 8,
+                        "noise_slack_model": "tuneinsight_avgcase",
+                        "reserve_penalty": 0.0,
+                        "min_transition_reserve": 0,
+                        "min_decryptability_reserve": 0,
+                        "bootstrap_penalty": 35_000_000.0,
+                        "selection_bootstrap_penalty": 0.0,
+                        "selection_objective": "cost",
+                    },
+                }
+                for name in relaxed_floor_action_names
             },
         ),
     }
@@ -2238,6 +2316,26 @@ def _policy_bank_full_validation_timeout_sec(params: Params) -> int:
     return max(60, min(1800, evaluator_timeout))
 
 
+def _policy_bank_prepass_timeout_sec(params: Params, variant_count: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_TIMEOUT_SEC", "").strip()
+    if raw:
+        try:
+            return max(30, int(float(raw)))
+        except ValueError:
+            pass
+    evaluator_timeout = int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180)
+    waves = max(
+        1,
+        math.ceil(
+            max(1, int(variant_count or 1))
+            / max(1, _policy_bank_worker_count(params, max(1, int(variant_count or 1))))
+        ),
+    )
+    # The policy bank is a seeding aid. A wedged variant should produce a
+    # timeout record and let OpenEvolve start, not block the whole compile.
+    return max(120, min(900, evaluator_timeout * waves + 30))
+
+
 def _mp_context():
     try:
         return multiprocessing.get_context("fork")
@@ -2529,26 +2627,55 @@ def _run_compile_policy_bank_prepass(
     else:
         qbp_worker_override = _policy_bank_qbp_worker_count(params, workers)
         with _temporary_qbp_worker_env(qbp_worker_override):
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                future_to_job = {
-                    executor.submit(
-                        _evaluate_policy_bank_program,
-                        str(context_path),
-                        str(program_path),
-                    ): (label, hints)
-                    for label, hints, program_path in jobs
-                }
-                for future in concurrent.futures.as_completed(future_to_job):
-                    label, hints = future_to_job[future]
-                    try:
-                        evaluation = future.result()
-                    except BaseException as exc:
-                        evaluation = _invalid_compile_result(
-                            "policy_bank_evaluator_exception",
-                            [f"{type(exc).__name__}: {str(exc)[:240]}"],
-                        )
-                        evaluation.setdefault("artifacts", {})["traceback"] = traceback.format_exc()[-4000:]
-                    consume_record(label, hints, evaluation)
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+            future_to_job = {
+                executor.submit(
+                    _evaluate_policy_bank_program,
+                    str(context_path),
+                    str(program_path),
+                ): (label, hints)
+                for label, hints, program_path in jobs
+            }
+            pending = set(future_to_job)
+            deadline = time.monotonic() + _policy_bank_prepass_timeout_sec(
+                params, len(future_to_job)
+            )
+            try:
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        for future in list(pending):
+                            label, hints = future_to_job[future]
+                            future.cancel()
+                            evaluation = _invalid_compile_result(
+                                "policy_bank_prepass_timeout",
+                                [f"policy-bank variant timed out: {label}"],
+                            )
+                            consume_record(label, hints, evaluation)
+                        pending.clear()
+                        break
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=min(5.0, max(0.1, remaining)),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+                    for future in done:
+                        label, hints = future_to_job[future]
+                        try:
+                            evaluation = future.result()
+                        except BaseException as exc:
+                            evaluation = _invalid_compile_result(
+                                "policy_bank_evaluator_exception",
+                                [f"{type(exc).__name__}: {str(exc)[:240]}"],
+                            )
+                            evaluation.setdefault("artifacts", {})[
+                                "traceback"
+                            ] = traceback.format_exc()[-4000:]
+                        consume_record(label, hints, evaluation)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
     summary = {
         "enabled": True,
         "variant_count": len(variants),
@@ -4039,6 +4166,70 @@ def _mlir_trace_features(
     }
 
 
+def _trace_learning_feedback(
+    context: dict[str, Any],
+    objective: dict[str, Any],
+    correctness_gate: dict[str, Any],
+    effective_path: dict[str, Any],
+    trace_features: dict[str, Any],
+) -> dict[str, Any]:
+    """Turn MLIR-like trace features into concrete next mutation guidance."""
+
+    cost = _finite_float(objective.get("objective_cost_usec"), float("inf"))
+    reference = _finite_float(objective.get("reference_objective_cost_usec"), float("inf"))
+    if not math.isfinite(reference) or reference <= 0:
+        reference = _finite_float(objective.get("base_objective_cost_usec"), float("inf"))
+    ratio = reference / cost if math.isfinite(reference) and math.isfinite(cost) and cost > 0 else 0.0
+    path_changed = bool(effective_path.get("selected_path_changed_vs_seed", False))
+    improved = bool(correctness_gate.get("objective_improved_vs_seed", False))
+    top_groups = list(trace_features.get("top_boundary_groups", []) or [])[:4]
+    selected_sources = dict(trace_features.get("selected_source_counts", {}) or {})
+    kind_counts = dict(trace_features.get("trace_kind_counts", {}) or {})
+    directives: list[str] = []
+    if not bool(correctness_gate.get("correct", False)):
+        directives.append(
+            "Reject this candidate: restore direct QBP coverage before optimizing latency."
+        )
+    elif improved:
+        directives.append(
+            "Keep this selected-path pattern and make small local mutations around the same boundary groups."
+        )
+    elif not path_changed:
+        directives.append(
+            "This is a seed-equivalent trace: mutate one costly boundary group overlay or action preset until selected_path_digest changes."
+        )
+    else:
+        directives.append(
+            "This path changed but is slower: use it only as an exploration trace and reduce the costly boundary groups before keeping the path."
+        )
+    if top_groups:
+        directives.append(
+            "Use the first top_boundary_groups selector as a boundary_group_policies entry; change boundary_scale_policy, scale_lattice, boundary_state_cap, or bootstrap_penalty for that group only."
+        )
+    if selected_sources:
+        directives.append(
+            "If selected_source_counts are unchanged from the seed, alter mcts_action_allowlist or a preset prior enough to change the selected source mix."
+        )
+    if kind_counts.get("bootstrap", 0) or kind_counts.get("rescale", 0):
+        directives.append(
+            "Compare orbit.trace.bootstrap/rescale node samples with the seed trace; avoid moves that add maintenance without reducing objective_cost_usec."
+        )
+    return {
+        "objective": "learn_from_mlir_trace_then_minimize_latency",
+        "objective_cost_usec": cost if math.isfinite(cost) else None,
+        "reference_objective_cost_usec": reference if math.isfinite(reference) else None,
+        "objective_cost_ratio_vs_seed": ratio,
+        "correct": bool(correctness_gate.get("correct", False)),
+        "objective_improved_vs_seed": improved,
+        "selected_path_changed_vs_seed": path_changed,
+        "selected_path_digest": str(effective_path.get("selected_path_digest", ""))[:32],
+        "trace_kind_counts": kind_counts,
+        "selected_source_counts": selected_sources,
+        "top_boundary_groups": top_groups,
+        "directives": directives[:6],
+    }
+
+
 def _trace_attr(line: str, name: str) -> str:
     marker = f'{name} = "'
     if marker not in line:
@@ -4290,6 +4481,13 @@ def evaluate_compile_candidate_program(
             result=result,
             diagnostics=diagnostics,
         )
+        trace_learning_feedback = _trace_learning_feedback(
+            context,
+            objective,
+            correctness_gate,
+            effective_path,
+            candidate_trace_features,
+        )
         evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
@@ -4527,6 +4725,9 @@ def evaluate_compile_candidate_program(
                 )[:TRACE_PREVIEW_CHARS],
                 "candidate_mlir_trace_features": json.dumps(
                     candidate_trace_features, sort_keys=True, default=str
+                )[:8000],
+                "trace_learning_feedback": json.dumps(
+                    trace_learning_feedback, sort_keys=True, default=str
                 )[:8000],
                 "noise_estimator": json.dumps(noise_estimate, sort_keys=True)[:4000],
                 "reserve_summary": json.dumps(
@@ -5783,11 +5984,12 @@ def _latency_only_combined_score(
         # sampled search or consume finalist slots.
         return 0.0
     if ratio < 1.0:
-        # Slower path-changing candidates are useful trace examples, but they
-        # must not replace the current latency reference in OpenEvolve's maximized
-        # best-program slot. Put them below the seed/equal baseline while keeping
-        # the magnitude latency-ordered for diagnostics.
-        return -max(1e-12, 1.0 - float(ratio))
+        # Slower path-changing candidates are useful trace examples. Give them
+        # enough positive search credit to become mutation parents ahead of
+        # seed-equivalent clones, but keep every latency-improving candidate
+        # strictly above them. Final MLIR selection still rejects non-improving
+        # sampled best programs through _sampled_best_invalid_reason().
+        return max(1e-6, min(0.25, float(ratio) * 0.25))
     if math.isclose(ratio, 1.0, rel_tol=1e-12, abs_tol=1e-12):
         return 1.0
     # OpenEvolve maximizes a single score, and raw latency ratios for sampled
@@ -6691,6 +6893,9 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
 
 
 def _seed_policy_for_effect(context: dict[str, Any]) -> dict[str, Any]:
+    active_seed = _context_initial_policy_hints(context)
+    if active_seed:
+        return active_seed
     search_mode = str(context.get("harness", {}).get("search_mode", "bootstrap-mcts"))
     if search_mode == "bootstrap-mcts":
         return _bootstrap_mcts_initial_policy_for_context(context)
@@ -9275,6 +9480,7 @@ def _record_compile_trace(
                 "candidate_mlir_digest",
                 "candidate_mlir_preview",
                 "candidate_mlir_trace_features",
+                "trace_learning_feedback",
             }
         },
     }
@@ -15798,10 +16004,16 @@ def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None
             for item in portfolio
             if isinstance(item, dict)
         ]
-    result["unit_policies"] = _normalize_unit_policies(value.get("unit_policies"), context)
-    result["boundary_group_policies"] = _normalize_boundary_group_policies(
-        value.get("boundary_group_policies"), context
-    )
+    if "unit_policies" in value:
+        result["unit_policies"] = _normalize_unit_policies(value.get("unit_policies"), context)
+    elif "unit_policies" in seed_base:
+        result["unit_policies"] = deepcopy(seed_base.get("unit_policies", []))
+    if "boundary_group_policies" in value:
+        result["boundary_group_policies"] = _normalize_boundary_group_policies(
+            value.get("boundary_group_policies"), context
+        )
+    elif "boundary_group_policies" in seed_base:
+        result["boundary_group_policies"] = deepcopy(seed_base.get("boundary_group_policies", []))
     result = _apply_patch_vocabulary(result, value.get("patches", []), context)
     result["api_version"] = value.get("api_version", "placement-builder-v1")
     return _sanitize_candidate_hints(result, context)

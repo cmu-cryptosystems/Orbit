@@ -5783,10 +5783,11 @@ def _latency_only_combined_score(
         # sampled search or consume finalist slots.
         return 0.0
     if ratio < 1.0:
-        # Keep the score purely latency-based after correctness: slower valid
-        # candidates rank below the seed, but remain distinguishable from
-        # invalid candidates so OpenEvolve can still learn from changed paths.
-        return max(0.0, float(ratio))
+        # Slower path-changing candidates are useful trace examples, but they
+        # must not replace the current latency reference in OpenEvolve's maximized
+        # best-program slot. Put them below the seed/equal baseline while keeping
+        # the magnitude latency-ordered for diagnostics.
+        return -max(1e-12, 1.0 - float(ratio))
     if math.isclose(ratio, 1.0, rel_tol=1e-12, abs_tol=1e-12):
         return 1.0
     # OpenEvolve maximizes a single score, and raw latency ratios for sampled

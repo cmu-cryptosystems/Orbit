@@ -4017,12 +4017,12 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
     )
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
-    assert slower_score == pytest.approx(1000.0 / 1001.0)
+    assert slower_score == pytest.approx(-(1.0 - (1000.0 / 1001.0)))
     assert equal_score == 1.0
     assert seed_equivalent_score == 0.0
     assert improved_score > 1.0
     assert seed_equivalent_improved_score == improved_score
-    assert 0.0 < slower_score < equal_score
+    assert slower_score < seed_equivalent_score < equal_score
     assert equal_score > slower_score
     assert improved_score > slower_score
     assert much_better_score > improved_score

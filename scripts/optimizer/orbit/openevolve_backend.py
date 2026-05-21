@@ -2283,6 +2283,22 @@ def _historical_context_limit() -> int:
         return 128
 
 
+def _cached_context_reference_latency(cached: dict[str, Any] | None) -> float:
+    if not isinstance(cached, dict):
+        return float("inf")
+    reference = cached.get("reference", {})
+    if not isinstance(reference, dict):
+        return float("inf")
+    latency = _finite_float(
+        reference.get(
+            "sampled_dp_latency_usec",
+            reference.get("objective_cost_usec", reference.get("final_latency_usec")),
+        ),
+        float("inf"),
+    )
+    return latency if math.isfinite(latency) and latency > 0 else float("inf")
+
+
 def _load_historical_compile_context(
     stable_context_path: Path | None,
     dag: Tdag,
@@ -2307,19 +2323,8 @@ def _load_historical_compile_context(
     for path in candidates[: _historical_context_limit()]:
         cached = _load_cached_compile_context(path, dag, params)
         if cached is not None:
-            reference = cached.get("reference", {})
-            if not isinstance(reference, dict):
-                reference = {}
-            latency = _finite_float(
-                reference.get(
-                    "sampled_dp_latency_usec",
-                    reference.get("objective_cost_usec", reference.get("final_latency_usec")),
-                ),
-                float("inf"),
-            )
+            latency = _cached_context_reference_latency(cached)
             task_count = len(cached.get("sampled_budget_tasks") or [])
-            if not math.isfinite(latency) or latency <= 0:
-                latency = float("inf")
             item = (latency, -task_count, -path.stat().st_mtime, cached, path)
             if best is None or item[:3] < best[:3]:
                 best = item
@@ -2547,16 +2552,26 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     context.setdefault("harness", {})["timing_log_enabled"] = True
     _set_context_cache_paths(context, params, stable_context_path)
     record_harness_timing("build_compile_context")
-    if cached_context is None and stable_context_path is not None:
+    if stable_context_path is not None:
         historical = _load_historical_compile_context(stable_context_path, dag, params)
         if historical is not None:
-            cached_context, historical_path = historical
-            cache_source = f"history:{historical_path}"
-            print(
-                "OpenEvolve compile harness: found historical sampled context "
-                f"{historical_path}.",
-                flush=True,
-            )
+            historical_context, historical_path = historical
+            historical_latency = _cached_context_reference_latency(historical_context)
+            cached_latency = _cached_context_reference_latency(cached_context)
+            if cached_context is None or historical_latency < cached_latency:
+                cached_context = historical_context
+                cache_source = f"history:{historical_path}"
+                print(
+                    "OpenEvolve compile harness: selected historical sampled context "
+                    f"{historical_path} latency={historical_latency}.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "OpenEvolve compile harness: keeping cached context over historical "
+                    f"latency={cached_latency} historical_latency={historical_latency}.",
+                    flush=True,
+                )
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
     )

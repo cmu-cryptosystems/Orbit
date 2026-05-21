@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
 import os
 import subprocess
 import sys
@@ -5664,6 +5665,24 @@ def test_historical_context_reuse_prefers_lowest_latency(
     cached, path = loaded
     assert path == best_path
     assert cached["reference"]["sampled_dp_latency_usec"] == 100.0
+
+
+def test_cached_context_reference_latency_prefers_sampled_objective(
+    toy_cost_json: str,
+):
+    assert (
+        oe_backend._cached_context_reference_latency(
+            {"reference": {"sampled_dp_latency_usec": 10.0, "final_latency_usec": 20.0}}
+        )
+        == 10.0
+    )
+    assert (
+        oe_backend._cached_context_reference_latency(
+            {"reference": {"objective_cost_usec": 30.0}}
+        )
+        == 30.0
+    )
+    assert math.isinf(oe_backend._cached_context_reference_latency({"reference": {}}))
 
 
 def test_sampled_qbp_task_cache_requires_validated_payload(tmp_path: Path):

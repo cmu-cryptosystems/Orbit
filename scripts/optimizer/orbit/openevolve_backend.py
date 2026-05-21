@@ -2300,12 +2300,17 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         params,
     )
     if policy_bank.get("initial_hints") is not None:
-        initial_hints = policy_bank["initial_hints"]
-        initial_source = _program_source_from_hints(
-            initial_hints,
-            "Policy-bank latency-improved OpenEvolve initial program.",
-        )
+        # A sampled policy-bank winner is a better latency reference and prompt
+        # example, but it can be too broad for OpenEvolve's required initial
+        # program evaluation. Keep the compact generated program as the actual
+        # OpenEvolve seed; candidates must beat the policy-bank reference to
+        # win, and the bank policy remains available in the context for trace
+        # learning and optional full-bundle validation.
+        policy_bank_initial_hints = policy_bank["initial_hints"]
         harness = context.setdefault("harness", {})
+        harness["policy_bank_initial_hints"] = _jsonable_policy_hints(
+            policy_bank_initial_hints
+        )
         selected_record = policy_bank.get("selected_record")
         if isinstance(selected_record, dict):
             active_seed = _policy_bank_active_seed_baseline(selected_record)
@@ -2327,7 +2332,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 selected_record.get("unsolved_boundary_groups", {}) or {}
             )
             context["reference"] = dict(active_seed)
-        harness["initial_policy_source"] = "policy_bank"
+        harness["initial_policy_source"] = "compact_seed_with_policy_bank_reference"
     elif getattr(params, "openevolve_reuse_output", False):
         reusable_initial = _load_reusable_policy_bank_initial_hints(output_dir, context)
         if reusable_initial is not None:

@@ -1785,6 +1785,10 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             shutil.rmtree(root, ignore_errors=True)
 
 
+def _evaluate_policy_bank_program(context_path: str, program_path: str) -> dict[str, Any]:
+    return evaluate_compile_candidate_program(Path(context_path), Path(program_path))
+
+
 def _run_compile_policy_bank_prepass(
     context_path: Path,
     context: dict[str, Any],
@@ -1821,10 +1825,18 @@ def _run_compile_policy_bank_prepass(
             pass
     records: list[dict[str, Any]] = []
     best_improved: tuple[float, dict[str, Any], dict[str, Any]] | None = None
+    workers_raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_WORKERS", "").strip()
+    try:
+        workers = max(1, int(workers_raw)) if workers_raw else 1
+    except ValueError:
+        workers = 1
+    workers = min(workers, max(1, len(variants)))
     print(
-        f"OpenEvolve compile harness: evaluating policy bank variants={len(variants)}.",
+        "OpenEvolve compile harness: evaluating policy bank "
+        f"variants={len(variants)} workers={workers}.",
         flush=True,
     )
+    jobs: list[tuple[str, dict[str, Any], Path]] = []
     for idx, (label, hints) in enumerate(variants):
         eval_hints = dict(hints)
         if os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_LIGHTWEIGHT", "").strip().lower() in {
@@ -1839,13 +1851,45 @@ def _run_compile_policy_bank_prepass(
             _program_source_from_hints(eval_hints, f"Policy-bank candidate {label}."),
             encoding="utf-8",
         )
-        evaluation = evaluate_compile_candidate_program(context_path, program_path)
+        jobs.append((label, hints, program_path))
+
+    def consume_record(label: str, hints: dict[str, Any], evaluation: dict[str, Any]) -> None:
+        nonlocal best_improved
         record = _policy_bank_record(label, hints, evaluation)
         records.append(record)
         if record.get("latency_improved") and record.get("correct"):
             objective = _finite_float(record.get("objective_cost_usec"), float("inf"))
             if best_improved is None or objective < best_improved[0]:
                 best_improved = (objective, hints, record)
+
+    if workers <= 1:
+        for label, hints, program_path in jobs:
+            consume_record(
+                label,
+                hints,
+                evaluate_compile_candidate_program(context_path, program_path),
+            )
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_job = {
+                executor.submit(
+                    _evaluate_policy_bank_program,
+                    str(context_path),
+                    str(program_path),
+                ): (label, hints)
+                for label, hints, program_path in jobs
+            }
+            for future in concurrent.futures.as_completed(future_to_job):
+                label, hints = future_to_job[future]
+                try:
+                    evaluation = future.result()
+                except BaseException as exc:
+                    evaluation = _invalid_compile_result(
+                        "policy_bank_evaluator_exception",
+                        [f"{type(exc).__name__}: {str(exc)[:240]}"],
+                    )
+                    evaluation.setdefault("artifacts", {})["traceback"] = traceback.format_exc()[-4000:]
+                consume_record(label, hints, evaluation)
     summary = {
         "enabled": True,
         "variant_count": len(variants),

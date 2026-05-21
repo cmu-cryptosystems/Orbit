@@ -198,7 +198,10 @@ class QBPManager:
         io_budgets_list = self._sample_openevolve_eval_budgets(pdag, io_budgets_list)
         self._record_openevolve_budget_task("normal", pdag, io_budgets_list)
         io_to_assign, io_to_cost = self.ilp_worker.get_qbp(pdag, io_budgets_list)
-        if getattr(self.params, "openevolve_evaluating_candidate", False):
+        if (
+            getattr(self.params, "openevolve_evaluating_candidate", False)
+            or getattr(self.params, "openevolve_collect_diagnostics", False)
+        ):
             self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
         qbp_io_to_assign = self._assign_biject(io_to_assign, bj_qbp, bj_label)
         bj_qbp.append_io_results(io_to_cost, qbp_io_to_assign)
@@ -247,7 +250,10 @@ class QBPManager:
         self._record_openevolve_budget_task("bypass", bypass_pdag, io_budgets_list)
         
         bypass_io_to_assign, _ = self.ilp_worker.get_qbp(bypass_pdag, io_budgets_list)
-        if getattr(self.params, "openevolve_evaluating_candidate", False):
+        if (
+            getattr(self.params, "openevolve_evaluating_candidate", False)
+            or getattr(self.params, "openevolve_collect_diagnostics", False)
+        ):
             self.openevolve_diagnostics.append(getattr(self.ilp_worker, "last_diagnostics", {}))
         main_io_to_assign = self.get_qbp_assign(main_pdag)
         dag_io_to_assign, dag_io_to_cost = self._merge_bypass_results(pdag, fork_v, maino_v, main_io_to_assign, bypass_io_to_assign)

@@ -3016,6 +3016,7 @@ def test_initial_compile_seed_exposes_disabled_trace_switches(
 
     hints = oe_backend._load_candidate_hints(program_path, context)
 
+    assert hints["inherit_initial_policy"] is False
     assert hints["boundary_group_policies"] == []
     assert hints["trace_group_overrides"][0]["enabled"] is False
     assert hints["trace_group_overrides"][0]["group_index"] == 0

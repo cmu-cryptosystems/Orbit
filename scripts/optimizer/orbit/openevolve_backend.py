@@ -605,6 +605,7 @@ def place(context):
             overrides = {key: value for key, value in item.items() if key not in {"enabled", "group_index"}}
             boundary_group_policies.append(mcts.boundary_group_policy(costly_groups[group_index], **overrides))
         return {
+            "inherit_initial_policy": False,
             "strategy": "bootstrap_mcts",
             "budget_aggressive": True,
             "allow_seed_fallback": True,

@@ -558,7 +558,7 @@ def test_open_helpers_expose_ilp_compatible_transition(toy_cost_json: str):
     assert PlacementBuilder(context).constraints.legal_output_states(16, 40)
 
 
-def test_transition_score_uses_raw_latency_for_open_evolve_selection(toy_cost_json: str):
+def test_transition_score_keeps_reserve_regularization_as_search_heuristic(toy_cost_json: str):
     params = _params(toy_cost_json)
     base_policy = {
         "bootstrap_penalty": 0.0,
@@ -600,7 +600,8 @@ def test_transition_score_uses_raw_latency_for_open_evolve_selection(toy_cost_js
     assert worst_score is not None
     assert avgcase_score is not None
     assert ignored_score is not None
-    assert ignored_score == avgcase_score == worst_score == 0.0
+    assert ignored_score == 0.0
+    assert 0.0 < avgcase_score < worst_score
 
 
 def test_assignment_validation_rejects_non_decryptable_candidate_record(toy_cost_json: str):

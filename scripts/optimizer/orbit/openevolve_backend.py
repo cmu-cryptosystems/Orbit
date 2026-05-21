@@ -130,7 +130,11 @@ class OpenEvolvePlacementWorker:
         else:
             hints = _zero_iteration_portfolio_hints()
         _apply_active_scale_floor_from_hints(self.params, hints)
-        diagnostics = {} if getattr(self.params, "openevolve_evaluating_candidate", False) else None
+        collect_diagnostics = bool(
+            getattr(self.params, "openevolve_evaluating_candidate", False)
+            or getattr(self.params, "openevolve_collect_diagnostics", False)
+        )
+        diagnostics = {} if collect_diagnostics else None
         result = solve_budget_batch(pdag, io_budgets_list, self.le, self.params, hints, diagnostics)
         self.last_diagnostics = diagnostics or {}
         return result
@@ -3845,6 +3849,7 @@ def _evaluate_compile_hints(
     params.openevolve_harness = "compile"
     params.openevolve_compile_hints = _compile_hints_for_eval_suite(hints, eval_suite)
     params.openevolve_evaluating_candidate = bool(evaluating_candidate)
+    params.openevolve_collect_diagnostics = True
     params.openevolve_eval_suite = eval_suite
     scale_floor_bits = _apply_active_scale_floor_from_hints(
         params, params.openevolve_compile_hints

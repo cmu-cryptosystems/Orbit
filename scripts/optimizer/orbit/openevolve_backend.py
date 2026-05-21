@@ -4971,6 +4971,9 @@ def _run_full_bundle_finalists(
         }
     else:
         reference = _evaluate_compile_hints(full_context, reference_hints, suppress_output=True)
+        reference_diagnostics = reference.get("diagnostics", {})
+        if not isinstance(reference_diagnostics, dict):
+            reference_diagnostics = {}
         full_context["reference"] = {
             "final_latency_usec": reference.get("final_latency_usec"),
             "objective_cost_usec": reference.get(
@@ -4980,6 +4983,8 @@ def _run_full_bundle_finalists(
             "bootstrap_count": reference.get("bootstrap_count"),
             "rescale_count": reference.get("rescale_count"),
             "valid": reference.get("valid", False),
+            "effective_qbp_digest": _effective_qbp_digest(reference_diagnostics),
+            "selected_path_digest": _selected_path_digest(reference, reference_diagnostics),
             "source": "initial_seed",
             "policy_summary": _compact_policy_summary(reference_hints),
         }
@@ -4998,6 +5003,7 @@ def _run_full_bundle_finalists(
     scale_floor_records = []
     result_cache: dict[str, dict[str, Any]] = {}
     seen_effective_paths: dict[str, int] = {}
+    progress_status: dict[str, Any] = {}
 
     def write_progress() -> None:
         try:
@@ -5006,6 +5012,7 @@ def _run_full_bundle_finalists(
                     {
                         "reference": full_context["reference"],
                         "candidates": summaries,
+                        "active": progress_status,
                         "updated_at": time.time(),
                     },
                     indent=2,
@@ -5025,7 +5032,55 @@ def _run_full_bundle_finalists(
         [("initial_seed", None, initial_hints)] if initial_hints is not None else []
     )
     if str(full_context.get("harness", {}).get("search_mode", "")) == "bootstrap-mcts":
-        finalist_items = initial_items + candidate_items
+        # The reference seed was already replayed before evolution and is the
+        # fail-open fallback. Replaying it again as finalist 0 can dominate the
+        # post-evolution wall time on large graphs while adding no selectable
+        # latency-improving candidate.
+        reference = full_context.get("reference", {})
+        if initial_hints is not None and isinstance(reference, dict):
+            reference_path_digest = str(reference.get("selected_path_digest") or "")[:24]
+            reference_qbp_digest = str(reference.get("effective_qbp_digest") or "")[:24]
+            seed_summary = {
+                "index": len(summaries),
+                "label": "initial_seed_reference",
+                "valid": bool(reference.get("valid", False)),
+                "reference_only": True,
+                "final_latency_usec": reference.get("final_latency_usec"),
+                "objective_cost_usec": reference.get(
+                    "objective_cost_usec", reference.get("final_latency_usec")
+                ),
+                "total_frontier_cost_usec": reference.get("total_frontier_cost_usec"),
+                "bootstrap_count": reference.get("bootstrap_count"),
+                "rescale_count": reference.get("rescale_count"),
+                "fallback_selected_budgets": 0,
+                "fallback_selected_groups": 0,
+                "candidate_qbp_coverage": 1.0 if reference.get("valid", False) else 0.0,
+                "effective_qbp_digest": reference_qbp_digest,
+                "selected_path_digest": reference_path_digest,
+                "selected_path_changed_vs_seed": False,
+                "policy_effect_summary": {
+                    "seed_equivalent": True,
+                    "source": "precomputed_reference",
+                },
+                "finalist_gate": {
+                    "latency_reject": True,
+                    "latency_improvement_reject": True,
+                    "final_latency_improved_vs_seed": False,
+                    "reference_objective_cost_usec": reference.get(
+                        "objective_cost_usec", reference.get("final_latency_usec")
+                    ),
+                    "effective_duplicate": False,
+                    "seed_equivalent_policy": True,
+                    "selected_path_changed_vs_seed": False,
+                    "target_bootstrap_count": _context_target_bootstrap_count(full_context),
+                    "seed_bootstrap_count": _context_seed_bootstrap_count(full_context),
+                },
+            }
+            summaries.append(seed_summary)
+            if reference_path_digest:
+                seen_effective_paths[reference_path_digest] = seed_summary["index"]
+            write_progress()
+        finalist_items = candidate_items
     else:
         finalist_items = candidate_items + initial_items
     for item_idx, (label, code, preset_hints) in enumerate(finalist_items):
@@ -5076,7 +5131,24 @@ def _run_full_bundle_finalists(
                     static = _static_validate_hints(full_context, finalist_hints)
                     if not static["valid"]:
                         raise PlacementError("; ".join(static["reasons"][:4]))
+                    progress_status = {
+                        "phase": "evaluating_full_bundle_finalist",
+                        "index": summary_index,
+                        "label": summary_label,
+                        "variant": variant_label,
+                        "hint_digest": hint_digest,
+                        "started_at": time.time(),
+                    }
+                    write_progress()
                     result = _evaluate_compile_hints(full_context, finalist_hints, suppress_output=True)
+                    progress_status = {
+                        "phase": "finished_full_bundle_finalist",
+                        "index": summary_index,
+                        "label": summary_label,
+                        "variant": variant_label,
+                        "hint_digest": hint_digest,
+                        "finished_at": time.time(),
+                    }
                     diagnostics = result.get("diagnostics", {})
                     effective_path = _result_effective_summary(
                         full_context, result, diagnostics if isinstance(diagnostics, dict) else {}
@@ -5330,6 +5402,14 @@ def _run_full_bundle_finalists(
                     elif best is None or item[:16] < best[:16]:
                         best = item
             except Exception as exc:
+                progress_status = {
+                    "phase": "failed_full_bundle_finalist",
+                    "index": summary_index,
+                    "label": summary_label,
+                    "variant": variant_label,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "finished_at": time.time(),
+                }
                 summary = {
                     "index": summary_index,
                     "label": summary_label,

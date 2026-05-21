@@ -2934,6 +2934,106 @@ def _compile_policy_bank_variants(
             },
         },
     )
+    reference_patterns = _reference_bootstrap_patterns_from_context(context)
+    if reference_patterns:
+        reference_anchor_count = max(8, min(64, len(reference_patterns) * 2))
+        reference_action_base = {
+            **_budget_fulfillment_beam_policy(),
+            "target_bootstrap_count": 0,
+            "direct_budget_policy": True,
+            "beam_width": 12,
+            "state_cap_per_node": 48,
+            "boundary_state_cap": 12,
+            "max_scale_candidates": 80,
+            "boundary_scale_policy": "frontier",
+            "scale_lattice": "waterline_sf",
+            "bootstrap_anchor_selector": "reference_bootstrap_locations",
+            "bootstrap_anchor_include_patterns": reference_patterns,
+            "bootstrap_anchor_count": reference_anchor_count,
+            "force_bootstrap_anchors": False,
+            "selection_objective": "cost",
+            "selection_bootstrap_penalty": 0.0,
+        }
+        for label, boundary_policy, scale_lattice, boundary_cap, max_scales in (
+            ("reference_location_frontier_cost", "frontier", "waterline_sf", 12, 80),
+            ("reference_location_dense_cost", "frontier", "dense", 16, 96),
+            ("reference_location_waterline_cost", "waterline", "waterline_sf", 10, 64),
+        ):
+            action_policy = {
+                **reference_action_base,
+                "boundary_scale_policy": boundary_policy,
+                "scale_lattice": scale_lattice,
+                "boundary_state_cap": int(boundary_cap),
+                "max_scale_candidates": int(max_scales),
+            }
+            add(
+                label,
+                {
+                    **action_policy,
+                    "strategy": "bootstrap_mcts",
+                    "budget_aggressive": True,
+                    "mcts_action_cap": 12,
+                    "mcts_rollout_budget": 24,
+                    "mcts_exploration_weight": 1.2,
+                    "mcts_max_repair_bootstraps": 128,
+                    "mcts_prior_order": True,
+                    "mcts_actions": [
+                        {
+                            "name": "reference_boundary_cost_beam",
+                            "prior": 0.92,
+                            "policy": action_policy,
+                        },
+                        {
+                            "name": "budget_fulfillment_beam",
+                            "prior": 0.62,
+                            "policy": {
+                                **action_policy,
+                                "bootstrap_anchor_count": 0,
+                                "bootstrap_anchor_selector": "",
+                            },
+                        },
+                        {
+                            "name": "dense_boundary_cost_beam",
+                            "prior": 0.52,
+                            "policy": {
+                                **action_policy,
+                                "scale_lattice": "dense",
+                                "boundary_state_cap": max(12, int(boundary_cap)),
+                                "max_scale_candidates": max(80, int(max_scales)),
+                            },
+                        },
+                    ],
+                    "mcts_action_allowlist": [
+                        "reference_boundary_cost_beam",
+                        "budget_fulfillment_beam",
+                        "dense_boundary_cost_beam",
+                    ],
+                },
+                {
+                    "reference_boundary_cost_beam": {
+                        "prior": 0.92,
+                        "policy": action_policy,
+                    },
+                    "budget_fulfillment_beam": {
+                        "prior": 0.62,
+                        "policy": {
+                            **action_policy,
+                            "bootstrap_anchor_count": 0,
+                            "bootstrap_anchor_selector": "",
+                        },
+                    },
+                    "dense_boundary_cost_beam": {
+                        "prior": 0.52,
+                        "policy": {
+                            **action_policy,
+                            "scale_lattice": "dense",
+                            "boundary_state_cap": max(12, int(boundary_cap)),
+                            "max_scale_candidates": max(80, int(max_scales)),
+                        },
+                    },
+                },
+                replace_presets=True,
+            )
     for floor in scale_candidates:
         if int(floor) >= waterline:
             continue

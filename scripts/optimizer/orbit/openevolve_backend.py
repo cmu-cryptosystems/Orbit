@@ -2257,6 +2257,59 @@ def _stable_context_cache_path(dag: Tdag, params: Params) -> Path | None:
     return cache_dir / f"{_compile_context_cache_key(dag, params)}.json"
 
 
+def _historical_context_root(stable_context_path: Path | None) -> Path | None:
+    if stable_context_path is None:
+        return None
+    cache_dir = stable_context_path.parent
+    if cache_dir.name == ".openevolve_context_cache":
+        return cache_dir.parent
+    return cache_dir.parent if cache_dir.parent != cache_dir else cache_dir
+
+
+def _historical_context_enabled(params: Params) -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_CONTEXT_HISTORY", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return bool(getattr(params, "openevolve_sampled_only", False))
+
+
+def _historical_context_limit() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_CONTEXT_HISTORY_LIMIT", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 128
+    except ValueError:
+        return 128
+
+
+def _load_historical_compile_context(
+    stable_context_path: Path | None,
+    dag: Tdag,
+    params: Params,
+) -> tuple[dict[str, Any], Path] | None:
+    if not _historical_context_enabled(params):
+        return None
+    root = _historical_context_root(stable_context_path)
+    if root is None or not root.exists():
+        return None
+    candidates: list[Path] = []
+    candidates.extend(root.glob("*/workdir/*/compile_context.json"))
+    candidates.extend(root.glob("*/compile_context.json"))
+    candidates = [
+        path
+        for path in candidates
+        if path.is_file()
+        and (stable_context_path is None or path.resolve() != stable_context_path.resolve())
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates[: _historical_context_limit()]:
+        cached = _load_cached_compile_context(path, dag, params)
+        if cached is not None:
+            return cached, path
+    return None
+
+
 def _store_stable_compile_context(path: Path | None, context: dict[str, Any]) -> None:
     if path is None:
         return
@@ -2476,6 +2529,16 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     context.setdefault("harness", {})["timing_log_enabled"] = True
     _set_context_cache_paths(context, params, stable_context_path)
     record_harness_timing("build_compile_context")
+    if cached_context is None and stable_context_path is not None:
+        historical = _load_historical_compile_context(stable_context_path, dag, params)
+        if historical is not None:
+            cached_context, historical_path = historical
+            cache_source = f"history:{historical_path}"
+            print(
+                "OpenEvolve compile harness: found historical sampled context "
+                f"{historical_path}.",
+                flush=True,
+            )
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
     )

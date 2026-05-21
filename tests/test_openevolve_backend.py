@@ -5385,6 +5385,49 @@ def test_stable_context_cache_key_tracks_eval_suite_and_disable(
     assert oe_backend._stable_context_cache_path(graph, params) is None
 
 
+def test_historical_context_reuse_finds_prior_sampled_context(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    cache_dir = tmp_path / ".openevolve_context_cache"
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_context_cache_dir=str(cache_dir),
+        openevolve_sampled_only=True,
+    )
+    graph = _mul_chain_pdag(params, length=3)
+    stable_path = oe_backend._stable_context_cache_path(graph, params)
+    assert stable_path is not None
+
+    prior_path = (
+        tmp_path
+        / "old_run"
+        / "workdir"
+        / "compile_oe_mul_chain"
+        / "compile_context.json"
+    )
+    prior_path.parent.mkdir(parents=True)
+    context = build_compile_context(graph, params)
+    context["reference"] = {"valid": True, "sampled_dp_latency_usec": 123.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [{"in_lvl": -1, "in_scl": 40}],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    prior_path.write_text(json.dumps(context), encoding="utf-8")
+
+    loaded = oe_backend._load_historical_compile_context(stable_path, graph, params)
+    assert loaded is not None
+    cached, path = loaded
+    assert path == prior_path
+    assert cached["reference"]["sampled_dp_latency_usec"] == 123.0
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_CONTEXT_HISTORY", "0")
+    assert oe_backend._load_historical_compile_context(stable_path, graph, params) is None
+
+
 def test_sampled_qbp_task_cache_requires_validated_payload(tmp_path: Path):
     task_context = {
         "schema_version": "test",

@@ -4975,6 +4975,51 @@ def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any
     return selected, float(reference_cost if reference_cost > 0 else float("inf"))
 
 
+def _top_boundary_group_key_tuples(context: dict[str, Any], limit: int = 4) -> list[tuple[int, int, str, int]]:
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    keys: list[tuple[int, int, str, int]] = []
+    for item in harness.get("top_costly_boundary_groups", []) or []:
+        if not isinstance(item, dict):
+            continue
+        group_key = item.get("group_key")
+        if isinstance(group_key, dict):
+            keys.append(
+                (
+                    int(group_key.get("in_lvl", -1)),
+                    int(group_key.get("in_scl", -1)),
+                    str(group_key.get("maino_v", "")),
+                    int(group_key.get("main_dag_size", 0) or 0),
+                )
+            )
+        if len(keys) >= limit:
+            break
+    return keys
+
+
+def _boundary_group_policy_focus_score(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+) -> float:
+    policies = [
+        item
+        for item in hints.get("boundary_group_policies", []) or []
+        if isinstance(item, dict)
+    ]
+    if not policies:
+        return 0.0
+    top_keys = _top_boundary_group_key_tuples(context, limit=4)
+    if not top_keys:
+        return 0.25 if len(policies) <= 2 else 0.05
+    matched = 0
+    for item in policies:
+        selector = item.get("selector", {})
+        if any(_boundary_group_selector_matches_key(selector, key) for key in top_keys):
+            matched += 1
+    match_score = min(1.0, matched / max(1.0, min(2, len(top_keys))))
+    focus_penalty = 1.0 if len(policies) <= 2 else max(0.0, 1.0 - 0.20 * (len(policies) - 2))
+    return float(match_score * focus_penalty)
+
+
 def _experience_surrogate_summary(
     context: dict[str, Any],
     eval_hints: dict[str, Any],
@@ -5028,21 +5073,31 @@ def _experience_surrogate_summary(
     if isinstance(examples, list) and examples:
         trace_example_bonus = 0.05
     effect_score = float(policy_effect.get("effect_score", 0.0) or 0.0)
+    complexity_reasons = _promotion_complexity_reasons(eval_hints)
+    focus_score = _boundary_group_policy_focus_score(context, eval_hints)
+    target_focus = 1.0 if targeted_count <= 2 else max(0.0, 1.0 - 0.15 * (targeted_count - 2))
+    raw_score = (
+        0.16 * effect_score
+        + 0.14 * min(1.0, action_overlap)
+        + 0.22 * focus_score
+        + 0.16 * target_focus
+        + 0.12 * min(1.0, lattice_changed / 3.0)
+        + (0.12 if cost_objective else 0.0)
+        + (0.10 if not complexity_reasons else 0.0)
+        + trace_example_bonus
+    )
     score = min(
         1.0,
-        0.20 * effect_score
-        + 0.22 * min(1.0, action_overlap)
-        + 0.18 * min(1.0, targeted_count / 2.0)
-        + 0.20 * min(1.0, lattice_changed / 3.0)
-        + (0.15 if cost_objective else 0.0)
-        + trace_example_bonus,
+        raw_score,
     )
+    if complexity_reasons:
+        score = min(score, 0.18)
     digest = _hint_digest(payload)
     seed_equivalent = bool(policy_effect.get("seed_equivalent", False))
     every = _experience_probe_every()
     hash_promote = int(digest[:8], 16) % every == 0
     threshold = _experience_probe_threshold()
-    promote = (not seed_equivalent) and (score >= threshold or hash_promote)
+    promote = (not seed_equivalent) and not complexity_reasons and (score >= threshold or hash_promote)
     return {
         "score": float(score),
         "digest": digest[:24],
@@ -5060,6 +5115,9 @@ def _experience_surrogate_summary(
         "targeted_policy_count": int(targeted_count),
         "lattice_changed_count": int(lattice_changed),
         "cost_objective": bool(cost_objective),
+        "boundary_group_focus_score": float(focus_score),
+        "target_focus_score": float(target_focus),
+        "promotion_complexity_reasons": complexity_reasons,
     }
 
 

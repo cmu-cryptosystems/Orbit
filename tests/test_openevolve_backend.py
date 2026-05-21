@@ -3764,6 +3764,78 @@ def test_promotion_probe_hints_are_lightweight_and_targeted(toy_cost_json: str):
     assert probe["unit_policies"] == []
 
 
+def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    bounded = {
+        "strategy": "bootstrap_mcts",
+        "selection_objective": "cost",
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "policy": {
+                    "strategy": "latency_beam",
+                    "boundary_state_cap": 4,
+                    "max_scale_candidates": 16,
+                    "beam_width": 4,
+                    "state_cap_per_node": 8,
+                    "selection_objective": "cost",
+                },
+            }
+        ],
+        "mcts_action_presets": {
+            "budget_fulfillment_beam": {
+                "policy": {
+                    "strategy": "latency_beam",
+                    "boundary_state_cap": 4,
+                    "max_scale_candidates": 16,
+                    "beam_width": 4,
+                    "state_cap_per_node": 8,
+                    "selection_objective": "cost",
+                }
+            }
+        },
+    }
+    broad = json.loads(json.dumps(bounded))
+    broad["boundary_group_policies"] = [
+        {
+            "selector": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+            "policy": {
+                "strategy": "latency_beam",
+                "boundary_state_cap": 20,
+                "max_scale_candidates": 96,
+                "beam_width": 12,
+                "state_cap_per_node": 64,
+                "selection_objective": "cost",
+            },
+        }
+        for _ in range(5)
+    ]
+
+    bounded_summary = oe_backend._experience_surrogate_summary(
+        context,
+        bounded,
+        {"effect_score": 1.0, "seed_equivalent": False},
+    )
+    broad_summary = oe_backend._experience_surrogate_summary(
+        context,
+        broad,
+        {"effect_score": 1.0, "seed_equivalent": False},
+    )
+
+    assert bounded_summary["score"] > broad_summary["score"]
+    assert bounded_summary["boundary_group_focus_score"] == pytest.approx(1.0)
+    assert bounded_summary["promotion_complexity_reasons"] == []
+    assert broad_summary["promotion_complexity_reasons"]
+    assert broad_summary["promote_to_probe"] is False
+
+
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_code = "def place(context):\n    return {'tag': 'result_best'}\n"

@@ -4812,6 +4812,11 @@ def _experience_probe_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _experience_inline_qbp_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_INLINE_QBP", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _experience_probe_limit() -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS", "").strip()
     try:
@@ -5036,11 +5041,13 @@ def _experience_probe_skip_result(
     suppress_output: bool,
     disabled: bool = False,
 ) -> dict[str, Any] | None:
-    if disabled or not _experience_probe_enabled():
+    if disabled:
         return None
     if eval_suite == "polybert-full" or not context.get("sampled_budget_tasks"):
         return None
     surrogate = _experience_surrogate_summary(context, eval_hints, policy_effect)
+    if not _experience_inline_qbp_enabled() or not _experience_probe_enabled():
+        return _experience_surrogate_only_result(raw_hints, policy_effect, surrogate)
     if not bool(surrogate.get("promote_to_probe", False)):
         return _experience_surrogate_only_result(raw_hints, policy_effect, surrogate)
     selected_tasks, reference_cost = _experience_probe_tasks(context)

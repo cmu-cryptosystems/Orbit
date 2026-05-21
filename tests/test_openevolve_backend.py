@@ -5620,6 +5620,52 @@ def test_historical_context_reuse_finds_prior_sampled_context(
     assert oe_backend._load_historical_compile_context(stable_path, graph, params) is None
 
 
+def test_historical_context_reuse_prefers_lowest_latency(
+    toy_cost_json: str, tmp_path: Path
+):
+    cache_dir = tmp_path / ".openevolve_context_cache"
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_context_cache_dir=str(cache_dir),
+        openevolve_sampled_only=True,
+    )
+    graph = _mul_chain_pdag(params, length=3)
+    stable_path = oe_backend._stable_context_cache_path(graph, params)
+    assert stable_path is not None
+
+    def write_context(run_name: str, latency: float, tasks: int) -> Path:
+        path = (
+            tmp_path
+            / run_name
+            / "workdir"
+            / "compile_oe_mul_chain"
+            / "compile_context.json"
+        )
+        path.parent.mkdir(parents=True)
+        context = build_compile_context(graph, params)
+        context["reference"] = {"valid": True, "sampled_dp_latency_usec": latency}
+        context["sampled_budget_tasks"] = [
+            {
+                "index": idx,
+                "group_keys": [{"in_lvl": -1, "in_scl": 40}],
+                "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+            }
+            for idx in range(tasks)
+        ]
+        path.write_text(json.dumps(context), encoding="utf-8")
+        return path
+
+    write_context("newer_slow", 200.0, 4)
+    best_path = write_context("older_fast", 100.0, 2)
+
+    loaded = oe_backend._load_historical_compile_context(stable_path, graph, params)
+    assert loaded is not None
+    cached, path = loaded
+    assert path == best_path
+    assert cached["reference"]["sampled_dp_latency_usec"] == 100.0
+
+
 def test_sampled_qbp_task_cache_requires_validated_payload(tmp_path: Path):
     task_context = {
         "schema_version": "test",

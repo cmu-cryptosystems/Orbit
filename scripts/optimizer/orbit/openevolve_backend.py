@@ -2303,11 +2303,29 @@ def _load_historical_compile_context(
         and (stable_context_path is None or path.resolve() != stable_context_path.resolve())
     ]
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    best: tuple[float, int, float, dict[str, Any], Path] | None = None
     for path in candidates[: _historical_context_limit()]:
         cached = _load_cached_compile_context(path, dag, params)
         if cached is not None:
-            return cached, path
-    return None
+            reference = cached.get("reference", {})
+            if not isinstance(reference, dict):
+                reference = {}
+            latency = _finite_float(
+                reference.get(
+                    "sampled_dp_latency_usec",
+                    reference.get("objective_cost_usec", reference.get("final_latency_usec")),
+                ),
+                float("inf"),
+            )
+            task_count = len(cached.get("sampled_budget_tasks") or [])
+            if not math.isfinite(latency) or latency <= 0:
+                latency = float("inf")
+            item = (latency, -task_count, -path.stat().st_mtime, cached, path)
+            if best is None or item[:3] < best[:3]:
+                best = item
+    if best is None:
+        return None
+    return best[3], best[4]
 
 
 def _store_stable_compile_context(path: Path | None, context: dict[str, Any]) -> None:

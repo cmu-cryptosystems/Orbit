@@ -2480,6 +2480,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         getattr(params, "openevolve_search_mode", None)
     )
     initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
+    context.setdefault("harness", {})["initial_program_digest"] = _source_digest(initial_source)
     initial_path.write_text(initial_source, encoding="utf-8")
     record_harness_timing("initial_program")
     seed_trace_examples: list[dict[str, Any]] = []
@@ -4788,12 +4789,204 @@ def _policy_bank_loss_reason(item: dict[str, Any]) -> str:
     return f"path_changed_but_slower_by_{delta:.3f}_usec"
 
 
+def _experience_probe_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _experience_probe_limit() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS", "").strip()
+    try:
+        return max(1, min(16, int(raw))) if raw else 4
+    except ValueError:
+        return 4
+
+
+def _boundary_group_key_from_dict(item: dict[str, Any]) -> str:
+    return _boundary_group_key_string(
+        (
+            _safe_int(item.get("in_lvl"), -1),
+            _safe_int(item.get("in_scl"), -1),
+            str(item.get("maino_v", "")),
+            _safe_int(item.get("main_dag_size"), 0),
+        )
+    )
+
+
+def _sampled_task_group_keys(task: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in task.get("group_keys", []) or []:
+        if isinstance(item, dict):
+            keys.add(_boundary_group_key_from_dict(item))
+    if keys:
+        return keys
+    context = task.get("context", {})
+    budgets = context.get("io_budgets", []) if isinstance(context, dict) else []
+    try:
+        grouped = _budget_boundary_groups(
+            [
+                _io_budget_from_json(item) if isinstance(item, dict) else item
+                for item in budgets
+                if isinstance(item, dict)
+            ]
+        )
+    except Exception:
+        return keys
+    return {_boundary_group_key_string(key) for key in grouped}
+
+
+def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
+    tasks = [
+        task
+        for task in context.get("sampled_budget_tasks", []) or []
+        if isinstance(task, dict) and isinstance(task.get("context"), dict)
+    ]
+    if not tasks:
+        return [], float("inf")
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    top_groups = [
+        item
+        for item in harness.get("top_costly_boundary_groups", []) or []
+        if isinstance(item, dict)
+    ]
+    if not top_groups:
+        return tasks[: _experience_probe_limit()], float("inf")
+    top_cost_by_key = {}
+    for item in top_groups:
+        key = str(item.get("key") or "")
+        if not key:
+            group_key = item.get("group_key", {})
+            if isinstance(group_key, dict):
+                key = _boundary_group_key_from_dict(group_key)
+        if key:
+            top_cost_by_key[key] = _finite_float(item.get("min_cost_usec"), 0.0)
+    wanted = {key for key, cost in top_cost_by_key.items() if key and cost > 0}
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    for task in tasks:
+        keys = _sampled_task_group_keys(task)
+        if keys & wanted:
+            selected.append(task)
+            selected_keys |= keys & wanted
+        if len(selected) >= _experience_probe_limit():
+            break
+    if not selected:
+        return tasks[: _experience_probe_limit()], float("inf")
+    reference_cost = sum(top_cost_by_key.get(key, 0.0) for key in selected_keys)
+    return selected, float(reference_cost if reference_cost > 0 else float("inf"))
+
+
+def _experience_probe_skip_result(
+    context: dict[str, Any],
+    raw_hints: dict[str, Any],
+    eval_hints: dict[str, Any],
+    eval_suite: str,
+    policy_effect: dict[str, Any],
+    *,
+    suppress_output: bool,
+    disabled: bool = False,
+) -> dict[str, Any] | None:
+    if disabled or not _experience_probe_enabled():
+        return None
+    if eval_suite == "polybert-full" or not context.get("sampled_budget_tasks"):
+        return None
+    selected_tasks, reference_cost = _experience_probe_tasks(context)
+    if not selected_tasks or not math.isfinite(reference_cost):
+        return None
+    probe_context = deepcopy(context)
+    probe_context["sampled_budget_tasks"] = deepcopy(selected_tasks)
+    probe_context.setdefault("harness", {})["experience_probe"] = True
+    probe_result = _evaluate_sampled_budget_tasks(
+        probe_context,
+        eval_hints,
+        suppress_output=suppress_output,
+    )
+    probe_diagnostics = probe_result.get("diagnostics", {})
+    if not isinstance(probe_diagnostics, dict):
+        probe_diagnostics = {}
+    probe_cost = _finite_float(
+        probe_result.get("sampled_dp_latency_usec", probe_result.get("objective_cost_usec")),
+        float("inf"),
+    )
+    direct_coverage = _finite_float(probe_result.get("candidate_qbp_coverage"), 0.0)
+    boundary_validity = _finite_float(probe_result.get("boundary_group_validity"), 0.0)
+    min_relative_improvement = _finite_float(
+        os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_MIN_REL", 0.0),
+        0.0,
+    )
+    improved = (
+        math.isfinite(probe_cost)
+        and probe_cost < reference_cost * (1.0 - max(0.0, min_relative_improvement))
+    )
+    direct_complete = direct_coverage >= 1.0 and boundary_validity >= 1.0
+    if improved and direct_complete:
+        return None
+    if not direct_complete:
+        reason = "experience_probe_incomplete_top_groups"
+    else:
+        reason = "experience_probe_no_latency_improvement"
+    result = _invalid_compile_result(reason, [reason])
+    metrics = result.setdefault("metrics", {})
+    metrics.update(
+        {
+            "experience_probe_cost_usec": float(probe_cost if math.isfinite(probe_cost) else 0.0),
+            "experience_probe_reference_cost_usec": float(reference_cost),
+            "experience_probe_candidate_qbp_coverage": float(direct_coverage),
+            "experience_probe_boundary_group_validity": float(boundary_validity),
+            "experience_probe_task_count": float(len(selected_tasks)),
+            "policy_effect_score": float(policy_effect.get("effect_score", 0.0)),
+            "seed_equivalent_policy": float(bool(policy_effect.get("seed_equivalent", False))),
+            "sampled_task_cache_hits": float(
+                probe_result.get("sampled_task_cache_hits", 0.0)
+            ),
+            "sampled_task_cache_misses": float(
+                probe_result.get("sampled_task_cache_misses", 0.0)
+            ),
+            "sampled_task_cache_writes": float(
+                probe_result.get("sampled_task_cache_writes", 0.0)
+            ),
+        }
+    )
+    artifacts = result.setdefault("artifacts", {})
+    artifacts["experience_probe"] = json.dumps(
+        {
+            "reason": reason,
+            "candidate_cost_usec": probe_cost if math.isfinite(probe_cost) else None,
+            "reference_cost_usec": reference_cost,
+            "direct_coverage": direct_coverage,
+            "boundary_validity": boundary_validity,
+            "task_count": len(selected_tasks),
+            "policy_summary": json.loads(_compact_policy_summary(raw_hints)),
+            "diagnostics": {
+                "sampled_task_cache_hits": int(
+                    probe_result.get("sampled_task_cache_hits", 0) or 0
+                ),
+                "sampled_task_cache_misses": int(
+                    probe_result.get("sampled_task_cache_misses", 0) or 0
+                ),
+                "sampled_task_cache_writes": int(
+                    probe_result.get("sampled_task_cache_writes", 0) or 0
+                ),
+                "selected_source_counts": dict(
+                    probe_diagnostics.get("selected_source_counts", {}) or {}
+                ),
+            },
+        },
+        sort_keys=True,
+    )
+    return result
+
+
 def _program_source_from_hints(hints: dict[str, Any], title: str) -> str:
     return (
         f'"""{title}"""\n\n'
         "def place(context):\n"
         f"    return {repr(hints)}\n"
     )
+
+
+def _source_digest(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
 def _safe_filename(value: str) -> str:
@@ -4856,8 +5049,21 @@ def evaluate_compile_candidate_program(
         mark_timing("compile_hints")
         policy_effect = _policy_effect_summary(context, hints, eval_hints, eval_suite)
         mark_timing("policy_effect")
+        try:
+            candidate_source_digest = _source_digest(
+                Path(program_path).read_text(encoding="utf-8")
+            )
+        except Exception:
+            candidate_source_digest = ""
+        initial_source_digest = str(
+            context.get("harness", {}).get("initial_program_digest", "") or ""
+        )
         allow_seed_equivalent = (
             Path(program_path).name == "initial_program.py"
+            or (
+                bool(initial_source_digest)
+                and candidate_source_digest == initial_source_digest
+            )
             or os.environ.get("ORBIT_OPENEVOLVE_EVALUATE_SEED_EQUIV", "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
@@ -4878,6 +5084,23 @@ def evaluate_compile_candidate_program(
             timings["record_trace"] = float(time.perf_counter() - trace_start)
             attach_timings(result)
             return result
+        probe_skip = _experience_probe_skip_result(
+            context,
+            hints,
+            eval_hints,
+            eval_suite,
+            policy_effect,
+            suppress_output=True,
+            disabled=allow_seed_equivalent,
+        )
+        mark_timing("experience_probe")
+        if probe_skip is not None:
+            attach_timings(probe_skip)
+            trace_start = time.perf_counter()
+            _record_compile_trace(context, Path(program_path), hints, probe_skip, "CLEAR_ONLY")
+            timings["record_trace"] = float(time.perf_counter() - trace_start)
+            attach_timings(probe_skip)
+            return probe_skip
         result = _evaluate_compile_hints(context, eval_hints, suppress_output=True)
         mark_timing("evaluate_compile_hints")
         result["static"] = static

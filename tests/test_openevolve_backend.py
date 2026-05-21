@@ -5445,6 +5445,69 @@ def test_seed_equivalent_candidate_skips_expensive_sampled_replay(
     assert result["artifacts"]["failure_stage"] == "seed_equivalent_policy_probe_skip"
 
 
+def test_experience_probe_uses_top_groups_before_full_sampled_replay(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        },
+        {
+            "index": 1,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 36, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 36}]},
+        },
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    calls = []
+
+    def fake_sampled(sampled_context, _hints, *, suppress_output):
+        calls.append(len(sampled_context.get("sampled_budget_tasks", [])))
+        assert suppress_output is True
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "sampled_dp_latency_usec": 120.0,
+            "objective_cost_usec": 120.0,
+            "sampled_task_cache_hits": 1,
+            "sampled_task_cache_misses": 0,
+            "sampled_task_cache_writes": 0,
+            "diagnostics": {"selected_source_counts": {"candidate:probe": 1}},
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fake_sampled)
+
+    result = oe_backend._experience_probe_skip_result(
+        context,
+        {"strategy": "bootstrap_mcts"},
+        {"strategy": "bootstrap_mcts"},
+        "polybert-sampled",
+        {"seed_equivalent": False, "effect_score": 1.0},
+        suppress_output=True,
+    )
+
+    assert calls == [1]
+    assert result is not None
+    assert result["artifacts"]["failure_stage"] == "experience_probe_no_latency_improvement"
+    assert result["metrics"]["experience_probe_cost_usec"] == 120.0
+
+
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
     toy_cost_json: str,
 ):

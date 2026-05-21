@@ -4557,14 +4557,6 @@ def _latency_only_correctness_gate(
         reasons.append("missing_positive_latency_objective")
     elif not math.isfinite(_finite_float(objective.get("objective_cost_usec"), float("inf"))):
         reasons.append("nonfinite_latency_objective")
-    if seed_equivalent_path and not objective_improved:
-        reasons.append("seed_equivalent_selected_path_without_latency_improvement")
-    if (
-        bool(policy_effect.get("seed_equivalent", False))
-        and not selected_path_changed
-        and not objective_improved
-    ):
-        reasons.append("seed_equivalent_policy_without_latency_improvement")
     return {
         "correct": not reasons,
         "reasons": reasons,
@@ -4618,11 +4610,14 @@ def _latency_only_combined_score(
     if not math.isfinite(cost) or cost <= 0:
         return 0.0
     ratio = reference / cost
-    if ratio <= 1.0:
-        # Valid but slower path-changing candidates are useful exploration
-        # examples, but they must not look almost as good as an actual latency
-        # improvement to OpenEvolve's maximizer.
-        return max(1e-6, min(0.099999, 0.1 * ratio))
+    if ratio < 1.0:
+        # Candidate examples and traces still record slower path-changing
+        # programs, but the maximized OpenEvolve objective is now purely
+        # latency after correctness. A slower valid candidate cannot outrank
+        # the current best seed/reference.
+        return 0.0
+    if math.isclose(ratio, 1.0, rel_tol=1e-12, abs_tol=1e-12):
+        return 1.0
     # OpenEvolve maximizes a single score, and raw latency ratios for sampled
     # QBP improvements are often 1.00000x. Keep the ordering purely latency
     # based, but magnify the positive delta so small real improvements are not

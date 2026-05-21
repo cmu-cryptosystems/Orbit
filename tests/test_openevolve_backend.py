@@ -3511,7 +3511,7 @@ def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_pa
         assert "earth." in evolved["artifacts"]["candidate_mlir_preview"]
 
 
-def test_latency_gate_rejects_seed_equivalent_path_without_improvement():
+def test_latency_gate_keeps_seed_equivalent_path_as_correct_baseline():
     result = {
         "valid": True,
         "fallback_selected_budgets": 0,
@@ -3543,8 +3543,10 @@ def test_latency_gate_rejects_seed_equivalent_path_without_improvement():
         policy_effect={"seed_equivalent": False},
     )
 
-    assert gate["correct"] is False
-    assert "seed_equivalent_selected_path_without_latency_improvement" in gate["reasons"]
+    assert gate["correct"] is True
+    assert gate["objective_improved_vs_seed"] is False
+    assert gate["seed_equivalent_path"] is True
+    assert gate["reasons"] == []
 
 
 def test_latency_gate_allows_equivalent_path_with_real_latency_improvement():
@@ -3594,6 +3596,11 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
         "reference_objective_cost_usec": 1000.0,
         "base_objective_cost_usec": 1000.0,
     }
+    equal = {
+        "objective_cost_usec": 1000.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
     much_better = {
         "objective_cost_usec": 900.0,
         "reference_objective_cost_usec": 1000.0,
@@ -3601,11 +3608,14 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
     }
 
     slower_score = oe_backend._latency_only_combined_score(slower, correct=True)
+    equal_score = oe_backend._latency_only_combined_score(equal, correct=True)
     improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
-    assert 0.0 < slower_score < 0.1
+    assert slower_score == 0.0
+    assert equal_score == 1.0
     assert improved_score > 1.0
+    assert equal_score > slower_score
     assert improved_score > slower_score
     assert much_better_score > improved_score
     assert oe_backend._latency_only_combined_score(improved, correct=False) == 0.0

@@ -501,9 +501,8 @@ def place(context):
     bootstrap_penalty, and MCTS action presets. Bootstrap counts are diagnostics
     only; do not optimize toward a fixed count.
     """
-    target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
     mcts = PlacementMCTS(context)
-    actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+    actions = mcts.candidate_actions(action_cap=12)
     reference_action_names = [
         str(action.get("name"))
         for action in actions
@@ -643,10 +642,9 @@ def place(context):
             action["prior"] = 0.19
         action["policy"] = policy
     policy = mcts.low_bootstrap_seed(
-        target_bootstraps=target_bootstraps,
         rollout_budget=20,
         exploration_weight=1.15,
-        max_repair_bootstraps=8,
+        max_repair_bootstraps=16,
         action_cap=len(actions),
     )
     policy["mcts_actions"] = actions
@@ -674,7 +672,42 @@ def place(context):
         "waterline_budget_repair",
     ]
     policy["mcts_exploration_weight"] = 1.15
-    policy["boundary_group_policies"] = []
+    group_policies = []
+    for idx, group in enumerate(mcts.top_costly_boundary_groups(limit=6)):
+        if idx % 3 == 0:
+            group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=12,
+                max_scale_candidates=80,
+                boundary_scale_policy="frontier",
+                scale_lattice="waterline_sf",
+                bootstrap_penalty=35_000_000.0,
+                beam_width=10,
+                state_cap_per_node=48,
+            ))
+        elif idx % 3 == 1:
+            group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=8,
+                max_scale_candidates=64,
+                boundary_scale_policy="waterline",
+                scale_lattice="waterline_sf",
+                bootstrap_penalty=65_000_000.0,
+                beam_width=8,
+                state_cap_per_node=40,
+            ))
+        else:
+            group_policies.append(mcts.boundary_group_policy(
+                group,
+                boundary_state_cap=16,
+                max_scale_candidates=96,
+                boundary_scale_policy="frontier",
+                scale_lattice="dense",
+                bootstrap_penalty=25_000_000.0,
+                beam_width=12,
+                state_cap_per_node=48,
+            ))
+    policy["boundary_group_policies"] = group_policies
     policy["include_seed_repair_actions"] = False
     policy["mcts_prior_order"] = True
     policy["mcts_action_presets"] = mcts.action_presets(
@@ -881,14 +914,13 @@ def place(context):
     """
     builder = PlacementBuilder(context)
     if context.get("harness", {}).get("search_mode") == "bootstrap-mcts":
-        target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
         mcts = PlacementMCTS(context)
         # Mutate mcts_action_presets first for bootstrap-mcts runs. The legacy
         # portfolio below is ignored in this mode, so useful candidates should
         # change action priors/enabled flags, mcts_action_cap, optional
         # allow/block lists, beam settings, scale candidates, and repair
         # aggressiveness in this compact action table.
-        actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+        actions = mcts.candidate_actions(action_cap=12)
         reference_action_names = [
             str(action.get("name"))
             for action in actions
@@ -1028,10 +1060,9 @@ def place(context):
                 action["prior"] = 0.19
             action["policy"] = policy
         policy = mcts.low_bootstrap_seed(
-            target_bootstraps=target_bootstraps,
             rollout_budget=20,
             exploration_weight=1.15,
-            max_repair_bootstraps=8,
+            max_repair_bootstraps=16,
             action_cap=len(actions),
         )
         policy["mcts_actions"] = actions
@@ -1053,6 +1084,42 @@ def place(context):
             "waterline_budget_repair",
         ]
         policy["mcts_exploration_weight"] = 1.15
+        group_policies = []
+        for idx, group in enumerate(mcts.top_costly_boundary_groups(limit=6)):
+            if idx % 3 == 0:
+                group_policies.append(mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=12,
+                    max_scale_candidates=80,
+                    boundary_scale_policy="frontier",
+                    scale_lattice="waterline_sf",
+                    bootstrap_penalty=35_000_000.0,
+                    beam_width=10,
+                    state_cap_per_node=48,
+                ))
+            elif idx % 3 == 1:
+                group_policies.append(mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=8,
+                    max_scale_candidates=64,
+                    boundary_scale_policy="waterline",
+                    scale_lattice="waterline_sf",
+                    bootstrap_penalty=65_000_000.0,
+                    beam_width=8,
+                    state_cap_per_node=40,
+                ))
+            else:
+                group_policies.append(mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=16,
+                    max_scale_candidates=96,
+                    boundary_scale_policy="frontier",
+                    scale_lattice="dense",
+                    bootstrap_penalty=25_000_000.0,
+                    beam_width=12,
+                    state_cap_per_node=48,
+                ))
+        policy["boundary_group_policies"] = group_policies
         policy["include_seed_repair_actions"] = False
         policy["mcts_prior_order"] = True
         policy["mcts_action_presets"] = mcts.action_presets(
@@ -1607,6 +1674,11 @@ def _merge_cached_compile_context(
         context["placement_profile"] = cached["placement_profile"]
     if isinstance(cached.get("unit_hotspots"), list):
         context["unit_hotspots"] = cached["unit_hotspots"]
+    for key in ("top_costly_boundary_groups", "unsolved_boundary_groups"):
+        if key in cached_harness:
+            harness[key] = deepcopy(cached_harness[key])
+        elif isinstance(sampled_seed, dict) and key in sampled_seed:
+            harness[key] = deepcopy(sampled_seed[key])
 
 
 def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> dict[str, Any]:
@@ -1666,7 +1738,14 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 sampled_baseline = _placement_baseline_from_result(sampled_reference)
                 sampled_baseline["source"] = "sampled_initial_seed"
                 sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
-                context.setdefault("harness", {})["sampled_seed_baseline"] = sampled_baseline
+                harness = context.setdefault("harness", {})
+                harness["sampled_seed_baseline"] = sampled_baseline
+                harness["top_costly_boundary_groups"] = list(
+                    sampled_baseline.get("top_costly_boundary_groups", []) or []
+                )[:8]
+                harness["unsolved_boundary_groups"] = dict(
+                    sampled_baseline.get("unsolved_boundary_groups", {}) or {}
+                )
                 context["reference"] = dict(sampled_baseline)
         context["placement_profile"] = reference.get("bottleneck_summary", [])
         print(
@@ -2484,6 +2563,113 @@ def _compile_policy_bank_variants(
                     },
                 },
             )
+    top_groups = []
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    for item in harness.get("top_costly_boundary_groups", []) or []:
+        if isinstance(item, dict):
+            top_groups.append(item)
+    if top_groups:
+        boundary_overlay_specs = [
+            (
+                "trace_cost_frontier_overlays",
+                "frontier",
+                "waterline_sf",
+                12,
+                80,
+                10,
+                48,
+                35_000_000.0,
+            ),
+            (
+                "trace_cost_waterline_overlays",
+                "waterline",
+                "waterline_sf",
+                8,
+                64,
+                8,
+                40,
+                65_000_000.0,
+            ),
+            (
+                "trace_cost_dense_overlays",
+                "frontier",
+                "dense",
+                16,
+                96,
+                12,
+                48,
+                25_000_000.0,
+            ),
+        ]
+        for (
+            label,
+            boundary_policy,
+            scale_lattice,
+            boundary_cap,
+            max_scales,
+            beam_width,
+            state_cap,
+            maintenance_penalty,
+        ) in boundary_overlay_specs:
+            overlays = []
+            for group in top_groups[:6]:
+                selector = group.get("group_key", group)
+                if not isinstance(selector, dict):
+                    continue
+                overlays.append(
+                    {
+                        "selector": dict(selector),
+                        "policy": {
+                            "boundary_state_cap": int(boundary_cap),
+                            "max_scale_candidates": int(max_scales),
+                            "boundary_scale_policy": boundary_policy,
+                            "scale_lattice": scale_lattice,
+                            "bootstrap_penalty": float(maintenance_penalty),
+                            "selection_bootstrap_penalty": 0.0,
+                            "beam_width": int(beam_width),
+                            "state_cap_per_node": int(state_cap),
+                            "selection_objective": "cost",
+                        },
+                    }
+                )
+            if overlays:
+                add(
+                    label,
+                    {
+                        "boundary_group_policies": overlays,
+                        "mcts_action_cap": 12,
+                        "mcts_rollout_budget": 24,
+                        "mcts_exploration_weight": 1.2,
+                        "mcts_max_repair_bootstraps": 128,
+                        "selection_objective": "cost",
+                        "include_seed_repair_actions": False,
+                    },
+                    {
+                        "budget_fulfillment_beam": {
+                            "prior": 0.66,
+                            "policy": {
+                                "boundary_state_cap": int(boundary_cap),
+                                "max_scale_candidates": int(max_scales),
+                                "boundary_scale_policy": boundary_policy,
+                                "scale_lattice": scale_lattice,
+                                "bootstrap_penalty": float(maintenance_penalty),
+                                "selection_objective": "cost",
+                            },
+                        },
+                        "dense_boundary_cost_beam": {
+                            "prior": 0.58,
+                            "policy": {
+                                "strategy": "latency_beam",
+                                "boundary_state_cap": int(max(boundary_cap, 12)),
+                                "max_scale_candidates": int(max(max_scales, 80)),
+                                "boundary_scale_policy": boundary_policy,
+                                "scale_lattice": scale_lattice,
+                                "bootstrap_penalty": float(maintenance_penalty),
+                                "selection_objective": "cost",
+                            },
+                        },
+                    },
+                )
     return variants
 
 
@@ -4069,6 +4255,7 @@ def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(diagnostics, dict):
         diagnostics = {}
     scored_groups = _scored_boundary_group_count(diagnostics)
+    boundary_group_summaries = diagnostics.get("boundary_group_summaries", [])
     return {
         "valid": bool(result.get("valid", False)),
         "final_latency_usec": _finite_float(result.get("final_latency_usec"), float("inf")),
@@ -4110,6 +4297,12 @@ def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "candidate_solved_boundary_groups": int(
             diagnostics.get("candidate_solved_boundary_groups", 0) or 0
+        ),
+        "unsolved_boundary_groups": _boundary_group_unsolved_summary(
+            boundary_group_summaries
+        ),
+        "top_costly_boundary_groups": _boundary_group_top_cost_summary(
+            boundary_group_summaries
         ),
     }
 
@@ -4725,9 +4918,8 @@ _POLICY_EFFECT_KEYS = (
 
 
 def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[str, Any]:
-    target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
     mcts = PlacementMCTS(context)
-    actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+    actions = mcts.candidate_actions(action_cap=12)
     reference_action_names = [
         str(action.get("name"))
         for action in actions
@@ -4867,10 +5059,9 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
             action["prior"] = 0.19
         action["policy"] = policy
     policy = mcts.low_bootstrap_seed(
-        target_bootstraps=target_bootstraps,
         rollout_budget=20,
         exploration_weight=1.15,
-        max_repair_bootstraps=8,
+        max_repair_bootstraps=16,
         action_cap=len(actions),
     )
     policy["mcts_actions"] = actions
@@ -4898,6 +5089,48 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
         "waterline_budget_repair",
     ]
     policy["mcts_exploration_weight"] = 1.15
+    group_policies = []
+    for idx, group in enumerate(mcts.top_costly_boundary_groups(limit=6)):
+        if idx % 3 == 0:
+            group_policies.append(
+                mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=12,
+                    max_scale_candidates=80,
+                    boundary_scale_policy="frontier",
+                    scale_lattice="waterline_sf",
+                    bootstrap_penalty=35_000_000.0,
+                    beam_width=10,
+                    state_cap_per_node=48,
+                )
+            )
+        elif idx % 3 == 1:
+            group_policies.append(
+                mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=8,
+                    max_scale_candidates=64,
+                    boundary_scale_policy="waterline",
+                    scale_lattice="waterline_sf",
+                    bootstrap_penalty=65_000_000.0,
+                    beam_width=8,
+                    state_cap_per_node=40,
+                )
+            )
+        else:
+            group_policies.append(
+                mcts.boundary_group_policy(
+                    group,
+                    boundary_state_cap=16,
+                    max_scale_candidates=96,
+                    boundary_scale_policy="frontier",
+                    scale_lattice="dense",
+                    bootstrap_penalty=25_000_000.0,
+                    beam_width=12,
+                    state_cap_per_node=48,
+                )
+            )
+    policy["boundary_group_policies"] = group_policies
     policy["include_seed_repair_actions"] = False
     policy["mcts_prior_order"] = True
     policy["mcts_action_presets"] = mcts.action_presets(
@@ -13911,13 +14144,22 @@ def _boundary_group_selector_is_well_formed(selector: Any) -> bool:
 def _selector_matches_any_boundary_group(selector: Any, context: dict[str, Any]) -> bool:
     if not _boundary_group_selector_is_well_formed(selector):
         return False
-    budgets = context.get("io_budgets", [])
-    if not isinstance(budgets, list) or not budgets:
-        return True
-    groups = _budget_boundary_groups(
-        [_io_budget_from_json(item) for item in budgets if isinstance(item, dict)]
-    )
-    return any(_boundary_group_selector_matches_key(selector, key) for key in groups)
+    contexts = [context]
+    for task in context.get("sampled_budget_tasks", []) or []:
+        if isinstance(task, dict) and isinstance(task.get("context"), dict):
+            contexts.append(task["context"])
+    saw_budget_groups = False
+    for candidate_context in contexts:
+        budgets = candidate_context.get("io_budgets", [])
+        if not isinstance(budgets, list) or not budgets:
+            continue
+        saw_budget_groups = True
+        groups = _budget_boundary_groups(
+            [_io_budget_from_json(item) for item in budgets if isinstance(item, dict)]
+        )
+        if any(_boundary_group_selector_matches_key(selector, key) for key in groups):
+            return True
+    return not saw_budget_groups
 
 
 def _boundary_group_selector_matches_key(selector: Any, group_key: tuple) -> bool:

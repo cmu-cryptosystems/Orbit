@@ -2781,6 +2781,52 @@ def test_boundary_group_policy_overlay_targets_sampled_group():
     assert merged["bootstrap_penalty"] == 45_000_000.0
 
 
+def test_initial_compile_seed_uses_trace_boundary_group_policies(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "context": {
+                "io_budgets": [
+                    {
+                        "in_lvl": params.lvl_ub,
+                        "in_scl": params.Sw,
+                        "out_lvl": params.lvl_ub - 1,
+                        "out_scl": params.Sw,
+                        "main_dag_size": 0,
+                    }
+                ]
+            }
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {
+                "in_lvl": params.lvl_ub,
+                "in_scl": params.Sw,
+                "maino_v": "",
+                "main_dag_size": 0,
+            },
+            "min_cost_usec": 123.0,
+        }
+    ]
+    program_path = tmp_path / "initial_trace.py"
+    program_path.write_text(
+        oe_backend._initial_compile_program_source("bootstrap-mcts"),
+        encoding="utf-8",
+    )
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    assert hints["boundary_group_policies"]
+    first = hints["boundary_group_policies"][0]
+    assert first["selector"]["in_lvl"] == params.lvl_ub
+    assert first["policy"]["selection_objective"] == "cost"
+    assert first["policy"]["boundary_state_cap"] >= 8
+
+
 def test_policy_bank_record_carries_boundary_trace_examples():
     evaluation = {
         "metrics": {

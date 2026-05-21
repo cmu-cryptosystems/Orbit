@@ -13,17 +13,21 @@ def check_tdag(tdag: Tdag):
         scale = tdag.nodes[v].get('scale', None)
         if lvl is None or scale is None:
             raise ValueError(f"Node {v} missing level or scale attribute.")
-        # Check scale bounds
-        if not tdag.params.Sw <= scale <= tdag.params.Sf + 2 * tdag.params.Sw:
-            if tdag.nodes[v]['op'] == 'constant' and tdag.params.Csw <= scale < tdag.params.Sw:
-                continue
-            raise ValueError(f"Node {v} has scale {scale} out of bounds [{tdag.params.Sw}, {tdag.params.Sf + 2 * tdag.params.Sw}].")
-        # Check level bounds
-        if not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:
-            raise ValueError(f"Node {v} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub}].")
         op = tdag.nodes[v].get('op', None)
         if op is None:
             raise ValueError(f"Node {v} missing operation attribute.")
+        if op == 'constant':
+            scale_lb = min(tdag.params.Csw, tdag.params.relaxed_scale_floor)
+        else:
+            scale_lb = tdag.params.scale_lower_bound(v, tdag.nodes[v], "out")
+        # Check scale bounds
+        if not scale_lb <= scale <= tdag.params.Sf + 2 * tdag.params.Sw:
+            if op == 'constant' and scale_lb <= scale < tdag.params.Sw:
+                continue
+            raise ValueError(f"Node {v} has scale {scale} out of bounds [{scale_lb}, {tdag.params.Sf + 2 * tdag.params.Sw}].")
+        # Check level bounds
+        if not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:
+            raise ValueError(f"Node {v} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub}].")
         if op in ['modswitch_single', 'rescale_single'] and lvl >= tdag.params.lvl_ub:
             raise ValueError(f"Node {v} with operation {op} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub-1}].")
         if op == 'bootstrap_single' and not (tdag.params.bts_lb < lvl <= tdag.params.bts_ub):
@@ -107,4 +111,3 @@ def check_tdag(tdag: Tdag):
         else:
             raise ValueError(f"Node {v} has unknown operation {op}.")
     return True
-

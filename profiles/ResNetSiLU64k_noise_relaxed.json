@@ -1,0 +1,18 @@
+{
+  "schema_version": "orbit-resilience-constraints-v0",
+  "model": {
+    "name": "ResNetSiLU64k"
+  },
+  "description": "Local waterline relaxations for ResNetSiLU64k activation-polynomial regions. Unmatched regions retain the requested Orbit waterline.",
+  "constraints": [
+    {
+      "target_id": "silu_activation_polynomials",
+      "match": {
+        "comment_regex": "SiLU_(?:poly|mul|add)"
+      },
+      "min_scale": 32,
+      "fragility_class": "profiled_relaxed",
+      "ports": ["in", "out"]
+    }
+  ]
+}

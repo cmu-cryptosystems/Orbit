@@ -21,6 +21,8 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
         f"Sw{params.Sw}",
         "16k" if params.netname.endswith("16k") else "64k"
     ])
+    if params.resilience_profile is not None:
+        qbp_name = f"{qbp_name}_noise_{params.resilience_profile.fingerprint}"
     
     start_time = time.time()
     qbp_manager = QBPManager(params, le)
@@ -60,4 +62,3 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
     print(f"Final Choice: input (l,s)=({final_io_choice[0]},{final_io_choice[1]}), output (l,s)=({final_io_choice[2]},{final_io_choice[3]}), cost={final_cost}")
     print(f"Final cost (aggregated partition cost): {final_cost/1000000:.3f} sec.")
     return assign, ilp_times
-    

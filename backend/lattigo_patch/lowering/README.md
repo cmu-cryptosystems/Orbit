@@ -45,6 +45,11 @@ go run ./fhe [options]
 - `-input <file>`: Path to input file
 - `-output [filename]`: Obtain output [filename] in outputs/ directory
 - `-getLog [filename]`: Obtain debug log [filename] in logs/ directory (default: precision_debug.txt)
+- `-heMode=false`: Run the MLIR plaintext executor instead of encrypted CKKS execution
+- `-noiseMode off|simulate`: Enable deterministic CKKS-style noise injection in plaintext execution
+- `-noiseProfile <json>`: Path to operation precision/noise metadata, such as `profiles/ckks_noise_estimator_64k_s40.json`
+- `-noiseSeed <int>`: Seed for deterministic Gaussian noise draws
+- `-noiseReport <json>`: Optional per-operation noise diagnostics JSON path
 
 ### Examples
 
@@ -62,6 +67,16 @@ go run ./fhe [options]
 # With debug logging
 ./fhe_binary -mlir mlirs/orbit_ResNetReLU.mlir -n 16384 \
   -getLog debug_output.txt
+
+# Plaintext execution with CKKS-style simulated operation noise
+./fhe_binary -heMode=false -noiseMode=simulate \
+  -noiseProfile profiles/ckks_noise_estimator_64k_s40.json \
+  -noiseSeed 20260519 -noiseReport noise_report.json \
+  -mlir mlirs/orbit_ResNetSiLU64k.mlir -n 65536 \
+  -maxLevel 16 -bootstrapMinLevel 3 -bootstrapMaxLevel 16 \
+  -cons input_constants/ResNetSiLU64k_hecate.cst \
+  -input input_data/64k/resnet/silu/inputs/input0.txt \
+  -output noisy_resnet_sample0.out
 ```
 
 ## Memory Management

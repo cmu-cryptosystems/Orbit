@@ -1,6 +1,7 @@
 import hecate as hc
 import sys
 import os
+import argparse
 import poly
 from poly.models.AlexNetReLU import *
 from poly.models.AlexNetSiLU import *
@@ -129,13 +130,19 @@ def postprocess(res, torch_res_shape):
     return res[0,:torch_res_size].reshape(torch_res_shape) *32
     
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate DaCapo benchmark input/reference samples.")
+    parser.add_argument("num_inputs", type=int)
+    parser.add_argument("--model", choices=["alexnet", "resnet", "vgg16", "squeezenet", "mobilenet"], default=None)
+    parser.add_argument("--activation", choices=["silu", "relu"], default=None)
+    parser.add_argument("--n", choices=["16", "16k", "64", "64k"], default=None)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
 
-    if len(sys.argv) != 2:
-        print("Usage: python gen_input_data.py <num_inputs>")
-        sys.exit(1)
-    
-    num_inputs = int(sys.argv[1])
+    args = parse_args()
+    num_inputs = args.num_inputs
     
     io_pairs = []
     for i in range(num_inputs):
@@ -143,11 +150,15 @@ if __name__ == "__main__":
         input_var = input.unsqueeze(0)
         io_pairs.append( (i, input_var, target) )
     
-    for modelname in ["resnet", "alexnet", "vgg16", "squeezenet", "mobilenet"]:
-        for modelact in ["silu", "relu"]:
+    model_names = [args.model] if args.model else ["resnet", "alexnet", "vgg16", "squeezenet", "mobilenet"]
+    model_acts = [args.activation] if args.activation else ["silu", "relu"]
+    slot_sizes = [2**16 if args.n in {"64", "64k"} else 2**14] if args.n else [2**14, 2**16]
+
+    for modelname in model_names:
+        for modelact in model_acts:
             model = getModel(modelname, modelact)
             model = model.eval()
-            for n in [2**14, 2**16]:
+            for n in slot_sizes:
                 if modelname == "mobilenet" and n != 2**16:
                     continue
                 n_name = "16k" if n == 2**14 else "64k"
@@ -194,12 +205,10 @@ if __name__ == "__main__":
                         f.write(f"{length}\n")
                         for val in range(length):
                             f.write(f"{reference[val].item()}\n")
-                
+
                 accuracy = num_correct / num_total
                 print(f"Accuracy for {modelname} with {modelact} activation, n={n_name}: {accuracy*100:.2f}%")
-                
+
                 with open(f"{dir_path}true_labels.txt", "w") as f:
                     for (idx, _, target) in io_pairs:
                         f.write(f"input{idx}.txt: {target}\n")
-                    
-            

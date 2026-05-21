@@ -101,15 +101,21 @@ type LattigoFHE struct {
 	enableTiming      bool
 	heMode            bool
 	timingStats       *TimingStats
+	noise             *NoiseSimulator
 }
 
-func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPath string, inputPath string, outputFile string, trueLabelsPath string, fileType FileType, maxLevel int, bootstrapMinLevel int, bootstrapMaxLevel int, logFile string, enableTiming bool, heMode bool) *LattigoFHE {
+func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPath string, inputPath string, outputFile string, trueLabelsPath string, fileType FileType, maxLevel int, bootstrapMinLevel int, bootstrapMaxLevel int, logFile string, enableTiming bool, heMode bool, noiseOptions NoiseOptions) (*LattigoFHE, error) {
 	var timingStats *TimingStats
 	if enableTiming {
 		timingStats = &TimingStats{
 			OperationStats: make(map[op]map[int]*LevelStats),
 			TotalTime:      0,
 		}
+	}
+
+	noise, err := NewNoiseSimulator(noiseOptions)
+	if err != nil {
+		return nil, err
 	}
 
 	return &LattigoFHE{
@@ -136,7 +142,8 @@ func NewLattigoFHE(n int, instructionsPath string, mlirPath string, constantsPat
 		enableTiming:      enableTiming,
 		timingStats:       timingStats,
 		heMode:            heMode,
-	}
+		noise:             noise,
+	}, nil
 }
 
 func (lattigo *LattigoFHE) findUniqueRots(operations []string) []int {
@@ -565,7 +572,11 @@ func (lattigo *LattigoFHE) Run() (pt_results []float64, _err error) {
 	}
 	if lattigo.fileType == MLIR {
 		fmt.Printf("\nMLIR Result Stats:\n")
-		fmt.Printf("Decrypted Result: %v...\n", pt_results[:20])
+		previewLen := 20
+		if len(pt_results) < previewLen {
+			previewLen = len(pt_results)
+		}
+		fmt.Printf("Decrypted Result: %v...\n", pt_results[:previewLen])
 		if lattigo.heMode {
 			fmt.Printf("Result Scale: %f\n", math.Log2(lastResult.Scale.Float64()))
 			fmt.Printf("Result Level (following lattigo): %v\n", lastResult.Level())
@@ -584,6 +595,12 @@ func (lattigo *LattigoFHE) Run() (pt_results []float64, _err error) {
 		err := lattigo.writeTimingReport()
 		if err != nil {
 			fmt.Printf("Warning: Failed to write timing report: %v\n", err)
+		}
+	}
+	if lattigo.noise != nil {
+		err := lattigo.noise.WriteReport()
+		if err != nil {
+			fmt.Printf("Warning: Failed to write noise report: %v\n", err)
 		}
 	}
 
@@ -679,8 +696,14 @@ func (lattigo *LattigoFHE) RunBatch() error {
 			continue
 		}
 
-		finalResult := lattigo.env[outputId]
-		pt_results := lattigo.decode(finalResult)
+		var finalResult *rlwe.Ciphertext
+		var pt_results []float64
+		if lattigo.heMode {
+			finalResult = lattigo.env[outputId]
+			pt_results = lattigo.decode(finalResult)
+		} else {
+			pt_results = lattigo.ptEnv[outputId]
+		}
 
 		// Print first 10 values from the output
 		fmt.Printf("  First 10 output values: [")
@@ -729,7 +752,7 @@ func (lattigo *LattigoFHE) RunBatch() error {
 			HasValidation:  hasValidation,
 		})
 
-		if len(expected) > 0 {
+		if len(expected) > 0 && lattigo.heMode {
 			accuracy := lattigo.calculateAccuracy(expected, finalResult)
 			fmt.Printf("  Accuracy: %.2f%%\n", accuracy)
 		}
@@ -771,6 +794,12 @@ func (lattigo *LattigoFHE) RunBatch() error {
 		err := lattigo.writeTimingReport()
 		if err != nil {
 			fmt.Printf("Warning: Failed to write timing report: %v\n", err)
+		}
+	}
+	if lattigo.noise != nil {
+		err := lattigo.noise.WriteReport()
+		if err != nil {
+			fmt.Printf("Warning: Failed to write noise report: %v\n", err)
 		}
 	}
 

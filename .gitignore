@@ -8,5 +8,7 @@ __pycache__/
 qbps_cache*/
 frontend/dacapo/
 frontend/log/
+frontend/dacapo_patch/data/
 backend/lattigo/
 .venv/
+profiles/noise_calibration_candidates/

@@ -347,5 +347,9 @@ func (lattigo *LattigoFHE) evalOpPlain(term *Term) []float64 {
 		lattigo.recordTiming(term.Op, term.Level, duration)
 	}
 
+	if lattigo.noise != nil {
+		result = lattigo.noise.Inject(lattigo, term, result)
+	}
+
 	return result
 }

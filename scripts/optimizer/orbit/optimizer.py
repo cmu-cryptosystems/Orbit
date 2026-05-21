@@ -20,6 +20,11 @@ def run(input_file: str, output_file: str, params: Params):
     og_dag = build_from_mlir(input_file, params)
     og_dag.squash_ops(['rescale', 'upscale', 'modswitch', 'bootstrap'])
     print(f"Built original DAG with {len(og_dag.nodes)} nodes and {len(og_dag.edges)} edges.")
+    if params.resilience_profile is not None:
+        print(f"Loaded noise profile: {params.resilience_profile.describe()}")
+        print(f"Noise relaxed floor: {params.relaxed_scale_floor} (requested Sw={params.requested_Sw})")
+    if params.upscale_objective_weight:
+        print(f"Upscale objective weight: {params.upscale_objective_weight}")
     timestamps['DAG Load Time'] = time.time() - start_time
     
     if params.comp:
@@ -34,6 +39,20 @@ def run(input_file: str, output_file: str, params: Params):
     else:
         comp_dag = og_dag.copy_tdag()
         og_to_comp = {node: node for node in og_dag.nodes}
+
+    if params.resilience_profile is not None:
+        report = params.resilience_profile.match_report(comp_dag)
+        params.resilience_match_report = report
+        print(params.resilience_profile.format_match_report(report))
+        if report["unmatched_targets"]:
+            preview = ", ".join(str(target) for target in report["unmatched_targets"][:5])
+            suffix = "..." if len(report["unmatched_targets"]) > 5 else ""
+            print(f"Unmatched noise targets: {preview}{suffix}")
+        if report["matched_nodes"] == 0 and not params.allow_empty_resilience_match:
+            raise RuntimeError(
+                "Noise profile matched zero compressed TDAG nodes. "
+                "Use --allow-empty-resilience-match only to debug old profiles."
+            )
     
     assign, ilp_times = orbit_core(comp_dag, le, params)
     for k, v in ilp_times.items():
@@ -89,6 +108,25 @@ def main():
     parser.add_argument('--bypass-dep', type=int, default=15, help='Bypass dependency level (default: 15)')
     parser.add_argument('--threads', type=int, default=16, help='Number of threads (default: 16)')
     parser.add_argument('--netname', type=str, default="", help='Network name for qbp reusing purposes (default: mlirs_input/<netname>.mlir)')
+    parser.add_argument(
+        '--noise-profile',
+        '--resilience-profile',
+        dest='resilience_profile',
+        type=str,
+        default=None,
+        help='ckks robustness/noise JSON or Orbit local scale constraints JSON',
+    )
+    parser.add_argument(
+        '--allow-empty-resilience-match',
+        action='store_true',
+        help='Allow a loaded noise profile to match zero TDAG nodes',
+    )
+    parser.add_argument(
+        '--upscale-objective-weight',
+        type=float,
+        default=None,
+        help='Weight for the linear ILP proxy that discourages later upscale pressure',
+    )
     
     args = parser.parse_args()
     if args.nobypass:
@@ -103,7 +141,9 @@ def main():
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname)
+                    netname=netname, resilience_profile=args.resilience_profile,
+                    allow_empty_resilience_match=args.allow_empty_resilience_match,
+                    upscale_objective_weight=args.upscale_objective_weight)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

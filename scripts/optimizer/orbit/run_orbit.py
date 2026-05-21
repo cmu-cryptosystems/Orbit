@@ -15,6 +15,26 @@ if __name__ == "__main__":
     parser.add_argument('--nocomp', action='store_true', help='Disable Compression')
     parser.add_argument('--nopart', action='store_true', help='Disable Partitioning')
     parser.add_argument('--sim-vari', action='store_true', help='Use simulated variadic bootstrapping cost model')
+    parser.add_argument('--threads', type=int, default=16, help='Number of Gurobi threads')
+    parser.add_argument(
+        '--noise-profile',
+        '--resilience-profile',
+        dest='resilience_profile',
+        type=str,
+        default=None,
+        help='ckks robustness/noise JSON or Orbit local scale constraints JSON',
+    )
+    parser.add_argument(
+        '--allow-empty-resilience-match',
+        action='store_true',
+        help='Allow a loaded noise profile to match zero TDAG nodes',
+    )
+    parser.add_argument(
+        '--upscale-objective-weight',
+        type=float,
+        default=None,
+        help='Weight for the linear ILP proxy that discourages later upscale pressure',
+    )
     
     args = parser.parse_args()
     benchmark = args.model+args.act+str(args.n)+"k"
@@ -27,7 +47,10 @@ if __name__ == "__main__":
         costs = f"cost_models/profiled_LATTIGONEW_CPU{args.n}k_3_{args.Lm}.json"
     
     result_dir = f"mlirs_output/orbit/{args.model}/{args.Sw}/{args.act}/{this_n}/"
-    outname = f"orbit_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "")
+    upscale_suffix = ""
+    if args.upscale_objective_weight is not None and args.upscale_objective_weight != 0.0:
+        upscale_suffix = f"_upw{str(args.upscale_objective_weight).replace('.', 'p')}"
+    outname = f"orbit_{benchmark}_Lm{args.Lm}_Sw{args.Sw}" + (f"_Csw{args.Csw}" if args.Csw is not None else "") + ("_nobypass" if args.nobypass else "_bypass") + ("_qbp" if args.qbp else "_noqbp") + ("_nocomp" if args.nocomp else "_comp") + ("_nopart" if args.nopart else "_part") + ("_simvari" if args.sim_vari else "") + ("_noise" if args.resilience_profile else "") + upscale_suffix
     
     os.makedirs(result_dir, exist_ok=True)
     
@@ -39,6 +62,8 @@ if __name__ == "__main__":
         "--costjson", costs,
         "--maxlevel", str(args.Lm),
         "--waterscale", str(args.Sw),
+        "--threads", str(args.threads),
+        "--netname", benchmark,
     ]
     if args.Csw is not None:
         cmds += ["--constantscale", str(args.Csw)]
@@ -50,6 +75,12 @@ if __name__ == "__main__":
         cmds.append("--no-partition")
     if args.qbp:
         cmds.append("--enable-reqbp")
+    if args.resilience_profile:
+        cmds += ["--noise-profile", args.resilience_profile]
+    if args.allow_empty_resilience_match:
+        cmds.append("--allow-empty-resilience-match")
+    if args.upscale_objective_weight is not None:
+        cmds += ["--upscale-objective-weight", str(args.upscale_objective_weight)]
         
     with open(f"{result_dir}{outname}.txt", "w", buffering=1) as stdout_file, \
         open(f"{result_dir}{outname}.err", "w", buffering=1) as stderr_file:

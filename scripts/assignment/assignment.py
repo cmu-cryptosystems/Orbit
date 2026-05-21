@@ -99,7 +99,18 @@ class Assign:
             if op == 'constant':
                 continue
 
+            scale_lb = self.params.scale_lower_bound(v, self.tdag.nodes[v], "out")
+            if v_os < scale_lb:
+                raise ValueError(
+                    f"Node {v} output scale {v_os} below local lower bound {scale_lb}."
+                )
+
             v_il, v_is = self.get_v_in_lvl_scl(v)
+            input_scale_lb = self.params.scale_lower_bound(v, self.tdag.nodes[v], "in")
+            if v_is < input_scale_lb:
+                raise ValueError(
+                    f"Node {v} input scale {v_is} below local lower bound {input_scale_lb}."
+                )
             if not self.params.check_resbts(v_il, v_is, v_ol, v_os):
                 raise ValueError(f"Node {v} with operation {op} has invalid level/scale transition: in({v_il}, {v_is}) -> out({v_ol}, {v_os}).")
         
@@ -114,6 +125,14 @@ class Assign:
                     raise ValueError(f"Edge ({u} -> {v}) missing output level/scale assignment.")
                 e_il = self.v_lvl_out.get(u, None)
                 e_is = self.v_scl_out.get(u, None)
+                edge_scale_lb = max(
+                    self.params.scale_lower_bound(u, self.tdag.nodes[u], "out"),
+                    self.params.scale_lower_bound(v, self.tdag.nodes[v], "in"),
+                )
+                if e_os < edge_scale_lb:
+                    raise ValueError(
+                        f"Edge ({u} -> {v}) output scale {e_os} below local lower bound {edge_scale_lb}."
+                    )
                 if not self.params.check_resbts(e_il, e_is, e_ol, e_os):
                     raise ValueError(f"Edge ({u} -> {v}) has invalid level/scale transition: in({e_il}, {e_is}) -> out({e_ol}, {e_os}).")
         

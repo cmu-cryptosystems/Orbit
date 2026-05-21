@@ -1,8 +1,25 @@
 import json
 import numpy as np
+from ..resilience import ResilienceProfile
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
+    def __init__(
+        self,
+        le_json,
+        sysname,
+        mode,
+        Sw=None,
+        CSw=None,
+        bpsdepth=None,
+        threads=None,
+        comp=None,
+        part=None,
+        reqbp=None,
+        netname=None,
+        resilience_profile=None,
+        allow_empty_resilience_match=False,
+        upscale_objective_weight=None,
+    ):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -29,16 +46,61 @@ class Params:
         self.sysname = sysname
         self.Sw = Sw if Sw is not None else self.Sf
         self.Csw = CSw if CSw is not None else self.Sw
+        self.requested_Sw = self.Sw
+        self.requested_Csw = self.Csw
         self.bpsdepth = bpsdepth  # possibly None
         self.threads = threads if threads is not None else 16
         self.comp = comp if comp is not None else True
         self.part = part if part is not None else True
         self.reqbp = reqbp if reqbp is not None else False
         self.netname = netname if netname is not None else ""
+        self.resilience_profile_path = resilience_profile
+        self.resilience_profile = ResilienceProfile.load(resilience_profile)
+        self.allow_empty_resilience_match = allow_empty_resilience_match
+        if upscale_objective_weight is None:
+            if self.resilience_profile is None:
+                self.upscale_objective_weight = 0.0
+            else:
+                self.upscale_objective_weight = self.resilience_profile.objective_upscale_weight
+        else:
+            self.upscale_objective_weight = float(upscale_objective_weight)
+        if self.resilience_profile is None:
+            self.relaxed_scale_floor = self.Sw
+        else:
+            self.relaxed_scale_floor = self.resilience_profile.relaxed_global_scale(self.Sw)
+        self.resilience_match_report = None
         
         self.trunc_val = 1 # truncation value for latency estimation
         self.dacapo_mlir_in = True  # need to revert the input MLIR level
         self.dacapo_mlir_out = True # need to revert the output MLIR level
+
+    def has_resilience_constraints(self) -> bool:
+        return (
+            self.resilience_profile is not None
+            and len(self.resilience_profile.constraints) > 0
+        )
+
+    def scale_lower_bound(self, node_label: str, node_attrs: dict, port: str) -> int:
+        if self.resilience_profile is None:
+            return self.Sw
+        profile_bound = self.resilience_profile.scale_lower_bound(
+            node_label,
+            node_attrs,
+            self.requested_Sw,
+            port,
+        )
+        return min(self.requested_Sw, profile_bound)
+
+    def constant_scale_for_node(self, node_label: str, node_attrs: dict) -> int:
+        if self.resilience_profile is None:
+            return self.Csw
+        profile_bound = self.resilience_profile.constant_scale_lower_bound(
+            node_label,
+            node_attrs,
+            self.requested_Csw,
+            self.requested_Sw,
+        )
+        return min(self.Csw, profile_bound)
         
     def check_res(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
         if in_lvl < out_lvl:

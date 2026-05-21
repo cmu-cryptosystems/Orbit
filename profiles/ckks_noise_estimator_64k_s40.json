@@ -1,0 +1,46 @@
+{
+  "source": "github.com/tuneinsight/ckks-noise-estimator",
+  "log_n": 16,
+  "log_scale": 40,
+  "iterations": 3,
+  "operation_stats": {
+    "add": {
+      "rms_abs_error": 1.979695824214776e-8,
+      "max_abs_error": 1.3218069901381387e-7,
+      "precision_bits": 25.59014597859604
+    },
+    "mul_cipher": {
+      "rms_abs_error": 1.6185772925152162e-8,
+      "max_abs_error": 1.5603748591873923e-7,
+      "precision_bits": 25.880698498361276
+    },
+    "mul_plain": {
+      "rms_abs_error": 2.8038646682218607e-8,
+      "max_abs_error": 2.2982031747391548e-7,
+      "precision_bits": 25.08800804141831
+    },
+    "rescale": {
+      "rms_abs_error": 15407.74878725637,
+      "max_abs_error": 98657.05160345709,
+      "precision_bits": -13.911368465885129
+    },
+    "rotate": {
+      "rms_abs_error": 1.994769976815382e-8,
+      "max_abs_error": 1.555376115604236e-7,
+      "precision_bits": 25.57920236475179
+    }
+  },
+  "operation_precision_bits": {
+    "add": 25.59014597859604,
+    "bootstrap": 24,
+    "constant": 60,
+    "input": 60,
+    "modswitch": 42,
+    "mul_cipher": 25.880698498361276,
+    "mul_plain": 25.08800804141831,
+    "negate": 60,
+    "rescale": 38,
+    "rotate": 25.57920236475179,
+    "upscale": 52
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "schema_version": "orbit-resilience-constraints-v0",
+  "model": {
+    "name": "ResNetSiLU64k"
+  },
+  "objective": {
+    "upscale_weight": 0.0
+  },
+  "description": "Noise-calibrated local waterline relaxation from backend plaintext CKKS-style operation-noise simulation. Unmatched regions retain Sw=40.",
+  "calibration_report": {
+    "candidate": true,
+    "candidate_id": "repair_g22_silu24_waterline_silu_cores22",
+    "stage": "waterline",
+    "group_scales": {
+      "silu_core": 22
+    },
+    "constant_min_scale": null,
+    "upscale_objective_weight": 0.0,
+    "estimator_json": "/home/jwaters/orbit_noise_relaxed_20260520_middle_ground/profiles/ckks_noise_estimator_64k_s40.json",
+    "trial_seeds": [
+      20260519,
+      20260520,
+      20260521
+    ],
+    "max_noisy_runs": 20,
+    "parallel_runs": 48
+  },
+  "constraints": [
+    {
+      "target_id": "noise_calibrated_silu_core_s22",
+      "group": "silu_core",
+      "match": {
+        "comment_regex": ".*"
+      },
+      "min_scale": 22,
+      "fragility_class": "ckks_noise_calibrated",
+      "ports": [
+        "in",
+        "out"
+      ]
+    },
+    {
+      "target_id": "noise_calibrated_silu_repair_s24",
+      "group": "silu_repair",
+      "match": {
+        "comment_regex": "SiLU_(?:poly|mul|add)"
+      },
+      "min_scale": 24,
+      "fragility_class": "ckks_noise_calibrated",
+      "ports": [
+        "in",
+        "out"
+      ]
+    }
+  ]
+}

@@ -21,9 +21,19 @@ class VarPool:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
             self.vars[f"v_lvl_in_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_in_{v}")
-            self.vars[f"v_scl_in_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_in_{v}")
+            self.vars[f"v_scl_in_{v}"] = model.addVar(
+                lb=self._node_scale_lb(tdag, v, "in"),
+                ub=self.Smax,
+                vtype=GRB.INTEGER,
+                name=f"v_scl_in_{v}",
+            )
             self.vars[f"v_lvl_out_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_out_{v}")
-            self.vars[f"v_scl_out_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_out_{v}")
+            self.vars[f"v_scl_out_{v}"] = model.addVar(
+                lb=self._node_scale_lb(tdag, v, "out"),
+                ub=self.Smax,
+                vtype=GRB.INTEGER,
+                name=f"v_scl_out_{v}",
+            )
             self.vars[f"v_use_r_{v}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"v_use_r_{v}")
             self.vars[f"v_use_b_{v}"] = model.addVar(vtype=GRB.BINARY, name=f"v_use_b_{v}")
         
@@ -38,9 +48,18 @@ class VarPool:
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"e_scl_out_{edge_label}")
+                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(
+                    lb=self._edge_scale_lb(tdag, u, v),
+                    ub=self.Smax,
+                    vtype=GRB.INTEGER,
+                    name=f"e_scl_out_{edge_label}",
+                )
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
+                model.addConstr(
+                    self.vars[f"e_scl_out_{edge_label}"] >= self._edge_scale_lb(tdag, u, v),
+                    name=f"edge_scale_lb_{edge_label}",
+                )
             self.vars[f"e_use_r_{edge_label}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"e_use_r_{edge_label}")
             
         # Constant variables
@@ -52,13 +71,28 @@ class VarPool:
             # node variables
             self.vars[f"v_lvl_out_{u}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"v_scl_out_{u}"] = model.addVar(lb=params.Csw, ub=params.Csw, vtype=GRB.INTEGER, name=f"v_scl_out_{u}")
+                const_scale = params.constant_scale_for_node(v, tdag.nodes[v])
+                self.vars[f"v_scl_out_{u}"] = model.addVar(lb=const_scale, ub=const_scale, vtype=GRB.INTEGER, name=f"v_scl_out_{u}")
             else:
                 self.vars[f"v_scl_out_{u}"] = self.vars[f"v_scl_in_{v}"]
             # edge variables
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
+
+    def _node_scale_lb(self, tdag: Tdag, v: str, port: str) -> int:
+        scale_lb = self.params.scale_lower_bound(v, tdag.nodes[v], port)
+        if scale_lb > self.Smax:
+            raise ValueError(
+                f"Node {v} has local min_scale={scale_lb}, above Orbit Smax={self.Smax}."
+            )
+        return scale_lb
+
+    def _edge_scale_lb(self, tdag: Tdag, u: str, v: str) -> int:
+        return max(
+            self._node_scale_lb(tdag, u, "out"),
+            self._node_scale_lb(tdag, v, "in"),
+        )
             
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
@@ -153,6 +187,42 @@ def add_ilp_linear_cost(tdag: Tdag, vp: VarPool, le: LatencyEstimator):
             this_cost = le.lin_op_lmaps[tdag.nodes[v]['op'] + '_double']
             vp.total_cost.append(double_cnt * (this_cost[0] * vp.var_lvl(v, 'in') + this_cost[1]))
 
+def add_ilp_upscale_proxy_cost(tdag: Tdag, vp: VarPool, le: LatencyEstimator):
+    params = vp.params
+    weight = getattr(params, "upscale_objective_weight", 0.0)
+    if weight <= 0:
+        return
+
+    upscale_costs = le.op_lmaps.get('upscale_single', {})
+    if not upscale_costs:
+        return
+    avg_upscale_cost = sum(upscale_costs.values()) / len(upscale_costs)
+    cost_per_scale_bit = weight * avg_upscale_cost / params.Sf
+    model = vp.model
+
+    for v in tdag.nodes:
+        if tdag.nodes[v]['op'] == 'constant':
+            continue
+        deficit = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"v_upscale_deficit_{v}")
+        vp.vars[f"v_upscale_deficit_{v}"] = deficit
+        model.addConstr(
+            deficit >= vp.var_scl(v, 'out') + params.Sf * vp.var_use(v, 'r') - vp.var_scl(v, 'in'),
+            name=f"v_upscale_deficit_{v}_lb",
+        )
+        vp.total_cost.append(tdag.nodes[v]['weight'] * cost_per_scale_bit * deficit)
+
+    for u, v in tdag.edges:
+        if tdag.nodes[u]['op'] == 'constant':
+            continue
+        edge_label = vp.get_edge_label(u, v)
+        deficit = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"e_upscale_deficit_{edge_label}")
+        vp.vars[f"e_upscale_deficit_{edge_label}"] = deficit
+        model.addConstr(
+            deficit >= vp.var_scl((u, v), 'out') + params.Sf * vp.var_use((u, v), 'r') - vp.var_scl((u, v), 'in'),
+            name=f"e_upscale_deficit_{edge_label}_lb",
+        )
+        vp.total_cost.append(tdag.edges[u, v]['weight'] * cost_per_scale_bit * deficit)
+
 def add_ilp_io_budgets(tdag: Tdag, vp: VarPool, io_budgets):
     v_in = list(tdag.inputs)[0]
     v_out = list(tdag.outputs)[0]
@@ -236,6 +306,7 @@ def solve_ilp(tdag: Tdag, io_budgets: dict, le: LatencyEstimator, task_name: str
     
     add_ilp_constraints(tdag, vp)
     add_ilp_linear_cost(tdag, vp, le)
+    add_ilp_upscale_proxy_cost(tdag, vp, le)
     add_ilp_io_budgets(tdag, vp, io_budgets)
     if 'maino_v' in io_budgets:
         solve_ilp_core_bypass(tdag, vp, io_budgets, num_threads)
@@ -262,17 +333,23 @@ def decode_ilp_sol(tdag: Tdag, vp: VarPool) -> Assign:
             # input nodes, need to store in-level/scale
             assign.v_lvl_in[v] = round(vp.var_lvl(v, 'in').X)
             assign.v_scl_in[v] = round(vp.var_scl(v, 'in').X)
-            assert assign.v_scl_in[v] >= params.Sw, f"Node {v} input scale {assign.v_scl_in[v]} below Sw={params.Sw}"
+            input_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "in")
+            assert assign.v_scl_in[v] >= input_scale_lb, f"Node {v} input scale {assign.v_scl_in[v]} below local lower bound {input_scale_lb}"
         assign.v_lvl_out[v] = round(vp.var_lvl(v, 'out').X)
         assign.v_scl_out[v] = round(vp.var_scl(v, 'out').X)
         if tdag.nodes[v]['op'] != 'constant':
-            assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
+            output_scale_lb = params.scale_lower_bound(v, tdag.nodes[v], "out")
+            assert assign.v_scl_out[v] >= output_scale_lb, f"Node {v} output scale {assign.v_scl_out[v]} below local lower bound {output_scale_lb}"
     
     for u, v in tdag.edges:
         if tdag.nodes[u]['op'] == 'constant':
             continue
         assign.e_lvl_out[(u,v)] = round(vp.var_lvl((u,v), 'out').X)
         assign.e_scl_out[(u,v)] = round(vp.var_scl((u,v), 'out').X)
-        assert assign.e_scl_out[(u,v)] >= params.Sw, f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below Sw={params.Sw}"
+        edge_scale_lb = max(
+            params.scale_lower_bound(u, tdag.nodes[u], "out"),
+            params.scale_lower_bound(v, tdag.nodes[v], "in"),
+        )
+        assert assign.e_scl_out[(u,v)] >= edge_scale_lb, f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below local lower bound {edge_scale_lb}"
     
     return assign

@@ -11069,11 +11069,9 @@ def _mcts_rollout_reward(
     params: Params,
     root_hints: dict[str, Any],
 ) -> float:
-    counts = _aggregate_counts([assign])
     if _selection_objective(root_hints) == "cost":
-        op_penalty = 0.0002 * counts["rescale"] + 0.004 * counts["bootstrap"]
-        latency_score = 1.0 / (1.0 + max(0.0, cost) / 1_000_000_000.0)
-        return latency_score - op_penalty
+        return 1.0 / (1.0 + max(0.0, cost) / 1_000_000_000.0)
+    counts = _aggregate_counts([assign])
     bootstrap_score = _policy_target_bootstrap_score(
         root_hints,
         params,
@@ -11110,18 +11108,7 @@ def _policy_assignment_score(
     hints: dict[str, Any],
     params: Params,
 ) -> float:
-    score = _assignment_score(assign, le)
-    boundary_scale_penalty = _float_hint(hints.get("boundary_scale_penalty"), 0.2)
-    if boundary_scale_penalty > 0.0 and le is not None and assign.tdag.outputs:
-        pdag_vout = list(assign.tdag.outputs)[0]
-        output_scale = int(assign.v_scl_out.get(pdag_vout, 0))
-        rescale_cost = float(le.lin_op_lmaps["rescale_single"][1])
-        score += boundary_scale_penalty * rescale_cost * assign.tdag.get_full_size() * output_scale
-    selection_bootstrap_penalty = _float_hint(hints.get("selection_bootstrap_penalty"), 0.0)
-    if selection_bootstrap_penalty > 0.0:
-        counts = _aggregate_counts([assign])
-        score += selection_bootstrap_penalty * counts["bootstrap"]
-    return score
+    return _assignment_score(assign, le)
 
 
 def _relaxed_scheduler_policy(hints: dict[str, Any], params: Params) -> dict[str, Any]:
@@ -12120,30 +12107,8 @@ def _transition_score(
     except Exception:
         cache[cache_key] = None
         return None
-    counts = _transition_count_values(params, in_lvl, in_scl, out_lvl, out_scl)
-    reserve_penalty = float(policy.get("reserve_penalty", 0.0))
-    reserve_deficit = 0.0
-    if reserve_penalty > 0.0:
-        slack_multiplier = _noise_slack_reserve_multiplier(policy)
-        reserve_deficit += slack_multiplier * max(
-            0.0,
-            float(policy.get("min_transition_reserve", 0))
-            - float(_transition_reserve_bits(params, in_lvl, in_scl, out_lvl, out_scl)),
-        )
-        reserve_deficit += slack_multiplier * max(
-            0.0,
-            float(policy.get("min_decryptability_reserve", 0))
-            - float(_decryptability_reserve_bits(params, out_lvl, out_scl)),
-        )
-    score = (
-        cost
-        + policy["bootstrap_penalty"] * counts["bootstrap"]
-        + policy["rescale_penalty"] * counts["rescale"]
-        + policy["level_drop_penalty"] * max(0, in_lvl - out_lvl)
-        + reserve_penalty * reserve_deficit
-    )
-    cache[cache_key] = score
-    return score
+    cache[cache_key] = cost
+    return cost
 
 
 def _noise_slack_reserve_multiplier(policy: dict[str, Any]) -> float:

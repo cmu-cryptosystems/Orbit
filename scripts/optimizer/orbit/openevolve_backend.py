@@ -3639,7 +3639,11 @@ def _latency_only_combined_score(
     ratio = reference / cost
     if ratio <= 1.0:
         return max(1e-6, min(0.999999, ratio))
-    return min(999.0, ratio)
+    # OpenEvolve maximizes a single score, and raw latency ratios for sampled
+    # QBP improvements are often 1.00000x. Keep the ordering purely latency
+    # based, but magnify the positive delta so small real improvements are not
+    # numerically indistinguishable from the seed in MAP-Elites/selection logs.
+    return 1.0 + min(998.0, max(0.0, ratio - 1.0) * 100_000.0)
 
 
 def _execution_trace_artifact(

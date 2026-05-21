@@ -8363,6 +8363,19 @@ def solve_budget_batch(
                 params,
                 diagnostics,
             )
+        if (
+            not getattr(params, "openevolve_evaluating_candidate", False)
+            and getattr(params, "openevolve_compile_hints", None) is not None
+        ):
+            parallel = _solve_budget_batch_boundary_mcts_parallel(
+                pdag,
+                io_budgets_list,
+                params,
+                hints,
+                diagnostics,
+            )
+            if parallel is not None:
+                return parallel
         result = _solve_budget_batch_boundary_mcts(
             pdag,
             io_budgets_list,
@@ -8430,6 +8443,177 @@ def solve_budget_batch(
             io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
             io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
     return io_to_assign, io_to_cost
+
+
+def _solve_budget_batch_boundary_mcts_parallel(
+    pdag: Tdag,
+    io_budgets_list: list[dict],
+    params: Params,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> tuple[
+    dict[tuple[int, int], dict[tuple[int, int], Assign]],
+    dict[tuple[int, int], dict[tuple[int, int], float]],
+] | None:
+    groups = list(_budget_boundary_groups(io_budgets_list).values())
+    workers = _parallel_qbp_worker_count(params, len(groups))
+    if workers <= 1 or len(groups) <= 1:
+        return None
+    print(
+        "OpenEvolve QBP parallel boundary replay: "
+        f"pdag={pdag.name} groups={len(groups)} workers={workers}",
+        flush=True,
+    )
+    payloads = [
+        (build_context(pdag, [dict(budget) for budget in budgets], params), hints)
+        for budgets in groups
+    ]
+    io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
+    io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        for payload in executor.map(_run_boundary_group_replay_payload, payloads):
+            if payload.get("error"):
+                if diagnostics is not None:
+                    _record_invalid_reason(
+                        diagnostics,
+                        "invalid_reasons",
+                        PlacementError(str(payload.get("error"))),
+                    )
+                continue
+            context = payload.get("context")
+            if not isinstance(context, dict):
+                continue
+            task_tdag = tdag_from_context(context)
+            for record in payload.get("records", []) or []:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    in_key = (int(record["in_key"][0]), int(record["in_key"][1]))
+                    out_key = (int(record["out_key"][0]), int(record["out_key"][1]))
+                    cost = float(record["cost"])
+                    assign = _assign_from_serialized(task_tdag, record["assign"])
+                except Exception as exc:
+                    if diagnostics is not None:
+                        _record_invalid_reason(diagnostics, "invalid_reasons", exc)
+                    continue
+                current = io_to_cost.get(in_key, {}).get(out_key)
+                if current is None or cost < current:
+                    io_to_cost.setdefault(in_key, {})[out_key] = cost
+                    io_to_assign.setdefault(in_key, {})[out_key] = assign
+            if diagnostics is not None:
+                _merge_boundary_replay_diagnostics(
+                    diagnostics,
+                    payload.get("diagnostics", {}),
+                )
+    return io_to_assign, io_to_cost
+
+
+def _parallel_qbp_worker_count(params: Params, group_count: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_QBP_WORKERS", "").strip()
+    try:
+        if raw:
+            requested = int(raw)
+        else:
+            requested = int(getattr(params, "threads", 1) or 1)
+    except ValueError:
+        requested = int(getattr(params, "threads", 1) or 1)
+    return max(1, min(int(group_count or 0), requested, 32))
+
+
+def _run_boundary_group_replay_payload(
+    payload: tuple[dict[str, Any], dict[str, Any]]
+) -> dict[str, Any]:
+    context, hints = payload
+    try:
+        task_tdag = tdag_from_context(context)
+        task_params = task_tdag.params
+        task_params.openevolve_iterations = 0
+        task_params.openevolve_harness = "compile"
+        task_params.openevolve_compile_hints = hints
+        task_params.openevolve_evaluating_candidate = False
+        _apply_active_scale_floor_from_hints(task_params, hints)
+        task_le = LatencyEstimator(task_params)
+        budgets = [
+            _io_budget_from_json(item)
+            for item in context.get("io_budgets", [])
+            if isinstance(item, dict)
+        ]
+        diagnostics: dict[str, Any] = {}
+        io_to_assign, io_to_cost = _solve_budget_batch_boundary_mcts(
+            task_tdag,
+            budgets,
+            task_le,
+            task_params,
+            hints,
+            diagnostics,
+        )
+        records = []
+        for in_key, out_to_cost in io_to_cost.items():
+            for out_key, cost in out_to_cost.items():
+                assign = io_to_assign.get(in_key, {}).get(out_key)
+                if assign is None:
+                    continue
+                records.append(
+                    {
+                        "in_key": [int(in_key[0]), int(in_key[1])],
+                        "out_key": [int(out_key[0]), int(out_key[1])],
+                        "cost": float(cost),
+                        "assign": _serialize_assign(assign),
+                    }
+                )
+        diagnostics.pop("assignments", None)
+        return {
+            "context": context,
+            "records": records,
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        return {
+            "context": context,
+            "records": [],
+            "diagnostics": {},
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
+
+def _merge_boundary_replay_diagnostics(
+    total: dict[str, Any], item: dict[str, Any] | None
+) -> None:
+    if not isinstance(item, dict):
+        return
+    for key in (
+        "requested_budgets",
+        "solved_budgets",
+        "candidate_solved_budgets",
+        "fallback_solved_budgets",
+        "fallback_selected_budgets",
+        "requested_boundary_groups",
+        "solved_boundary_groups",
+        "partial_boundary_groups",
+        "candidate_solved_boundary_groups",
+        "fallback_selected_boundary_groups",
+        "invalid_boundary_groups",
+        "unreachable_boundary_groups",
+        "candidate_improved_budgets",
+    ):
+        total[key] = int(total.get(key, 0) or 0) + int(item.get(key, 0) or 0)
+    for key in ("costs", "candidate_costs"):
+        total.setdefault(key, []).extend(item.get(key, []) or [])
+    for dict_key in (
+        "selected_source_counts",
+        "mcts_action_attempt_counts",
+        "mcts_action_success_counts",
+        "mcts_action_invalid_counts",
+        "mcts_action_duplicate_skips",
+        "candidate_invalid_reasons",
+        "invalid_reasons",
+    ):
+        dest = total.setdefault(dict_key, {})
+        for name, count in dict(item.get(dict_key, {}) or {}).items():
+            dest[str(name)] = int(dest.get(str(name), 0) or 0) + int(count or 0)
+    summaries = total.setdefault("boundary_group_summaries", [])
+    if len(summaries) < 512:
+        summaries.extend(list(item.get("boundary_group_summaries", []) or [])[: 512 - len(summaries)])
 
 
 def _solve_budget_batch_fast_seed(

@@ -3589,6 +3589,17 @@ def test_policy_bank_replay_hints_extract_dominant_boundary_action():
     assert oe_backend._dominant_boundary_mcts_action({"seed_fallback": 3}) is None
 
 
+def test_parallel_qbp_worker_count_uses_threads_and_env(toy_cost_json: str, monkeypatch):
+    params = _params(toy_cost_json)
+    params.threads = 96
+    assert oe_backend._parallel_qbp_worker_count(params, 100) == 32
+    assert oe_backend._parallel_qbp_worker_count(params, 7) == 7
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_QBP_WORKERS", "12")
+    assert oe_backend._parallel_qbp_worker_count(params, 100) == 12
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_QBP_WORKERS", "bad")
+    assert oe_backend._parallel_qbp_worker_count(params, 100) == 32
+
+
 def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_path: Path):
     params = _params(
         toy_cost_json,

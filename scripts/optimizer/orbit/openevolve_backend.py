@@ -58,6 +58,8 @@ BANNED_CANDIDATE_TOKENS = (
     "git ",
     "apply_patch",
 )
+TRACE_PREVIEW_CHARS = 5000
+TRACE_FEEDBACK_CHARS = 20000
 
 
 @dataclass
@@ -507,9 +509,12 @@ def place(context):
     boundary_state_cap, boundary_scale_policy, scale_lattice, max_scale_candidates,
     bootstrap_penalty, and MCTS action presets. Bootstrap counts are diagnostics
     only; do not optimize toward a fixed count. Candidate examples include
-    candidate_mlir_preview values. Treat those as execution traces: compare
-    orbit.trace.bootstrap, orbit.trace.rescale, and selected-source operations
-    against objective_cost_usec, then mutate the active policy below.
+    candidate_mlir_preview and trace_features values. Treat those as execution
+    traces: compare orbit.trace.bootstrap, orbit.trace.rescale,
+    orbit.trace.boundary_group, and selected-source operations against
+    objective_cost_usec, then mutate the active policy below. Good mutations
+    change the selected path digest and lower latency; trace-only or
+    seed-equivalent changes are exploration examples, not winners.
     """
     mcts = PlacementMCTS(context)
     actions = mcts.candidate_actions(action_cap=12)
@@ -1172,6 +1177,9 @@ def place(context):
     and context["harness"]["top_costly_boundary_groups"]: use previous evaluator
     artifacts as execution-trace feedback, keep CKKS legality intact, and
     mutate only the high-impact policy surface rather than Orbit source code.
+    Candidate examples carry candidate_mlir_preview and trace_features fields;
+    use them to compare maintenance placement, selected sources, boundary
+    groups, and objective_cost_usec before changing policy priors.
     Use boundary_group_policies when one expensive QBP group needs a different
     boundary lattice, scale policy, or action preset than the global seed.
 
@@ -2046,6 +2054,10 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         context.get("placement_units", []),
         context.get("placement_profile", []),
     )
+    if seed_trace_examples:
+        context.setdefault("harness", {})["candidate_examples"] = _merge_candidate_examples(
+            seed_trace_examples
+        )
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     policy_bank = _run_compile_policy_bank_prepass(
         context_path,
@@ -3544,6 +3556,7 @@ def _policy_bank_record(
     trace = _dict_from_jsonish(artifacts.get("execution_trace", {}))
     objective = _finite_float(metrics.get("objective_cost_usec"), float("inf"))
     reference = _finite_float(metrics.get("reference_objective_cost_usec"), float("inf"))
+    mlir_preview = str(artifacts.get("candidate_mlir_preview", ""))
     improved = bool(
         metrics.get("objective_improved_vs_seed", 0.0)
         or (math.isfinite(objective) and math.isfinite(reference) and objective < reference)
@@ -3608,7 +3621,11 @@ def _policy_bank_record(
         "path_digest": str(artifacts.get("sampled_selected_path_digest", ""))[:24],
         "candidate_mlir_digest": str(artifacts.get("candidate_mlir_digest", "")),
         "candidate_mlir_path": str(artifacts.get("candidate_mlir_path", "")),
-        "candidate_mlir_preview": str(artifacts.get("candidate_mlir_preview", ""))[:2500],
+        "candidate_mlir_preview": mlir_preview[:TRACE_PREVIEW_CHARS],
+        "trace_features": _dict_from_jsonish(
+            artifacts.get("candidate_mlir_trace_features", {})
+        )
+        or _mlir_trace_features(mlir_preview, result=evaluation),
         "gate_reasons": list(gate.get("reasons", []) or [])[:8],
         "policy_summary": json.loads(_compact_policy_summary(hints)),
     }
@@ -3718,7 +3735,11 @@ def _policy_bank_candidate_examples(
                 )[:4],
                 "candidate_mlir_digest": item.get("candidate_mlir_digest", ""),
                 "candidate_mlir_path": item.get("candidate_mlir_path", ""),
-                "candidate_mlir_preview": str(item.get("candidate_mlir_preview", ""))[:2500],
+                "candidate_mlir_preview": str(item.get("candidate_mlir_preview", ""))[
+                    :TRACE_PREVIEW_CHARS
+                ],
+                "trace_features": item.get("trace_features")
+                or _mlir_trace_features(str(item.get("candidate_mlir_preview", ""))),
                 "why_it_lost": _policy_bank_loss_reason(item),
             }
         )
@@ -3742,7 +3763,13 @@ def _merge_candidate_examples(*groups: list[dict[str, Any]]) -> list[dict[str, A
             seen.add(key)
             compact = dict(item)
             if "candidate_mlir_preview" in compact:
-                compact["candidate_mlir_preview"] = str(compact["candidate_mlir_preview"])[:2500]
+                compact["candidate_mlir_preview"] = str(compact["candidate_mlir_preview"])[
+                    :TRACE_PREVIEW_CHARS
+                ]
+                compact.setdefault(
+                    "trace_features",
+                    _mlir_trace_features(str(compact.get("candidate_mlir_preview", ""))),
+                )
             examples.append(compact)
     return examples[:8]
 
@@ -3813,7 +3840,7 @@ def _seed_mlir_trace_examples(
     if bool(artifacts.get("written", False)):
         mlir_digest = str(artifacts.get("mlir_digest", ""))
         mlir_path = str(artifacts.get("mlir_path", ""))
-        mlir_preview = str(artifacts.get("mlir_preview", ""))[:2500]
+        mlir_preview = str(artifacts.get("mlir_preview", ""))[:TRACE_PREVIEW_CHARS]
         execution_trace_path = str(artifacts.get("execution_trace_path", ""))
         artifact_reason = ""
     else:
@@ -3842,9 +3869,14 @@ def _seed_mlir_trace_examples(
             "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
             "candidate_mlir_digest": mlir_digest,
             "candidate_mlir_path": mlir_path,
-            "candidate_mlir_preview": mlir_preview[:2500],
+            "candidate_mlir_preview": mlir_preview[:TRACE_PREVIEW_CHARS],
             "candidate_mlir_artifact_reason": artifact_reason,
             "execution_trace_path": execution_trace_path,
+            "trace_features": _mlir_trace_features(
+                mlir_preview,
+                result=result,
+                diagnostics=diagnostics,
+            ),
             "why_it_lost": "seed_reference_for_latency_and_trace_comparison",
             "top_costly_boundary_groups": execution_trace["top_costly_boundary_groups"][:4],
         }
@@ -3890,6 +3922,26 @@ def _mlir_trace_preview_from_result(
 
     add_locations("bootstrap", result.get("bootstrap_locations", {}))
     add_locations("rescale", result.get("rescale_locations", {}))
+    for idx, group in enumerate(
+        _boundary_group_top_cost_summary(
+            list(diagnostics.get("boundary_group_summaries", []) or []), limit=16
+        )
+    ):
+        key = str(group.get("key", "")).replace('"', '\\"')[:160]
+        source_counts = group.get("selected_source_counts", {})
+        source = ""
+        if isinstance(source_counts, dict) and source_counts:
+            source = max(source_counts.items(), key=lambda item: int(item[1] or 0))[0]
+        source_text = str(source).replace('"', '\\"')[:160]
+        levels = ",".join(str(v) for v in list(group.get("requested_output_levels", []) or [])[:8])
+        lines.append(
+            f'  "orbit.trace.boundary_group"() '
+            f'{{index = {idx}, key = "{key}", output_levels = "{levels}", '
+            f'min_cost_usec = {_finite_float(group.get("min_cost_usec"), 0.0):.3f}, '
+            f'min_bootstrap = {_finite_float(group.get("min_bootstrap"), 0.0):.3f}, '
+            f'min_rescale = {_finite_float(group.get("min_rescale"), 0.0):.3f}, '
+            f'dominant_source = "{source_text}"}} : () -> ()'
+        )
     source_counts = diagnostics.get("selected_source_counts", {})
     if isinstance(source_counts, dict) and source_counts:
         for source, count in sorted(source_counts.items(), key=lambda item: str(item[0]))[:24]:
@@ -3900,6 +3952,115 @@ def _mlir_trace_preview_from_result(
             )
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def _mlir_trace_features(
+    mlir_preview: str,
+    *,
+    result: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract compact structured features from MLIR or MLIR-like trace text."""
+
+    preview = str(mlir_preview or "")
+    kind_counts: Counter = Counter()
+    node_samples: dict[str, list[str]] = {"bootstrap": [], "rescale": []}
+    selected_sources: Counter = Counter()
+    objective_cost = None
+    path_digest = ""
+    for line in preview.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("//") and "=" in stripped:
+            key, value = stripped[2:].split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "objective_cost_usec":
+                objective_cost = _finite_float(value, 0.0)
+            elif key == "selected_path_digest":
+                path_digest = value[:32]
+        if '"orbit.trace.' not in line:
+            continue
+        kind = line.split('"orbit.trace.', 1)[1].split('"', 1)[0]
+        kind_counts[kind] += 1
+        if kind in node_samples:
+            node = _trace_attr(line, "node")
+            if node and len(node_samples[kind]) < 12:
+                node_samples[kind].append(node)
+        if kind == "selected_source":
+            source = _trace_attr(line, "source")
+            count = _trace_int_attr(line, "count")
+            if source:
+                selected_sources[source] += max(1, count)
+    if isinstance(result, dict):
+        metrics = result.get("metrics", result)
+        artifacts = result.get("artifacts", {})
+        if objective_cost is None:
+            objective_cost = _finite_float(
+                metrics.get("objective_cost_usec", artifacts.get("objective_cost_usec")),
+                0.0,
+            )
+        if not path_digest:
+            path_digest = str(
+                artifacts.get("sampled_selected_path_digest")
+                or artifacts.get("selected_path_digest")
+                or metrics.get("sampled_selected_path_digest")
+                or ""
+            )[:32]
+        for kind, key in (("bootstrap", "bootstrap_locations"), ("rescale", "rescale_locations")):
+            locations = result.get(key)
+            if not isinstance(locations, dict):
+                locations = artifacts.get(key) if isinstance(artifacts, dict) else None
+            if isinstance(locations, dict):
+                kind_counts[kind] = max(kind_counts[kind], len(locations))
+                for node in list(locations)[:12]:
+                    node_text = str(node)
+                    if node_text not in node_samples[kind]:
+                        node_samples[kind].append(node_text)
+        artifact_sources = _dict_from_jsonish(
+            artifacts.get("selected_source_counts", {})
+            if isinstance(artifacts, dict)
+            else {}
+        )
+        for source, count in artifact_sources.items():
+            selected_sources[str(source)] += int(count or 0)
+    diag = diagnostics if isinstance(diagnostics, dict) else {}
+    boundary_groups = []
+    if isinstance(diag.get("boundary_group_summaries"), list):
+        boundary_groups = _boundary_group_top_cost_summary(diag["boundary_group_summaries"], limit=6)
+    return {
+        "trace_kind_counts": dict(sorted(kind_counts.items())),
+        "objective_cost_usec": objective_cost if objective_cost is not None else 0.0,
+        "selected_path_digest": path_digest,
+        "bootstrap_nodes": node_samples["bootstrap"][:12],
+        "rescale_nodes": node_samples["rescale"][:12],
+        "selected_source_counts": dict(selected_sources.most_common(8)),
+        "top_boundary_groups": boundary_groups,
+        "preview_bytes": len(preview.encode("utf-8")),
+    }
+
+
+def _trace_attr(line: str, name: str) -> str:
+    marker = f'{name} = "'
+    if marker not in line:
+        return ""
+    return line.split(marker, 1)[1].split('"', 1)[0]
+
+
+def _trace_int_attr(line: str, name: str) -> int:
+    marker = f"{name} = "
+    if marker not in line:
+        return 0
+    tail = line.split(marker, 1)[1]
+    digits = []
+    for char in tail:
+        if char.isdigit() or (char == "-" and not digits):
+            digits.append(char)
+        else:
+            break
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return 0
 
 
 def _policy_bank_loss_reason(item: dict[str, Any]) -> str:
@@ -4114,6 +4275,20 @@ def evaluate_compile_candidate_program(
             objective,
             correctness_gate,
             execution_trace,
+        )
+        if not str(candidate_artifacts.get("mlir_preview", "")).strip():
+            trace_preview = _mlir_trace_preview_from_result(result, diagnostics)
+            candidate_artifacts = dict(candidate_artifacts)
+            candidate_artifacts["mlir_preview"] = trace_preview
+            if not str(candidate_artifacts.get("mlir_digest", "")).strip():
+                candidate_artifacts["mlir_digest"] = hashlib.sha256(
+                    trace_preview.encode("utf-8")
+                ).hexdigest()
+            candidate_artifacts["trace_fallback"] = True
+        candidate_trace_features = _mlir_trace_features(
+            str(candidate_artifacts.get("mlir_preview", "")),
+            result=result,
+            diagnostics=diagnostics,
         )
         evaluation = {
             "metrics": {
@@ -4341,7 +4516,7 @@ def evaluate_compile_candidate_program(
                     context.get("harness", {}).get("candidate_examples", []),
                     sort_keys=True,
                     default=str,
-                )[:8000],
+                )[:TRACE_FEEDBACK_CHARS],
                 "candidate_mlir_artifacts": json.dumps(
                     candidate_artifacts, sort_keys=True
                 )[:4000],
@@ -4349,7 +4524,10 @@ def evaluate_compile_candidate_program(
                 "candidate_mlir_digest": str(candidate_artifacts.get("mlir_digest", "")),
                 "candidate_mlir_preview": str(
                     candidate_artifacts.get("mlir_preview", "")
-                )[:6000],
+                )[:TRACE_PREVIEW_CHARS],
+                "candidate_mlir_trace_features": json.dumps(
+                    candidate_trace_features, sort_keys=True, default=str
+                )[:8000],
                 "noise_estimator": json.dumps(noise_estimate, sort_keys=True)[:4000],
                 "reserve_summary": json.dumps(
                     result.get("reserve_summary", {}), sort_keys=True
@@ -9095,6 +9273,7 @@ def _record_compile_trace(
                 "candidate_mlir_path",
                 "candidate_mlir_digest",
                 "candidate_mlir_preview",
+                "candidate_mlir_trace_features",
             }
         },
     }

@@ -2977,7 +2977,12 @@ def test_policy_bank_record_carries_boundary_trace_examples():
         },
         "artifacts": {
             "correctness_gate": {"reasons": []},
-            "candidate_mlir_preview": "module { func.func @candidate() }",
+            "candidate_mlir_preview": (
+                'module attributes {orbit.trace = "placement"} {\n'
+                '  "orbit.trace.bootstrap"() {node = "layer.0.softmax", level = "12", scale = "40"} : () -> ()\n'
+                '  "orbit.trace.selected_source"() {source = "latency_beam", count = 3} : () -> ()\n'
+                "}\n"
+            ),
             "candidate_mlir_digest": "abc123",
             "candidate_mlir_path": "/tmp/candidate.mlir",
             "execution_trace": json.dumps(
@@ -3003,8 +3008,11 @@ def test_policy_bank_record_carries_boundary_trace_examples():
     assert record["scale_floor_bits"] == 36.0
     assert record["top_costly_boundary_groups"][0]["group_key"]["in_lvl"] == 14
     assert record["candidate_mlir_preview"].startswith("module")
+    assert record["trace_features"]["trace_kind_counts"]["bootstrap"] == 1
+    assert record["trace_features"]["selected_source_counts"]["latency_beam"] == 3
     assert examples[1]["candidate_mlir_digest"] == "abc123"
     assert examples[1]["candidate_mlir_preview"].startswith("module")
+    assert examples[1]["trace_features"]["trace_kind_counts"]["bootstrap"] == 1
     assert examples[1]["top_costly_boundary_groups"][0]["min_cost_usec"] == 12.0
 
 
@@ -3015,7 +3023,7 @@ def test_merge_candidate_examples_preserves_seed_mlir_preview():
                 "kind": "seed_mlir_trace_reference",
                 "candidate_mlir_digest": "digest",
                 "selected_path_digest": "path",
-                "candidate_mlir_preview": "x" * 4000,
+                "candidate_mlir_preview": "x" * 6000,
             }
         ],
         [
@@ -3036,8 +3044,31 @@ def test_merge_candidate_examples_preserves_seed_mlir_preview():
 
     assert len(examples) == 2
     assert examples[0]["kind"] == "seed_mlir_trace_reference"
-    assert len(examples[0]["candidate_mlir_preview"]) == 2500
+    assert len(examples[0]["candidate_mlir_preview"]) == oe_backend.TRACE_PREVIEW_CHARS
     assert examples[1]["candidate_mlir_preview"] == "module { }"
+
+
+def test_mlir_trace_features_extracts_trace_ops_and_boundaries():
+    preview = (
+        'module attributes {orbit.trace = "placement"} {\n'
+        "  // objective_cost_usec = 42.000\n"
+        "  // selected_path_digest = abcdef012345\n"
+        '  "orbit.trace.bootstrap"() {node = "n1", level = "12", scale = "40"} : () -> ()\n'
+        '  "orbit.trace.rescale"() {node = "n2", level = "11", scale = "36"} : () -> ()\n'
+        '  "orbit.trace.selected_source"() {source = "wide_boundary_cost_beam", count = 7} : () -> ()\n'
+        '  "orbit.trace.boundary_group"() {index = 0, key = "in=16:40", min_cost_usec = 3.000} : () -> ()\n'
+        "}\n"
+    )
+
+    features = oe_backend._mlir_trace_features(preview)
+
+    assert features["objective_cost_usec"] == 42.0
+    assert features["selected_path_digest"] == "abcdef012345"
+    assert features["trace_kind_counts"]["bootstrap"] == 1
+    assert features["trace_kind_counts"]["rescale"] == 1
+    assert features["trace_kind_counts"]["boundary_group"] == 1
+    assert features["bootstrap_nodes"] == ["n1"]
+    assert features["selected_source_counts"]["wide_boundary_cost_beam"] == 7
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):

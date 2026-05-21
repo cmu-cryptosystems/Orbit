@@ -549,9 +549,7 @@ def place(context):
             for name in [
                 "budget_fulfillment_beam",
                 "wide_boundary_cost_beam",
-                "dense_boundary_cost_beam",
                 *reference_action_names,
-                "latency_mcts_repair",
             ]
             if name in available
         ]
@@ -618,12 +616,12 @@ def place(context):
             "trace_group_overrides": trace_group_overrides,
             "boundary_group_policies": boundary_group_policies,
             "mcts_action_allowlist": compact_names,
-            "mcts_action_cap": 10,
-            "mcts_rollout_budget": 16,
+            "mcts_action_cap": max(1, min(2, len(compact_names))),
+            "mcts_rollout_budget": 4,
             "mcts_exploration_weight": 1.25,
-            "mcts_max_repair_bootstraps": 128,
+            "mcts_max_repair_bootstraps": 16,
             "mcts_prior_order": True,
-            "include_seed_repair_actions": True,
+            "include_seed_repair_actions": False,
             "selection_objective": "cost",
             "mcts_action_presets": mcts.action_presets(
                 budget_fulfillment_beam={

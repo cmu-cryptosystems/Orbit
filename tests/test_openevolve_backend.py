@@ -3524,6 +3524,28 @@ def test_fail_open_preserves_validated_policy_bank_seed():
         "policy_bank_selected_label": "latency_beam_waterline48_compact",
         "policy_bank_lightweight": True,
         "boundary_state_cap": 8,
+        "mcts_actions": [
+            {"name": "budget_fulfillment_beam", "policy": {"strategy": "latency_beam"}},
+            {"name": "dense_boundary_cost_beam", "policy": {"strategy": "latency_beam"}},
+        ],
+        "mcts_action_allowlist": [
+            "budget_fulfillment_beam",
+            "dense_boundary_cost_beam",
+        ],
+        "policy_bank_selected_top_costly_boundary_groups": [
+            {
+                "group_key": {
+                    "in_lvl": 8,
+                    "in_scl": 51,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                },
+                "selected_source_counts": {
+                    "candidate:boundary_mcts:dense_boundary_cost_beam:0": 4,
+                    "candidate:boundary_mcts:budget_fulfillment_beam:0": 1,
+                },
+            }
+        ],
     }
 
     fallback = oe_backend._bounded_fail_open_hints(initial)
@@ -3531,7 +3553,40 @@ def test_fail_open_preserves_validated_policy_bank_seed():
     assert fallback["fail_open_reason"] == "policy_bank_validated_seed"
     assert fallback["policy_bank_selected_label"] == "latency_beam_waterline48_compact"
     assert fallback["boundary_state_cap"] == 8
+    assert fallback["policy_bank_full_compile_replay"] is True
+    assert fallback["mcts_action_allowlist"] == ["budget_fulfillment_beam"]
+    assert fallback["mcts_action_cap"] == 1
+    assert fallback["mcts_rollout_budget"] == 1
+    assert fallback["boundary_group_policies"] == [
+        {
+            "selector": {
+                "in_lvl": 8,
+                "in_scl": 51,
+                "maino_v": "",
+                "main_dag_size": 0,
+            },
+            "policy": {
+                "mcts_action_allowlist": ["dense_boundary_cost_beam"],
+                "mcts_action_cap": 1,
+                "mcts_rollout_budget": 1,
+            },
+        }
+    ]
     assert "policy_bank_lightweight" not in fallback
+
+
+def test_policy_bank_replay_hints_extract_dominant_boundary_action():
+    assert (
+        oe_backend._dominant_boundary_mcts_action(
+            {
+                "candidate:boundary_mcts:wide_boundary_cost_beam:0": 2,
+                "candidate:boundary_mcts:dense_boundary_cost_beam:0": 5,
+                "seed_fallback_latency_beam": 99,
+            }
+        )
+        == "dense_boundary_cost_beam"
+    )
+    assert oe_backend._dominant_boundary_mcts_action({"seed_fallback": 3}) is None
 
 
 def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_path: Path):
@@ -3967,6 +4022,7 @@ def test_mocked_compile_harness_runs_once_for_compile(
 
     _install_fake_openevolve(monkeypatch, fake_run_evolution)
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK", "0")
     params = _params(
         toy_cost_json,
         openevolve_iterations=2,
@@ -3997,6 +4053,7 @@ def test_compile_harness_fail_open_returns_initial_seed(
 
     _install_fake_openevolve(monkeypatch, fake_run_evolution)
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK", "0")
     params = _params(
         toy_cost_json,
         openevolve_iterations=2,

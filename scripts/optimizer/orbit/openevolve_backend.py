@@ -2103,6 +2103,9 @@ def _run_compile_policy_bank_prepass(
         selected_hints["policy_bank_validated_initial"] = True
         selected_hints["policy_bank_selected_label"] = str(best_improved[2].get("label", ""))
         selected_hints["policy_bank_selected_objective_cost_usec"] = float(best_improved[0])
+        selected_hints["policy_bank_selected_top_costly_boundary_groups"] = list(
+            best_improved[2].get("top_costly_boundary_groups", []) or []
+        )[:8]
     return {
         "examples": examples,
         "summary": summary,
@@ -2916,6 +2919,14 @@ def _policy_bank_record(
             metrics.get("sampled_frontier_total_rescale_count"), 0.0
         ),
         "scale_floor_bits": _finite_float(metrics.get("scale_floor_bits"), 0.0),
+        "selected_source_counts": {
+            str(source): int(count or 0)
+            for source, count in dict(
+                trace.get("path", {}).get("selected_source_counts", {})
+                if isinstance(trace.get("path"), dict)
+                else {}
+            ).items()
+        },
         "top_costly_boundary_groups": list(
             trace.get("top_costly_boundary_groups", []) or []
         )[:8],
@@ -6982,7 +6993,7 @@ def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, 
 
     if initial_hints is not None:
         if _bool_hint(initial_hints.get("policy_bank_validated_initial"), False):
-            fallback = deepcopy(initial_hints)
+            fallback = _policy_bank_full_compile_replay_hints(initial_hints)
             fallback.pop("policy_bank_lightweight", None)
             fallback["fail_open_reason"] = "policy_bank_validated_seed"
             return fallback
@@ -6991,6 +7002,121 @@ def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, 
     if initial_hints is not None:
         fallback["recovered_from_initial_digest"] = _hint_digest(initial_hints)
     return fallback
+
+
+def _policy_bank_full_compile_replay_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    """Bound a validated sampled policy-bank winner for production replay.
+
+    Sampled policy-bank evaluation tries several MCTS actions per boundary group
+    so it can discover which direct budget policy wins. The production Orbit
+    compile intentionally runs a single action per group for speed. Preserve the
+    sampled winner by adding boundary-specific action allowlists for the costly
+    groups where the trace shows a non-default action won, and keep the global
+    replay bounded to one deterministic action.
+    """
+
+    replay = deepcopy(hints)
+    replay.pop("portfolio", None)
+    replay.pop("policy_bank_lightweight", None)
+    replay["policy_bank_full_compile_replay"] = True
+    replay["allow_seed_fallback"] = True
+    replay["mcts_rollout_budget"] = 1
+    replay["mcts_action_cap"] = 1
+    replay["mcts_prior_order"] = True
+
+    default_action = _first_available_action_name(
+        replay,
+        preferred=(
+            "budget_fulfillment_beam",
+            "wide_boundary_cost_beam",
+            "dense_boundary_cost_beam",
+            "waterline_cost_beam",
+        ),
+    )
+    if default_action:
+        replay["mcts_action_allowlist"] = [default_action]
+
+    overlays = list(replay.get("boundary_group_policies", []) or [])
+    for item in list(replay.get("policy_bank_selected_top_costly_boundary_groups", []) or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        selector = item.get("group_key")
+        if not isinstance(selector, dict):
+            continue
+        action_name = _dominant_boundary_mcts_action(item.get("selected_source_counts", {}))
+        if not action_name or action_name == default_action:
+            continue
+        overlays.append(
+            {
+                "selector": dict(selector),
+                "policy": {
+                    "mcts_action_allowlist": [action_name],
+                    "mcts_action_cap": 1,
+                    "mcts_rollout_budget": 1,
+                },
+            }
+        )
+    if overlays:
+        replay["boundary_group_policies"] = overlays[:32]
+    replay["policy_bank_full_compile_overlay_count"] = len(overlays)
+    return replay
+
+
+def _dominant_boundary_mcts_action(selected_source_counts: Any) -> str | None:
+    if not isinstance(selected_source_counts, dict):
+        return None
+    best_name = None
+    best_count = 0
+    for source, count in selected_source_counts.items():
+        action_name = _boundary_mcts_action_name_from_source(str(source))
+        if not action_name:
+            continue
+        try:
+            numeric = int(count or 0)
+        except (TypeError, ValueError):
+            numeric = 0
+        if numeric > best_count:
+            best_name = action_name
+            best_count = numeric
+    return best_name
+
+
+def _boundary_mcts_action_name_from_source(source: str) -> str | None:
+    parts = str(source).split(":")
+    if len(parts) >= 3 and parts[0] == "candidate" and parts[1] == "boundary_mcts":
+        return parts[2]
+    return None
+
+
+def _first_available_action_name(
+    hints: dict[str, Any],
+    *,
+    preferred: tuple[str, ...],
+) -> str | None:
+    names: set[str] = set()
+    raw_actions = hints.get("mcts_actions")
+    if isinstance(raw_actions, list):
+        for item in raw_actions:
+            if isinstance(item, dict) and item.get("name") is not None:
+                names.add(str(item.get("name")))
+    presets = hints.get("mcts_action_presets")
+    if isinstance(presets, dict):
+        names.update(str(name) for name in presets)
+    elif isinstance(presets, list):
+        for item in presets:
+            if isinstance(item, dict) and item.get("name") is not None:
+                names.add(str(item.get("name")))
+    allowlist = [
+        str(item)
+        for item in hints.get("mcts_action_allowlist", []) or []
+        if str(item)
+    ]
+    if allowlist:
+        names = {name for name in names if name in allowlist} or set(allowlist)
+    for name in preferred:
+        if name in names:
+            return name
+    return sorted(names)[0] if names else None
 
 
 def _sampled_best_invalid_reason(output_dir: Path) -> str | None:

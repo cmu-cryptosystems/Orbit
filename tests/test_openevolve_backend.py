@@ -2977,6 +2977,9 @@ def test_policy_bank_record_carries_boundary_trace_examples():
         },
         "artifacts": {
             "correctness_gate": {"reasons": []},
+            "candidate_mlir_preview": "module { func.func @candidate() }",
+            "candidate_mlir_digest": "abc123",
+            "candidate_mlir_path": "/tmp/candidate.mlir",
             "execution_trace": json.dumps(
                 {
                     "top_costly_boundary_groups": [
@@ -2999,7 +3002,42 @@ def test_policy_bank_record_carries_boundary_trace_examples():
 
     assert record["scale_floor_bits"] == 36.0
     assert record["top_costly_boundary_groups"][0]["group_key"]["in_lvl"] == 14
+    assert record["candidate_mlir_preview"].startswith("module")
+    assert examples[1]["candidate_mlir_digest"] == "abc123"
+    assert examples[1]["candidate_mlir_preview"].startswith("module")
     assert examples[1]["top_costly_boundary_groups"][0]["min_cost_usec"] == 12.0
+
+
+def test_merge_candidate_examples_preserves_seed_mlir_preview():
+    examples = oe_backend._merge_candidate_examples(
+        [
+            {
+                "kind": "seed_mlir_trace_reference",
+                "candidate_mlir_digest": "digest",
+                "selected_path_digest": "path",
+                "candidate_mlir_preview": "x" * 4000,
+            }
+        ],
+        [
+            {
+                "kind": "seed_mlir_trace_reference",
+                "candidate_mlir_digest": "digest",
+                "selected_path_digest": "path",
+                "candidate_mlir_preview": "duplicate",
+            },
+            {
+                "kind": "policy_bank_loser",
+                "candidate_mlir_digest": "other",
+                "selected_path_digest": "other-path",
+                "candidate_mlir_preview": "module { }",
+            },
+        ],
+    )
+
+    assert len(examples) == 2
+    assert examples[0]["kind"] == "seed_mlir_trace_reference"
+    assert len(examples[0]["candidate_mlir_preview"]) == 2500
+    assert examples[1]["candidate_mlir_preview"] == "module { }"
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):

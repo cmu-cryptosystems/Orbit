@@ -1810,10 +1810,13 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     print(f"OpenEvolve compile workspace: {root}", flush=True)
     cached_context = _load_cached_compile_context(context_path, dag, params)
     context = build_compile_context(dag, params)
+    context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
     )
     initial_hints = _hints_from_code(initial_source, context) or _bootstrap_mcts_seed_policy(params)
+    initial_path.write_text(initial_source, encoding="utf-8")
+    seed_trace_examples: list[dict[str, Any]] = []
     if cached_context is not None:
         print("OpenEvolve compile harness: reusing cached seed replay/context.", flush=True)
         _merge_cached_compile_context(context, cached_context, params)
@@ -1859,7 +1862,20 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                     sampled_baseline.get("unsolved_boundary_groups", {}) or {}
                 )
                 context["reference"] = dict(sampled_baseline)
+                seed_trace_examples = _seed_mlir_trace_examples(
+                    context,
+                    initial_path,
+                    initial_hints,
+                    sampled_reference,
+                )
         context["placement_profile"] = reference.get("bottleneck_summary", [])
+        if not seed_trace_examples:
+            seed_trace_examples = _seed_mlir_trace_examples(
+                context,
+                initial_path,
+                initial_hints,
+                reference,
+            )
         print(
             "OpenEvolve compile harness: seed baseline "
             f"valid={context['reference'].get('valid')} "
@@ -1871,7 +1887,6 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         context.get("placement_units", []),
         context.get("placement_profile", []),
     )
-    context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     policy_bank = _run_compile_policy_bank_prepass(
         context_path,
@@ -1925,7 +1940,10 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     context.setdefault("harness", {})["initial_policy_hints"] = _jsonable_policy_hints(
         initial_hints
     )
-    context.setdefault("harness", {})["candidate_examples"] = policy_bank.get("examples", [])
+    context.setdefault("harness", {})["candidate_examples"] = _merge_candidate_examples(
+        seed_trace_examples,
+        policy_bank.get("examples", []),
+    )
     context.setdefault("harness", {})["policy_bank_summary"] = policy_bank.get("summary", {})
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initial_path.write_text(initial_source, encoding="utf-8")
@@ -3431,6 +3449,7 @@ def _policy_bank_record(
         "path_digest": str(artifacts.get("sampled_selected_path_digest", ""))[:24],
         "candidate_mlir_digest": str(artifacts.get("candidate_mlir_digest", "")),
         "candidate_mlir_path": str(artifacts.get("candidate_mlir_path", "")),
+        "candidate_mlir_preview": str(artifacts.get("candidate_mlir_preview", ""))[:2500],
         "gate_reasons": list(gate.get("reasons", []) or [])[:8],
         "policy_summary": json.loads(_compact_policy_summary(hints)),
     }
@@ -3540,10 +3559,119 @@ def _policy_bank_candidate_examples(
                 )[:4],
                 "candidate_mlir_digest": item.get("candidate_mlir_digest", ""),
                 "candidate_mlir_path": item.get("candidate_mlir_path", ""),
+                "candidate_mlir_preview": str(item.get("candidate_mlir_preview", ""))[:2500],
                 "why_it_lost": _policy_bank_loss_reason(item),
             }
         )
     return examples[:8]
+
+
+def _merge_candidate_examples(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                str(item.get("kind", "")),
+                str(item.get("candidate_mlir_digest", "")),
+                str(item.get("selected_path_digest", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            compact = dict(item)
+            if "candidate_mlir_preview" in compact:
+                compact["candidate_mlir_preview"] = str(compact["candidate_mlir_preview"])[:2500]
+            examples.append(compact)
+    return examples[:8]
+
+
+def _seed_mlir_trace_examples(
+    context: dict[str, Any],
+    program_path: Path,
+    hints: dict[str, Any],
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not bool(result.get("valid", False)):
+        return []
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    objective_cost = _finite_float(
+        result.get("objective_cost_usec", result.get("final_latency_usec")),
+        float("inf"),
+    )
+    if not math.isfinite(objective_cost):
+        return []
+    objective = {
+        "objective_cost_usec": objective_cost,
+        "base_objective_cost_usec": objective_cost,
+        "reference_objective_cost_usec": objective_cost,
+        "total_frontier_cost_usec": _finite_float(
+            result.get("total_frontier_cost_usec", result.get("aggregated_partition_cost_usec")),
+            objective_cost,
+        ),
+    }
+    selected_path_digest = _selected_path_digest(result, diagnostics)
+    correctness_gate = {
+        "correct": True,
+        "reasons": [],
+        "seed_equivalent_path": True,
+        "objective_improved_vs_seed": False,
+    }
+    execution_trace = {
+        "objective": "seed_mlir_trace_reference",
+        "correctness_gate": correctness_gate,
+        "policy_summary": json.loads(_compact_policy_summary(hints)),
+        "latency": {
+            "objective_cost_usec": objective_cost,
+            "final_latency_usec": _finite_float(result.get("final_latency_usec"), objective_cost),
+            "total_frontier_cost_usec": objective["total_frontier_cost_usec"],
+        },
+        "path": {
+            "selected_path_digest": selected_path_digest,
+            "effective_qbp_digest": _effective_qbp_digest(diagnostics),
+            "selected_source_counts": diagnostics.get("selected_source_counts", {}),
+        },
+        "top_costly_boundary_groups": _boundary_group_top_cost_summary(
+            diagnostics.get("boundary_group_summaries", [])
+        )[:8],
+        "unsolved_boundary_groups": _boundary_group_unsolved_summary(
+            diagnostics.get("boundary_group_summaries", [])
+        ),
+    }
+    artifacts = _maybe_write_candidate_mlir_artifacts(
+        context,
+        program_path,
+        hints,
+        result,
+        objective,
+        correctness_gate,
+        execution_trace,
+    )
+    if not bool(artifacts.get("written", False)):
+        return []
+    return [
+        {
+            "kind": "seed_mlir_trace_reference",
+            "label": "initial_seed",
+            "correct": True,
+            "latency_improved": False,
+            "objective_cost_usec": objective_cost,
+            "final_latency_usec": _finite_float(result.get("final_latency_usec"), objective_cost),
+            "selected_path_digest": selected_path_digest[:24],
+            "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
+            "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
+            "candidate_mlir_digest": str(artifacts.get("mlir_digest", "")),
+            "candidate_mlir_path": str(artifacts.get("mlir_path", "")),
+            "candidate_mlir_preview": str(artifacts.get("mlir_preview", ""))[:2500],
+            "execution_trace_path": str(artifacts.get("execution_trace_path", "")),
+            "why_it_lost": "seed_reference_for_latency_and_trace_comparison",
+            "top_costly_boundary_groups": execution_trace["top_costly_boundary_groups"][:4],
+        }
+    ]
 
 
 def _policy_bank_loss_reason(item: dict[str, Any]) -> str:
@@ -5422,6 +5550,9 @@ def _maybe_write_candidate_mlir_artifacts(
             "candidate_digest": candidate_digest,
             "mlir_path": str(mlir_path),
             "mlir_digest": mlir_digest,
+            "assignment_path": str(artifact_root / "assignment.json"),
+            "policy_path": str(artifact_root / "policy.json"),
+            "execution_trace_path": str(artifact_root / "execution_trace.json"),
             "mlir_bytes": len(mlir_text.encode("utf-8")),
             "context_name": assignment_context.get("tdag", {}).get("name", context.get("tdag", {}).get("name", "")),
             "sampled_partition_mlir": assignment_context is not context,

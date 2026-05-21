@@ -3661,8 +3661,11 @@ def test_full_validate_policy_bank_seed_promotes_only_valid_full_replay(
         "mcts_action_allowlist": ["budget_fulfillment_beam"],
     }
 
-    def fake_evaluate_compile_hints(_context, hints, *, suppress_output):
+    def fake_evaluate_compile_hints(
+        _context, hints, *, suppress_output, evaluating_candidate=True
+    ):
         assert _context["harness"]["eval_suite"] == "polybert-full"
+        assert evaluating_candidate is False
         assert hints["policy_bank_full_compile_replay"] is True
         return {
             "valid": True,

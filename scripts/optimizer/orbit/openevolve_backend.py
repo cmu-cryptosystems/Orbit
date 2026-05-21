@@ -3645,7 +3645,11 @@ def evaluate_compile_candidate_program(
 
 
 def _evaluate_compile_hints(
-    context: dict[str, Any], hints: dict[str, Any], *, suppress_output: bool
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    *,
+    suppress_output: bool,
+    evaluating_candidate: bool = True,
 ) -> dict[str, Any]:
     eval_suite = context.get("harness", {}).get("eval_suite", "polybert-sampled")
     if eval_suite != "polybert-full" and context.get("sampled_budget_tasks"):
@@ -3659,7 +3663,7 @@ def _evaluate_compile_hints(
     params.openevolve_iterations = 0
     params.openevolve_harness = "compile"
     params.openevolve_compile_hints = _compile_hints_for_eval_suite(hints, eval_suite)
-    params.openevolve_evaluating_candidate = True
+    params.openevolve_evaluating_candidate = bool(evaluating_candidate)
     params.openevolve_eval_suite = eval_suite
     scale_floor_bits = _apply_active_scale_floor_from_hints(
         params, params.openevolve_compile_hints
@@ -7057,7 +7061,12 @@ def _full_validate_policy_bank_seed(
     replay_hints = _policy_bank_full_compile_replay_hints(initial_hints)
     summary_path = finalist_dir / "policy_bank_full_validation.json"
     try:
-        result = _evaluate_compile_hints(full_context, replay_hints, suppress_output=True)
+        result = _evaluate_compile_hints(
+            full_context,
+            replay_hints,
+            suppress_output=True,
+            evaluating_candidate=False,
+        )
     except Exception as exc:
         summary_path.write_text(
             json.dumps(

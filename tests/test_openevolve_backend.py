@@ -2230,14 +2230,27 @@ def test_sampled_fallback_only_best_skips_expensive_full_bundle(tmp_path: Path):
     )
 
 
-def test_unreachable_boundary_groups_still_count_for_scoring():
+def test_unreachable_boundary_groups_are_excluded_from_sampled_reachable_scoring():
     diagnostics = {
         "requested_boundary_groups": 16,
         "unreachable_boundary_groups": 6,
         "solved_boundary_groups": 10,
     }
 
-    assert oe_backend._scored_boundary_group_count(diagnostics) == 16
+    assert oe_backend._scored_boundary_group_count(diagnostics) == 10
+
+
+def test_sampled_policy_bank_seed_requires_full_validation_for_fail_open():
+    initial = {
+        "strategy": "bootstrap_mcts",
+        "policy_bank_validated_initial": True,
+        "policy_bank_selected_label": "sampled_only",
+    }
+
+    fallback = oe_backend._bounded_fail_open_hints(initial)
+
+    assert fallback["fail_open_reason"] == "zero_iteration_seed_portfolio"
+    assert fallback["rejected_initial_reason"] == "sampled_policy_bank_not_full_validated"
 
 
 def test_full_bundle_finalist_variants_include_bounded_portfolio(toy_cost_json: str, tmp_path: Path):

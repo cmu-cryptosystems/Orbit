@@ -4446,13 +4446,8 @@ def _is_retryable_bypass_failure(exc: BaseException) -> bool:
 
 def _scored_boundary_group_count(diagnostics: dict[str, Any]) -> int:
     requested = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
-    # Do not remove "unreachable" sampled groups from the correctness
-    # denominator. The sampled prepass can misclassify downstream boundary
-    # states as unreachable when the current policy simply failed to connect a
-    # complete QBP path. Keeping the raw requested count makes OpenEvolve solve
-    # the Orbit-shaped boundary table instead of optimizing a locally repaired
-    # subset that later fails during full compile.
-    return requested
+    unreachable = max(0, int(diagnostics.get("unreachable_boundary_groups", 0) or 0))
+    return max(1, requested - unreachable)
 
 
 def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:

@@ -8610,7 +8610,7 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
             if policy_bank_lightweight
             else (8 if (mcts_broad or budget_aggressive) else 4),
         ),
-    )
+        )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
         # Sampled evolution must stay a fast proxy. A candidate may request a
         # broader beam for full replay, but the sampled OpenEvolve evaluator
@@ -8646,6 +8646,26 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 2 if policy_bank_lightweight else (8 if budget_aggressive else 6),
             ),
         )
+    bounded = _clamp_sampled_policy_patch(
+        bounded,
+        policy_bank_lightweight=policy_bank_lightweight,
+    )
+    bounded["mcts_actions"] = _clamp_sampled_policy_items(
+        bounded.get("mcts_actions"),
+        policy_bank_lightweight=policy_bank_lightweight,
+    )
+    bounded["mcts_action_presets"] = _clamp_sampled_action_presets(
+        bounded.get("mcts_action_presets"),
+        policy_bank_lightweight=policy_bank_lightweight,
+    )
+    bounded["boundary_group_policies"] = _clamp_sampled_policy_items(
+        bounded.get("boundary_group_policies"),
+        policy_bank_lightweight=policy_bank_lightweight,
+    )
+    bounded["unit_policies"] = _clamp_sampled_policy_items(
+        bounded.get("unit_policies"),
+        policy_bank_lightweight=policy_bank_lightweight,
+    )
     if isinstance(portfolio, list) and portfolio:
         sampled_portfolio = [
             _bounded_sampled_policy(item)
@@ -8898,6 +8918,111 @@ def _hint_digest(hints: dict[str, Any]) -> str:
     except TypeError:
         payload = repr(hints)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sampled_policy_limits(policy_bank_lightweight: bool = False) -> dict[str, int]:
+    if policy_bank_lightweight:
+        return {
+            "max_scale_candidates": 16,
+            "state_cap_per_node": 8,
+            "beam_width": 4,
+            "boundary_state_cap": 2,
+            "mcts_rollout_budget": 4,
+            "mcts_action_cap": 2,
+            "mcts_max_repair_bootstraps": 4,
+        }
+    return {
+        "max_scale_candidates": 48,
+        "state_cap_per_node": 32,
+        "beam_width": 8,
+        "boundary_state_cap": 8,
+        "mcts_rollout_budget": 8,
+        "mcts_action_cap": 4,
+        "mcts_max_repair_bootstraps": 32,
+    }
+
+
+def _clamp_sampled_policy_patch(
+    policy: dict[str, Any],
+    *,
+    policy_bank_lightweight: bool = False,
+) -> dict[str, Any]:
+    clamped = dict(policy)
+    limits = _sampled_policy_limits(policy_bank_lightweight)
+    defaults = {
+        "max_scale_candidates": 24,
+        "state_cap_per_node": 24,
+        "beam_width": 4,
+        "boundary_state_cap": 6,
+        "mcts_rollout_budget": 6,
+        "mcts_action_cap": 3,
+        "mcts_max_repair_bootstraps": 12,
+    }
+    for key, limit in limits.items():
+        if key in clamped:
+            clamped[key] = min(limit, _int_hint(clamped.get(key), defaults[key]))
+    return clamped
+
+
+def _clamp_sampled_policy_items(
+    value: Any,
+    *,
+    policy_bank_lightweight: bool = False,
+) -> Any:
+    if not isinstance(value, list):
+        return value
+    clamped_items: list[Any] = []
+    for item in value:
+        if not isinstance(item, dict):
+            clamped_items.append(item)
+            continue
+        updated = dict(item)
+        policy = updated.get("policy")
+        if isinstance(policy, dict):
+            updated["policy"] = _clamp_sampled_policy_patch(
+                policy,
+                policy_bank_lightweight=policy_bank_lightweight,
+            )
+        else:
+            updated = _clamp_sampled_policy_patch(
+                updated,
+                policy_bank_lightweight=policy_bank_lightweight,
+            )
+        clamped_items.append(updated)
+    return clamped_items
+
+
+def _clamp_sampled_action_presets(
+    value: Any,
+    *,
+    policy_bank_lightweight: bool = False,
+) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for name, preset in value.items():
+            if not isinstance(preset, dict):
+                result[name] = preset
+                continue
+            updated = dict(preset)
+            policy = updated.get("policy")
+            if isinstance(policy, dict):
+                updated["policy"] = _clamp_sampled_policy_patch(
+                    policy,
+                    policy_bank_lightweight=policy_bank_lightweight,
+                )
+            else:
+                updated = _clamp_sampled_policy_patch(
+                    updated,
+                    policy_bank_lightweight=policy_bank_lightweight,
+                )
+            result[str(name)] = updated
+        return result
+    if isinstance(value, list):
+        return _clamp_sampled_policy_items(
+            value,
+            policy_bank_lightweight=policy_bank_lightweight,
+        )
+    return value
 
 
 def _sampled_policy_static_reasons(context: dict[str, Any], hints: dict[str, Any]) -> list[str]:
@@ -10114,6 +10239,39 @@ def _promotion_record_summary(
     }
 
 
+def _promotion_complexity_reasons(hints: dict[str, Any]) -> list[str]:
+    limits = _sampled_policy_limits(False)
+    max_seen = {key: 0 for key in limits}
+    policy_like_count = 0
+
+    def visit(value: Any) -> None:
+        nonlocal policy_like_count
+        if isinstance(value, dict):
+            if any(key in value for key in limits) or "strategy" in value:
+                policy_like_count += 1
+                for key in limits:
+                    if key in value:
+                        max_seen[key] = max(
+                            max_seen[key],
+                            _int_hint(value.get(key), 0),
+                        )
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(hints)
+    reasons = [
+        f"{key}>{limit} ({max_seen[key]})"
+        for key, limit in limits.items()
+        if max_seen[key] > limit
+    ]
+    if policy_like_count > 48:
+        reasons.append(f"policy_like_count>48 ({policy_like_count})")
+    return reasons[:8]
+
+
 def _write_promotion_progress(
     promotion_dir: Path,
     *,
@@ -10359,6 +10517,29 @@ def _run_sampled_promotion_pass(
             )
             continue
         eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
+        complexity_reasons = _promotion_complexity_reasons(eval_hints)
+        if complexity_reasons:
+            records.append(
+                _promotion_record_summary(
+                    index=index,
+                    stage="static",
+                    hints=eval_hints,
+                    reason="promotion_policy_too_expensive:"
+                    + ",".join(complexity_reasons[:3]),
+                    code_digest=code_digest,
+                )
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="static_rejected",
+                current_index=index,
+                total_candidates=len(codes),
+                records=records,
+                selected=best is not None,
+            )
+            continue
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True

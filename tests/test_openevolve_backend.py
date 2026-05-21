@@ -3644,6 +3644,61 @@ def test_sampled_compile_eval_rejects_expensive_policy(toy_cost_json: str):
     assert "sampled policy rejects strategy 'waterline_seed'" in reasons
 
 
+def test_sampled_policy_clamps_nested_qbp_lattice_controls(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "budget_aggressive": True,
+        "mcts_action_presets": {
+            "dense_boundary_cost_beam": {
+                "policy": {
+                    "boundary_state_cap": 20,
+                    "max_scale_candidates": 128,
+                    "beam_width": 12,
+                    "state_cap_per_node": 96,
+                    "mcts_rollout_budget": 64,
+                }
+            }
+        },
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": -1, "in_scl": 40},
+                "policy": {
+                    "boundary_state_cap": 16,
+                    "max_scale_candidates": 96,
+                    "beam_width": 12,
+                    "state_cap_per_node": 64,
+                    "mcts_action_cap": 12,
+                },
+            }
+        ],
+        "unit_policies": [
+            {
+                "selector": {"layer": "0"},
+                "policy": {
+                    "boundary_state_cap": 14,
+                    "max_scale_candidates": 80,
+                    "beam_width": 10,
+                    "state_cap_per_node": 80,
+                },
+            }
+        ],
+    }
+
+    sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
+    preset_policy = sampled["mcts_action_presets"]["dense_boundary_cost_beam"]["policy"]
+    boundary_policy = sampled["boundary_group_policies"][0]["policy"]
+    unit_policy = sampled["unit_policies"][0]["policy"]
+
+    for policy in (sampled, preset_policy, boundary_policy, unit_policy):
+        assert policy["boundary_state_cap"] <= 8
+        assert policy["max_scale_candidates"] <= 48
+        assert policy["beam_width"] <= 8
+        assert policy["state_cap_per_node"] <= 32
+    assert boundary_policy["mcts_action_cap"] <= 4
+    assert oe_backend._promotion_complexity_reasons(sampled) == []
+
+
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_code = "def place(context):\n    return {'tag': 'result_best'}\n"

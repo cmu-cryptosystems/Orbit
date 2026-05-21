@@ -2679,6 +2679,23 @@ def test_policy_bank_worker_count_uses_parallel_evaluations(
     assert oe_backend._policy_bank_worker_count(params, 22) == 4
 
 
+def test_policy_bank_qbp_worker_count_avoids_nested_oversubscription(
+    toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+    )
+    params.threads = 96
+
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_POLICY_BANK_QBP_WORKERS", raising=False)
+    assert oe_backend._policy_bank_qbp_worker_count(params, 16) == 6
+    assert oe_backend._policy_bank_qbp_worker_count(params, 4) == 8
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_POLICY_BANK_QBP_WORKERS", "12")
+    assert oe_backend._policy_bank_qbp_worker_count(params, 16) == 12
+
+
 def test_policy_bank_full_validation_timeout_follows_evaluator_timeout(
     toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
 ):

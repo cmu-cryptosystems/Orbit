@@ -2317,26 +2317,41 @@ def _run_compile_policy_bank_prepass(
                 evaluate_compile_candidate_program(context_path, program_path),
             )
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_job = {
-                executor.submit(
-                    _evaluate_policy_bank_program,
-                    str(context_path),
-                    str(program_path),
-                ): (label, hints)
-                for label, hints, program_path in jobs
-            }
-            for future in concurrent.futures.as_completed(future_to_job):
-                label, hints = future_to_job[future]
-                try:
-                    evaluation = future.result()
-                except BaseException as exc:
-                    evaluation = _invalid_compile_result(
-                        "policy_bank_evaluator_exception",
-                        [f"{type(exc).__name__}: {str(exc)[:240]}"],
-                    )
-                    evaluation.setdefault("artifacts", {})["traceback"] = traceback.format_exc()[-4000:]
-                consume_record(label, hints, evaluation)
+        qbp_worker_override = _policy_bank_qbp_worker_count(params, workers)
+        old_qbp_workers = os.environ.get("ORBIT_OPENEVOLVE_QBP_WORKERS")
+        old_qbp_cap = os.environ.get("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS")
+        os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = str(qbp_worker_override)
+        os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = str(qbp_worker_override)
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_job = {
+                    executor.submit(
+                        _evaluate_policy_bank_program,
+                        str(context_path),
+                        str(program_path),
+                    ): (label, hints)
+                    for label, hints, program_path in jobs
+                }
+                for future in concurrent.futures.as_completed(future_to_job):
+                    label, hints = future_to_job[future]
+                    try:
+                        evaluation = future.result()
+                    except BaseException as exc:
+                        evaluation = _invalid_compile_result(
+                            "policy_bank_evaluator_exception",
+                            [f"{type(exc).__name__}: {str(exc)[:240]}"],
+                        )
+                        evaluation.setdefault("artifacts", {})["traceback"] = traceback.format_exc()[-4000:]
+                    consume_record(label, hints, evaluation)
+        finally:
+            if old_qbp_workers is None:
+                os.environ.pop("ORBIT_OPENEVOLVE_QBP_WORKERS", None)
+            else:
+                os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = old_qbp_workers
+            if old_qbp_cap is None:
+                os.environ.pop("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", None)
+            else:
+                os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = old_qbp_cap
     summary = {
         "enabled": True,
         "variant_count": len(variants),
@@ -2398,6 +2413,18 @@ def _policy_bank_worker_count(params: Params, variant_count: int) -> int:
             ),
         )
     return min(workers, max(1, int(variant_count or 0)))
+
+
+def _policy_bank_qbp_worker_count(params: Params, policy_bank_workers: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_QBP_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    threads = max(1, int(getattr(params, "threads", 1) or 1))
+    bank_workers = max(1, int(policy_bank_workers or 1))
+    return max(1, min(8, threads // bank_workers))
 
 
 def _graph_maintenance_anchor_hint(context: dict[str, Any]) -> int:

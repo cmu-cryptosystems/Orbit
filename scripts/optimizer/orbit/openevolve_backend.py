@@ -555,6 +555,55 @@ def place(context):
             ]
             if name in available
         ]
+        # Keep trace-group switches explicit but disabled in the seed. This
+        # gives OpenEvolve a small, concrete boolean surface to mutate from
+        # prior MLIR/path traces without making the initial program broad or
+        # slow.
+        trace_group_overrides = [
+            {
+                "enabled": False,
+                "group_index": 0,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "bootstrap_penalty": 35_000_000.0,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+            },
+            {
+                "enabled": False,
+                "group_index": 0,
+                "boundary_scale_policy": "waterline",
+                "scale_lattice": "waterline_sf",
+                "boundary_state_cap": 8,
+                "max_scale_candidates": 64,
+                "bootstrap_penalty": 65_000_000.0,
+                "beam_width": 8,
+                "state_cap_per_node": 40,
+            },
+            {
+                "enabled": False,
+                "group_index": 1,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "dense",
+                "boundary_state_cap": 16,
+                "max_scale_candidates": 96,
+                "bootstrap_penalty": 25_000_000.0,
+                "beam_width": 12,
+                "state_cap_per_node": 48,
+            },
+        ]
+        costly_groups = mcts.top_costly_boundary_groups(limit=4)
+        boundary_group_policies = []
+        for item in trace_group_overrides:
+            if not item.get("enabled"):
+                continue
+            group_index = int(item.get("group_index", 0))
+            if group_index < 0 or group_index >= len(costly_groups):
+                continue
+            overrides = {key: value for key, value in item.items() if key not in {"enabled", "group_index"}}
+            boundary_group_policies.append(mcts.boundary_group_policy(costly_groups[group_index], **overrides))
         return {
             "strategy": "bootstrap_mcts",
             "budget_aggressive": True,
@@ -565,7 +614,8 @@ def place(context):
             "min_transition_reserve": 1,
             "min_decryptability_reserve": 1,
             "boundary_scale_policy": "waterline",
-            "boundary_group_policies": [],
+            "trace_group_overrides": trace_group_overrides,
+            "boundary_group_policies": boundary_group_policies,
             "mcts_action_allowlist": compact_names,
             "mcts_action_cap": 10,
             "mcts_rollout_budget": 16,
@@ -2949,6 +2999,12 @@ def _compile_policy_bank_variants(
             hints["mcts_action_presets"] = presets
         variants.append((label, hints))
 
+    top_groups: list[dict[str, Any]] = []
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    for item in harness.get("top_costly_boundary_groups", []) or []:
+        if isinstance(item, dict):
+            top_groups.append(item)
+
     waterline_direct_policy = {
         "selection_objective": "cost",
         "bootstrap_penalty": 25_000_000.0,
@@ -3073,6 +3129,81 @@ def _compile_policy_bank_variants(
         },
         replace_presets=True,
     )
+    if top_groups:
+        # Keep these before the broad policy-bank sweep so capped short runs
+        # still test whether trace-derived boundary overlays can move the DP
+        # path. Each probe touches one costly boundary group only.
+        trace_probe_specs = [
+            ("frontier", "waterline_sf", 12, 80, 10, 48, 35_000_000.0),
+            ("waterline", "waterline_sf", 8, 64, 8, 40, 65_000_000.0),
+            ("frontier", "dense", 16, 96, 12, 48, 25_000_000.0),
+        ]
+        for group_idx, group in enumerate(top_groups[:2]):
+            selector = group.get("group_key", group)
+            if not isinstance(selector, dict):
+                continue
+            for (
+                boundary_policy,
+                scale_lattice,
+                boundary_cap,
+                max_scales,
+                beam_width,
+                state_cap,
+                maintenance_penalty,
+            ) in trace_probe_specs:
+                overlay_policy = {
+                    "boundary_state_cap": int(boundary_cap),
+                    "max_scale_candidates": int(max_scales),
+                    "boundary_scale_policy": boundary_policy,
+                    "scale_lattice": scale_lattice,
+                    "bootstrap_penalty": float(maintenance_penalty),
+                    "selection_bootstrap_penalty": 0.0,
+                    "beam_width": int(beam_width),
+                    "state_cap_per_node": int(state_cap),
+                    "selection_objective": "cost",
+                }
+                add(
+                    (
+                        f"trace_group_{group_idx}_{boundary_policy}_"
+                        f"{scale_lattice}_cost_probe"
+                    ),
+                    {
+                        "boundary_group_policies": [
+                            {"selector": dict(selector), "policy": overlay_policy}
+                        ],
+                        "mcts_action_cap": 10,
+                        "mcts_rollout_budget": 16,
+                        "mcts_exploration_weight": 1.15,
+                        "mcts_max_repair_bootstraps": 128,
+                        "selection_objective": "cost",
+                        "include_seed_repair_actions": False,
+                        "mcts_action_allowlist": [
+                            "budget_fulfillment_beam",
+                            "wide_boundary_cost_beam",
+                            "dense_boundary_cost_beam",
+                            "latency_mcts_repair",
+                        ],
+                    },
+                    {
+                        "budget_fulfillment_beam": {
+                            "prior": 0.70,
+                            "policy": overlay_policy,
+                        },
+                        "wide_boundary_cost_beam": {
+                            "prior": 0.55,
+                            "policy": overlay_policy,
+                        },
+                        "dense_boundary_cost_beam": {
+                            "prior": 0.58,
+                            "policy": {
+                                **overlay_policy,
+                                "strategy": "latency_beam",
+                                "boundary_state_cap": max(12, int(boundary_cap)),
+                                "max_scale_candidates": max(80, int(max_scales)),
+                            },
+                        },
+                    },
+                )
     for label, max_scale, boundary_cap, beam_width, bootstrap_penalty in [
         ("waterline_direct_cost_wide48", 48, 8, 12, 25_000_000.0),
         ("waterline_direct_cost_wide64", 64, 8, 12, 25_000_000.0),
@@ -3666,11 +3797,6 @@ def _compile_policy_bank_variants(
                     },
                 },
             )
-    top_groups = []
-    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
-    for item in harness.get("top_costly_boundary_groups", []) or []:
-        if isinstance(item, dict):
-            top_groups.append(item)
     if top_groups:
         boundary_overlay_specs = [
             (

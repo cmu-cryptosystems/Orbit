@@ -2991,6 +2991,70 @@ def test_initial_compile_seed_uses_trace_cost_boundary_group_policies(
     assert "budget_fulfillment_beam" in hints["mcts_action_allowlist"]
 
 
+def test_initial_compile_seed_exposes_disabled_trace_switches(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["initial_policy_hints"] = {"strategy": "bootstrap_mcts"}
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {
+                "in_lvl": params.lvl_ub,
+                "in_scl": params.Sw,
+                "maino_v": "",
+                "main_dag_size": 0,
+            },
+            "min_cost_usec": 123.0,
+        }
+    ]
+    program_path = tmp_path / "initial_compact.py"
+    program_path.write_text(
+        oe_backend._initial_compile_program_source("bootstrap-mcts"),
+        encoding="utf-8",
+    )
+
+    hints = oe_backend._load_candidate_hints(program_path, context)
+
+    assert hints["boundary_group_policies"] == []
+    assert hints["trace_group_overrides"][0]["enabled"] is False
+    assert hints["trace_group_overrides"][0]["group_index"] == 0
+
+
+def test_policy_bank_prioritizes_trace_group_probes(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {
+                "in_lvl": params.lvl_ub,
+                "in_scl": params.Sw,
+                "maino_v": "",
+                "main_dag_size": 0,
+            },
+            "min_cost_usec": 123.0,
+        },
+        {
+            "group_key": {
+                "in_lvl": params.lvl_ub - 1,
+                "in_scl": params.Sw,
+                "maino_v": "bypass",
+                "main_dag_size": 4,
+            },
+            "min_cost_usec": 100.0,
+        },
+    ]
+    variants = oe_backend._compile_policy_bank_variants(
+        oe_backend._bootstrap_mcts_seed_policy(params),
+        context,
+        params,
+    )
+    early_labels = [label for label, _hints in variants[:8]]
+
+    assert any(label.startswith("trace_group_0_") for label in early_labels)
+    assert any(label.startswith("trace_group_1_") for label in early_labels)
+
+
 def test_policy_bank_record_carries_boundary_trace_examples():
     evaluation = {
         "metrics": {

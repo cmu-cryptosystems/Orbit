@@ -246,7 +246,7 @@ def main():
         '--openevolve-target-bootstrap-count',
         type=int,
         default=0,
-        help='Soft target for final bootstrap count; 0 disables the target',
+        help='Backward-compatible explicit bootstrap target; leave 0 for model-general latency optimization',
     )
     parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
     parser.add_argument('--openevolve-llm-retries', type=int, default=1)

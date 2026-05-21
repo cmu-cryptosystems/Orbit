@@ -1146,7 +1146,7 @@ def test_target_bootstrap_score_rewards_absolute_progress_without_reference():
     assert oe_backend._target_bootstrap_score(9, 9, None) == 1.0
 
 
-def test_component_bootstrap_target_penalizes_under_budget(toy_cost_json: str):
+def test_contextual_bootstrap_score_does_not_infer_component_targets(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
     graph = Tdag(params, "unit_graph")
     graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
@@ -1162,11 +1162,12 @@ def test_component_bootstrap_target_penalizes_under_budget(toy_cost_json: str):
     graph.outputs = {"softmax"}
     context = build_context(graph, [{"in_lvl": -1, "in_scl": 40}], params)
 
-    under = oe_backend._contextual_target_bootstrap_score(context, 9, 1, None)
-    aligned = oe_backend._contextual_target_bootstrap_score(context, 9, 3, None)
+    lower = oe_backend._contextual_target_bootstrap_score(context, 9, 1, None)
+    higher_but_under_explicit = oe_backend._contextual_target_bootstrap_score(context, 9, 3, None)
 
-    assert under < aligned
-    assert aligned == 1.0
+    assert lower == 1.0
+    assert higher_but_under_explicit == 1.0
+    assert context["unit_bootstrap_budget"]["unit_budgets"] == {}
 
 
 def test_assignment_count_summary_does_not_sum_qbp_alternatives(monkeypatch):
@@ -2285,8 +2286,9 @@ def test_layer_nonlinear_units_are_extracted_from_comments(toy_cost_json: str):
     assert "nonlinear:layer.0:activation" in unit_ids
     assert context["unit_op_histogram"]["mul"] == 4
     budget = context["unit_bootstrap_budget"]
-    assert budget["unit_budgets"]["nonlinear:layer.0:attention_softmax"]["target"] == 3
-    assert budget["effective_target_bootstrap_count"] >= 3
+    pressure = budget["unit_maintenance_pressure"]["nonlinear:layer.0:attention_softmax"]
+    assert pressure["pressure"] > 0
+    assert budget["effective_target_bootstrap_count"] == 0
 
 
 def test_layer_units_handle_prefixed_rotom_comments_and_waterline_summary(toy_cost_json: str):
@@ -2334,7 +2336,7 @@ def test_layer_units_handle_prefixed_rotom_comments_and_waterline_summary(toy_co
     assert waterline["by_layer"]["pooler"]["output_scale_lower_bounds"] == {"40": 1}
 
 
-def test_component_bootstrap_alignment_scores_non_linear_budget(toy_cost_json: str):
+def test_component_bootstrap_alignment_is_neutral_without_count_budget(toy_cost_json: str):
     params = _params(toy_cost_json)
     graph = Tdag(params, "unit_graph")
     graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
@@ -2361,7 +2363,7 @@ def test_component_bootstrap_alignment_scores_non_linear_budget(toy_cost_json: s
         3,
     )
 
-    assert aligned > misplaced
+    assert aligned == misplaced
     assert aligned == 1.0
 
 
@@ -2384,13 +2386,38 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
     actions = candidate_actions(context, action_cap=8)
     component = next(action for action in actions if action["name"] == "component_budget_repair")
 
-    assert component["policy"]["component_bootstrap_budgets"] == {
-        "nonlinear:layer.0:attention_softmax": 3
-    }
-    assert component["policy"]["bootstrap_anchor_count"] >= 3
-    assert component["policy"]["selection_objective"] == "component_budget_fit"
-    assert component["policy"]["prefer_component_budget_fit"] is True
+    assert component["policy"]["component_bootstrap_budgets"] == {}
+    assert component["policy"]["bootstrap_anchor_count"] >= 1
+    assert component["policy"]["selection_objective"] == "cost"
+    assert component["policy"]["prefer_component_budget_fit"] is False
     assert component["policy"]["force_bootstrap_anchors"] is False
+
+
+def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    initial = oe_backend._bootstrap_mcts_initial_policy_for_context(context)
+
+    variants = oe_backend._compile_policy_bank_variants(initial, context, params)
+
+    def target_values(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "target_bootstrap_count":
+                    yield item
+                yield from target_values(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from target_values(item)
+
+    assert variants
+    assert all("gurobi" not in label.lower() for label, _ in variants)
+    assert all("boundary40" not in label.lower() for label, _ in variants)
+    assert all(
+        int(raw or 0) == 0
+        for _label, hints in variants
+        for raw in target_values(hints)
+    )
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):
@@ -2668,7 +2695,8 @@ def test_context_includes_alphaevolve_guidance(toy_cost_json: str):
     assert guidance["source"].startswith("Adapting AlphaEvolve")
     assert "strategy_pool" in guidance
     assert any("execution-trace" in item or "trace" in item for item in guidance["principles"])
-    assert guidance["target_bootstraps"] >= 9
+    assert guidance["requested_bootstrap_target"] == 9
+    assert "maintenance_pressure_summary" in guidance
 
 
 def test_alphaevolve_feedback_suggests_component_action_when_under_budget(toy_cost_json: str):
@@ -2698,7 +2726,7 @@ def test_alphaevolve_feedback_suggests_component_action_when_under_budget(toy_co
     )
 
     joined = " ".join(feedback["suggestions"])
-    assert "component_budget_repair" in joined
+    assert "component pressure repair" in joined
     assert "force_bootstrap_anchors=False" in joined
 
 

@@ -8995,6 +8995,7 @@ def _run_boundary_group_replay_payload(
             if isinstance(item, dict)
         ]
         diagnostics: dict[str, Any] = {}
+        _init_budget_diagnostics(diagnostics, len(budgets))
         io_to_assign, io_to_cost = _solve_budget_batch_boundary_mcts(
             task_tdag,
             budgets,
@@ -9027,7 +9028,7 @@ def _run_boundary_group_replay_payload(
         return {
             "context": context,
             "records": [],
-            "diagnostics": {},
+            "diagnostics": locals().get("diagnostics", {}),
             "error": f"{type(exc).__name__}: {str(exc)[:240]}",
         }
 

@@ -2069,6 +2069,7 @@ def _policy_bank_full_validation_record(
             "invalid_boundary_groups",
             "unreachable_boundary_groups",
             "selected_source_counts",
+            "invalid_reasons",
             "mcts_action_attempt_counts",
             "mcts_action_success_counts",
             "mcts_action_invalid_counts",
@@ -8013,6 +8014,7 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         "invalid_boundary_groups": 0,
         "unreachable_boundary_groups": 0,
         "candidate_improved_budgets": 0,
+        "invalid_reasons": {},
         "candidate_invalid_reasons": {},
         "candidate_costs": [],
         "costs": [],
@@ -8055,8 +8057,9 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
                 totals[dict_key][name] = totals[dict_key].get(name, 0) + int(count)
         totals["costs"].extend(item.get("costs", []))
         totals["assignments"].extend(item.get("assignments", []))
-        for reason, count in item.get("candidate_invalid_reasons", {}).items():
-            totals["candidate_invalid_reasons"][reason] = totals["candidate_invalid_reasons"].get(reason, 0) + int(count)
+        for dict_key in ("invalid_reasons", "candidate_invalid_reasons"):
+            for reason, count in item.get(dict_key, {}).items():
+                totals[dict_key][reason] = totals[dict_key].get(reason, 0) + int(count)
         if len(totals["boundary_group_summaries"]) < 512:
             remaining = 512 - len(totals["boundary_group_summaries"])
             totals["boundary_group_summaries"].extend(

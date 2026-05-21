@@ -543,6 +543,110 @@ def place(context):
         ]
         if name in available
     ]
+    if not isinstance(context.get("harness", {}).get("initial_policy_hints"), dict):
+        compact_names = [
+            name
+            for name in [
+                "budget_fulfillment_beam",
+                "wide_boundary_cost_beam",
+                "dense_boundary_cost_beam",
+                *reference_action_names,
+                "latency_mcts_repair",
+            ]
+            if name in available
+        ]
+        return {
+            "strategy": "bootstrap_mcts",
+            "budget_aggressive": True,
+            "allow_seed_fallback": True,
+            "max_scale_candidates": 24,
+            "bootstrap_penalty": 25_000_000.0,
+            "reserve_penalty": 75_000.0,
+            "min_transition_reserve": 1,
+            "min_decryptability_reserve": 1,
+            "boundary_scale_policy": "waterline",
+            "boundary_group_policies": [],
+            "mcts_action_allowlist": compact_names,
+            "mcts_action_cap": 10,
+            "mcts_rollout_budget": 16,
+            "mcts_exploration_weight": 1.25,
+            "mcts_max_repair_bootstraps": 128,
+            "mcts_prior_order": True,
+            "include_seed_repair_actions": True,
+            "selection_objective": "cost",
+            "mcts_action_presets": mcts.action_presets(
+                budget_fulfillment_beam={
+                    "prior": 0.60,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "beam_width": 10,
+                        "state_cap_per_node": 32,
+                        "boundary_state_cap": 8,
+                        "max_scale_candidates": 48,
+                        "bootstrap_penalty": 25_000_000.0,
+                        "rescale_penalty": 0.0,
+                        "level_drop_penalty": 20_000_000.0,
+                        "selection_objective": "cost",
+                        "direct_budget_policy": True,
+                        "boundary_scale_policy": "waterline",
+                    },
+                },
+                wide_boundary_cost_beam={
+                    "prior": 0.40,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "beam_width": 10,
+                        "state_cap_per_node": 32,
+                        "boundary_state_cap": 8,
+                        "max_scale_candidates": 48,
+                        "boundary_scale_policy": "frontier",
+                        "bootstrap_penalty": 25_000_000.0,
+                        "rescale_penalty": 0.0,
+                        "level_drop_penalty": 20_000_000.0,
+                        "selection_objective": "cost",
+                        "direct_budget_policy": True,
+                    },
+                },
+                dense_boundary_cost_beam={
+                    "prior": 0.50,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "beam_width": 10,
+                        "state_cap_per_node": 48,
+                        "boundary_state_cap": 16,
+                        "max_scale_candidates": 96,
+                        "scale_lattice": "dense",
+                        "boundary_scale_policy": "frontier",
+                        "bootstrap_penalty": 25_000_000.0,
+                        "rescale_penalty": 0.0,
+                        "level_drop_penalty": 20_000_000.0,
+                        "selection_objective": "cost",
+                        "direct_budget_policy": True,
+                    },
+                },
+                **{
+                    name: {
+                        "prior": 0.50,
+                        "policy": {
+                            "strategy": "latency_beam",
+                            "beam_width": 10,
+                            "state_cap_per_node": 48,
+                            "boundary_state_cap": 12,
+                            "max_scale_candidates": 80,
+                            "boundary_scale_policy": "frontier",
+                            "scale_lattice": "waterline_sf",
+                            "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                            "force_bootstrap_anchors": False,
+                            "bootstrap_penalty": 30_000_000.0,
+                            "selection_bootstrap_penalty": 0.0,
+                            "selection_objective": "cost",
+                            "direct_budget_policy": True,
+                        },
+                    }
+                    for name in reference_action_names
+                },
+            ),
+        }
     boundary_group_policies = []
     for idx, group in enumerate(mcts.top_costly_boundary_groups(limit=6)):
         if idx % 3 == 0:

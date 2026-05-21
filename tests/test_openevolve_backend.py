@@ -760,6 +760,7 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
         openevolve_target_bootstrap_count=9,
     )
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["initial_policy_hints"] = {"strategy": "bootstrap_mcts"}
     program_path = tmp_path / "initial.py"
     source = oe_backend._initial_compile_program_source("bootstrap-mcts")
     assert "builder.budget_fulfillment_beam" not in source
@@ -866,6 +867,7 @@ def test_policy_effect_summary_detects_seed_equivalent_and_changed_preset(
         openevolve_target_bootstrap_count=9,
     )
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["initial_policy_hints"] = {"strategy": "bootstrap_mcts"}
     context["harness"]["eval_suite"] = "polybert-sampled"
     initial_path = tmp_path / "initial_program.py"
     changed_path = tmp_path / "changed.py"
@@ -2947,6 +2949,7 @@ def test_initial_compile_seed_uses_trace_cost_boundary_group_policies(
 ):
     params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context["harness"]["initial_policy_hints"] = {"strategy": "bootstrap_mcts"}
     context["sampled_budget_tasks"] = [
         {
             "context": {

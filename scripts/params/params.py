@@ -91,6 +91,9 @@ class Params:
         openevolve_checkpoint_interval=5,
         openevolve_fail_open=True,
         openevolve_reuse_output=False,
+        openevolve_context_cache_dir=None,
+        openevolve_context_cache=True,
+        openevolve_sampled_only=False,
         noise_estimator="finalists",
         noise_estimator_binary=None,
         noise_estimator_timeout_sec=30,
@@ -393,6 +396,21 @@ class Params:
             openevolve_reuse_output
             if openevolve_reuse_output is not None
             else json_parsed.get("openevolve_reuse_output", False)
+        )
+        self.openevolve_context_cache_dir = (
+            openevolve_context_cache_dir
+            if openevolve_context_cache_dir is not None
+            else json_parsed.get("openevolve_context_cache_dir")
+        )
+        self.openevolve_context_cache = bool(
+            openevolve_context_cache
+            if openevolve_context_cache is not None
+            else json_parsed.get("openevolve_context_cache", True)
+        )
+        self.openevolve_sampled_only = bool(
+            openevolve_sampled_only
+            if openevolve_sampled_only is not None
+            else json_parsed.get("openevolve_sampled_only", False)
         )
         self.noise_estimator = (
             noise_estimator

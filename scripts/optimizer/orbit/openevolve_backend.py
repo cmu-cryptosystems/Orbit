@@ -41,6 +41,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 CONTEXT_SCHEMA_VERSION = "orbit-openevolve-placement-context-v4"
 COMPILE_CONTEXT_SCHEMA_VERSION = "orbit-openevolve-compile-harness-v4"
+SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION = "orbit-openevolve-sampled-qbp-task-v1"
 BANNED_CANDIDATE_TOKENS = (
     "gurobipy",
     "pulp",
@@ -2165,6 +2166,232 @@ def _load_cached_compile_context(path: Path, dag: Tdag, params: Params) -> dict[
     return cached
 
 
+def _stable_context_cache_dir(params: Params) -> Path | None:
+    if not getattr(params, "openevolve_context_cache", True):
+        return None
+    explicit = getattr(params, "openevolve_context_cache_dir", None)
+    if explicit:
+        return Path(explicit).resolve()
+    env_dir = os.environ.get("ORBIT_OPENEVOLVE_CONTEXT_CACHE_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).resolve()
+    if getattr(params, "openevolve_output_dir", None):
+        base = Path(params.openevolve_output_dir).resolve()
+        if base.name == "workdir" and base.parent.parent != base.parent:
+            return base.parent.parent / ".openevolve_context_cache"
+        return base.parent / ".openevolve_context_cache"
+    return Path.cwd() / ".openevolve_context_cache"
+
+
+def _file_digest(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tdag_cache_digest(dag: Tdag) -> str:
+    payload = {
+        "name": dag.name,
+        "inputs": sorted(str(item) for item in dag.inputs),
+        "outputs": sorted(str(item) for item in dag.outputs),
+        "nodes": [
+            [str(node), _jsonable_attrs(dict(attrs))]
+            for node, attrs in sorted(dag.nodes(data=True), key=lambda item: str(item[0]))
+        ],
+        "edges": [
+            [str(u), str(v), _jsonable_attrs(dict(attrs))]
+            for u, v, attrs in sorted(
+                dag.edges(data=True),
+                key=lambda item: (str(item[0]), str(item[1])),
+            )
+        ],
+    }
+    return _hint_digest(payload)
+
+
+def _compile_context_cache_key(dag: Tdag, params: Params) -> str:
+    profile = getattr(params, "resilience_profile", None)
+    payload = {
+        "schema_version": COMPILE_CONTEXT_SCHEMA_VERSION,
+        "tdag": _tdag_cache_digest(dag),
+        "cost_model_digest": _file_digest(getattr(params, "le_json", None)),
+        "params": {
+            "Sw": int(params.Sw),
+            "Csw": int(params.Csw),
+            "Sf": int(params.Sf),
+            "lvl_lb": int(params.lvl_lb),
+            "lvl_ub": int(params.lvl_ub),
+            "bts_lb": int(params.bts_lb),
+            "bts_ub": int(params.bts_ub),
+            "bpsdepth": params.bpsdepth,
+            "part": bool(params.part),
+            "comp": bool(params.comp),
+            "netname": str(params.netname),
+            "eval_suite": str(params.openevolve_eval_suite),
+            "search_mode": str(getattr(params, "openevolve_search_mode", "bootstrap-mcts")),
+            "granularity": str(params.openevolve_granularity),
+            "leniency": str(params.openevolve_leniency),
+            "max_unit_samples": int(params.openevolve_max_unit_samples),
+            "reference_json_digest": _file_digest(getattr(params, "openevolve_reference_json", None)),
+            "scale_floor_policy": str(getattr(params, "scale_floor_policy", "waterline")),
+            "scale_floor_min_bits": int(getattr(params, "scale_floor_min_bits", params.Sw)),
+            "scale_floor_candidates": list(
+                getattr(params, "openevolve_scale_floor_candidates", [params.Sw])
+            ),
+            "resilience_profile_fingerprint": getattr(profile, "fingerprint", None),
+            "resilience_constraint_policy": str(params.resilience_constraint_policy),
+            "resilience_mode": str(params.resilience_mode),
+        },
+    }
+    return _hint_digest(payload)
+
+
+def _stable_context_cache_path(dag: Tdag, params: Params) -> Path | None:
+    cache_dir = _stable_context_cache_dir(params)
+    if cache_dir is None:
+        return None
+    return cache_dir / f"{_compile_context_cache_key(dag, params)}.json"
+
+
+def _store_stable_compile_context(path: Path | None, context: dict[str, Any]) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _set_context_cache_paths(
+    context: dict[str, Any],
+    params: Params,
+    stable_context_path: Path | None,
+) -> None:
+    if stable_context_path is None:
+        return
+    qbp_cache_dir = str(
+        stable_context_path.parent / f"{stable_context_path.stem}_qbp_tasks"
+    )
+    context.setdefault("harness", {})["stable_context_cache_path"] = str(
+        stable_context_path
+    )
+    context.setdefault("harness", {})["sampled_qbp_cache_dir"] = qbp_cache_dir
+    setattr(params, "openevolve_sampled_qbp_cache_dir", qbp_cache_dir)
+    for task in context.get("sampled_budget_tasks", []) or []:
+        if isinstance(task, dict) and isinstance(task.get("context"), dict):
+            task["context"].setdefault("harness", {})[
+                "sampled_qbp_cache_dir"
+            ] = qbp_cache_dir
+
+
+def _clean_task_context_for_cache(task_context: dict[str, Any]) -> dict[str, Any]:
+    cleaned = _jsonable_policy_hints(task_context)
+    harness = cleaned.get("harness")
+    if isinstance(harness, dict):
+        for key in (
+            "stable_context_cache_path",
+            "sampled_qbp_cache_dir",
+            "trace_dir",
+            "timing_log_enabled",
+        ):
+            harness.pop(key, None)
+    return cleaned
+
+
+def _sampled_task_cache_dir(task_context: dict[str, Any]) -> Path | None:
+    harness = task_context.get("harness", {})
+    if not isinstance(harness, dict):
+        return None
+    raw = harness.get("sampled_qbp_cache_dir")
+    if not raw:
+        return None
+    return Path(str(raw)).resolve()
+
+
+def _sampled_task_cache_key(
+    task_context: dict[str, Any],
+    eval_hints: dict[str, Any],
+    eval_suite: str,
+) -> str:
+    payload = {
+        "schema_version": SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION,
+        "task_context": _hint_digest(_clean_task_context_for_cache(task_context)),
+        "eval_hints": _hint_digest(_jsonable_policy_hints(eval_hints)),
+        "policy_effect": _hint_digest(_policy_effect_payload(eval_hints)),
+        "eval_suite": str(eval_suite),
+    }
+    return _hint_digest(payload)
+
+
+def _sampled_task_cache_path(
+    task_context: dict[str, Any],
+    eval_hints: dict[str, Any],
+    eval_suite: str,
+) -> Path | None:
+    cache_dir = _sampled_task_cache_dir(task_context)
+    if cache_dir is None:
+        return None
+    key = _sampled_task_cache_key(task_context, eval_hints, eval_suite)
+    return cache_dir / key[:2] / f"{key}.json"
+
+
+def _read_sampled_task_cache(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if cached.get("schema_version") != SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION:
+        return None
+    if not bool(cached.get("validated_assignments", False)):
+        return None
+    result = cached.get("result")
+    if not isinstance(result, dict):
+        return None
+    diagnostics = result.setdefault("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        timings = diagnostics.setdefault("sampled_task_timing_sec", {})
+        if isinstance(timings, dict):
+            timings["cache_read"] = 0.0
+            timings["total"] = 0.0
+        diagnostics["sampled_task_cache_hit"] = True
+    return result
+
+
+def _write_sampled_task_cache(
+    path: Path | None,
+    result: dict[str, Any],
+    *,
+    validated_assignments: bool,
+) -> None:
+    if path is None or not validated_assignments:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        diagnostics = result.setdefault("diagnostics", {})
+        if isinstance(diagnostics, dict):
+            diagnostics["sampled_task_cache_write"] = True
+        payload = {
+            "schema_version": SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION,
+            "validated_assignments": True,
+            "created_at": time.time(),
+            "result": result,
+        }
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 def _merge_cached_compile_context(
     context: dict[str, Any],
     cached: dict[str, Any],
@@ -2237,11 +2464,17 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         except Exception:
             pass
 
+    stable_context_path = _stable_context_cache_path(dag, params)
     cached_context = _load_cached_compile_context(context_path, dag, params)
+    cache_source = "workspace"
+    if cached_context is None and stable_context_path is not None:
+        cached_context = _load_cached_compile_context(stable_context_path, dag, params)
+        cache_source = "stable"
     record_harness_timing("load_cached_context")
     context = build_compile_context(dag, params)
     context.setdefault("harness", {})["trace_dir"] = str(output_dir / "trace_repository")
     context.setdefault("harness", {})["timing_log_enabled"] = True
+    _set_context_cache_paths(context, params, stable_context_path)
     record_harness_timing("build_compile_context")
     initial_source = _initial_compile_program_source(
         getattr(params, "openevolve_search_mode", None)
@@ -2251,8 +2484,13 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     record_harness_timing("initial_program")
     seed_trace_examples: list[dict[str, Any]] = []
     if cached_context is not None:
-        print("OpenEvolve compile harness: reusing cached seed replay/context.", flush=True)
+        print(
+            "OpenEvolve compile harness: reusing cached seed replay/context "
+            f"from {cache_source}.",
+            flush=True,
+        )
         _merge_cached_compile_context(context, cached_context, params)
+        _set_context_cache_paths(context, params, stable_context_path)
         record_harness_timing("merge_cached_context")
     else:
         print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
@@ -2329,6 +2567,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             seed_trace_examples
         )
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _store_stable_compile_context(stable_context_path, context)
     record_harness_timing("write_context_before_policy_bank")
     policy_bank = _run_compile_policy_bank_prepass(
         context_path,
@@ -4617,6 +4856,28 @@ def evaluate_compile_candidate_program(
         mark_timing("compile_hints")
         policy_effect = _policy_effect_summary(context, hints, eval_hints, eval_suite)
         mark_timing("policy_effect")
+        allow_seed_equivalent = (
+            Path(program_path).name == "initial_program.py"
+            or os.environ.get("ORBIT_OPENEVOLVE_EVALUATE_SEED_EQUIV", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if bool(policy_effect.get("seed_equivalent", False)) and not allow_seed_equivalent:
+            result = _invalid_compile_result(
+                "seed_equivalent_policy_probe_skip",
+                ["normalized_policy_matches_seed"],
+            )
+            result.setdefault("metrics", {})["seed_equivalent_policy"] = 1.0
+            result.setdefault("metrics", {})["policy_effect_score"] = 0.0
+            result.setdefault("artifacts", {})["policy_effect"] = json.dumps(
+                policy_effect,
+                sort_keys=True,
+            )
+            attach_timings(result)
+            trace_start = time.perf_counter()
+            _record_compile_trace(context, Path(program_path), hints, result, "STATIC_ONLY")
+            timings["record_trace"] = float(time.perf_counter() - trace_start)
+            attach_timings(result)
+            return result
         result = _evaluate_compile_hints(context, eval_hints, suppress_output=True)
         mark_timing("evaluate_compile_hints")
         result["static"] = static
@@ -4921,6 +5182,15 @@ def evaluate_compile_candidate_program(
                 ),
                 "sampled_task_solve_max_sec": float(
                     result.get("sampled_task_solve_max_sec", 0.0)
+                ),
+                "sampled_task_cache_hits": float(
+                    result.get("sampled_task_cache_hits", 0.0)
+                ),
+                "sampled_task_cache_misses": float(
+                    result.get("sampled_task_cache_misses", 0.0)
+                ),
+                "sampled_task_cache_writes": float(
+                    result.get("sampled_task_cache_writes", 0.0)
                 ),
                 "compile_replay_solve_partition_sec": float(
                     result.get("diagnostics", {})
@@ -5650,11 +5920,24 @@ def _sampled_budget_tasks_from_qbp_manager(
         ]
         if not sampled_budgets:
             continue
+        task_context = build_context(record["pdag"], sampled_budgets, params)
+        cache_dir = getattr(params, "openevolve_sampled_qbp_cache_dir", None)
+        if cache_dir:
+            task_context.setdefault("harness", {})["sampled_qbp_cache_dir"] = str(cache_dir)
         tasks.append(
             {
                 "index": record["index"],
                 "kind": record["kind"],
-                "context": build_context(record["pdag"], sampled_budgets, params),
+                "group_keys": [
+                    {
+                        "in_lvl": int(key[0]),
+                        "in_scl": int(key[1]),
+                        "maino_v": str(key[2]),
+                        "main_dag_size": int(key[3]),
+                    }
+                    for key in group_keys
+                ],
+                "context": task_context,
             }
         )
         remaining -= len(group_keys)
@@ -5736,6 +6019,10 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
     log_buffer = io.StringIO()
     total_start = time.perf_counter()
     timings: dict[str, float] = {}
+    cache_path = _sampled_task_cache_path(task_context, eval_hints, eval_suite)
+    cached = _read_sampled_task_cache(cache_path)
+    if cached is not None:
+        return cached
 
     def elapsed_since(start: float) -> float:
         return float(time.perf_counter() - start)
@@ -5764,13 +6051,22 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
             timings["budget_parse"] = elapsed_since(stage_start)
             if not budgets:
                 timings["total"] = elapsed_since(total_start)
-                return {
+                result = {
                     "task_context": task_context,
-                    "diagnostics": {"sampled_task_timing_sec": timings},
+                    "diagnostics": {
+                        "sampled_task_timing_sec": timings,
+                        "sampled_task_cache_hit": False,
+                    },
                     "assignments": [],
                     "costs": [],
                     "log_tail": log_buffer.getvalue()[-2000:],
                 }
+                _write_sampled_task_cache(
+                    cache_path,
+                    result,
+                    validated_assignments=True,
+                )
+                return result
             task_diag: dict[str, Any] = {}
             stage_start = time.perf_counter()
             solve_budget_batch(
@@ -5783,23 +6079,37 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
             )
             timings["solve_budget_batch"] = elapsed_since(stage_start)
         stage_start = time.perf_counter()
-        assignments = [
-            _serialize_assign(assign)
-            for assign in task_diag.get("assignments", [])
-            if isinstance(assign, Assign)
-        ]
+        assignments = []
+        validation_errors = []
+        for assign in task_diag.get("assignments", []):
+            if not isinstance(assign, Assign):
+                continue
+            try:
+                assign.check_assign()
+                assignments.append(_serialize_assign(assign))
+            except Exception as exc:
+                validation_errors.append(f"{type(exc).__name__}: {str(exc)[:160]}")
         timings["serialize_assignments"] = elapsed_since(stage_start)
         timings["total"] = elapsed_since(total_start)
         diagnostics = dict(task_diag)
         diagnostics.pop("assignments", None)
         diagnostics["sampled_task_timing_sec"] = timings
-        return {
+        diagnostics["sampled_task_cache_hit"] = False
+        if validation_errors:
+            diagnostics["sampled_task_assignment_validation_errors"] = validation_errors[:8]
+        result = {
             "task_context": task_context,
             "diagnostics": diagnostics,
             "assignments": assignments,
             "costs": [float(item) for item in task_diag.get("costs", [])],
             "log_tail": log_buffer.getvalue()[-2000:],
         }
+        _write_sampled_task_cache(
+            cache_path,
+            result,
+            validated_assignments=not validation_errors,
+        )
+        return result
     except Exception as exc:
         timings["total"] = elapsed_since(total_start)
         return {
@@ -5808,6 +6118,7 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
                 "invalid_reasons": {f"{type(exc).__name__}: {str(exc)[:240]}": 1},
                 "traceback": traceback.format_exc()[-3000:],
                 "sampled_task_timing_sec": timings,
+                "sampled_task_cache_hit": False,
             },
             "assignments": [],
             "costs": [],
@@ -5818,6 +6129,12 @@ def _run_sampled_task_payload(payload: tuple[dict[str, Any], dict[str, Any], str
 def _sampled_task_parallelism(context: dict[str, Any], task_count: int) -> int:
     if task_count <= 1:
         return 1
+    env_requested = os.environ.get("ORBIT_OPENEVOLVE_EVALUATOR_QBP_WORKERS", "").strip()
+    if env_requested:
+        try:
+            return max(1, min(task_count, int(env_requested)))
+        except ValueError:
+            pass
     params = context.get("params", {}) if isinstance(context.get("params"), dict) else {}
     threads = max(1, _safe_int(params.get("threads"), 1))
     outer_parallel = max(1, _safe_int(params.get("openevolve_parallel_evaluations"), 1))
@@ -5864,6 +6181,9 @@ def _evaluate_sampled_budget_tasks(
         "mcts_action_duplicate_skips": {},
         "boundary_group_summaries": [],
         "sampled_task_count": 0,
+        "sampled_task_cache_hits": 0,
+        "sampled_task_cache_misses": 0,
+        "sampled_task_cache_writes": 0,
         "sampled_direct_budget_eval": False,
         "sampled_qbp_group_eval": True,
     }
@@ -5910,6 +6230,12 @@ def _evaluate_sampled_budget_tasks(
                 for task in context.get("sampled_budget_tasks", [])
                 if isinstance(task, dict) and isinstance(task.get("context"), dict)
             ]
+            task_cache_dir = context.get("harness", {}).get("sampled_qbp_cache_dir")
+            if task_cache_dir:
+                for task in tasks:
+                    task["context"].setdefault("harness", {})[
+                        "sampled_qbp_cache_dir"
+                    ] = str(task_cache_dir)
             workers = _sampled_task_parallelism(context, len(tasks))
             payloads = [(task["context"], eval_hints, eval_suite) for task in tasks]
             if workers > 1:
@@ -5951,7 +6277,20 @@ def _evaluate_sampled_budget_tasks(
                             "requested_boundary_groups": int(
                                 task_diag.get("requested_boundary_groups", 0)
                             ),
+                            "cache_hit": bool(task_diag.get("sampled_task_cache_hit", False)),
                         }
+                    )
+                if bool(task_diag.get("sampled_task_cache_hit", False)):
+                    total["sampled_task_cache_hits"] = (
+                        int(total.get("sampled_task_cache_hits", 0) or 0) + 1
+                    )
+                else:
+                    total["sampled_task_cache_misses"] = (
+                        int(total.get("sampled_task_cache_misses", 0) or 0) + 1
+                    )
+                if bool(task_diag.get("sampled_task_cache_write", False)):
+                    total["sampled_task_cache_writes"] = (
+                        int(total.get("sampled_task_cache_writes", 0) or 0) + 1
                     )
                 for key in (
                     "requested_budgets",
@@ -6098,6 +6437,13 @@ def _evaluate_sampled_budget_tasks(
             "sampled_task_solve_max_sec": float(
                 task_timing_max.get("solve_budget_batch", 0.0)
             ),
+            "sampled_task_cache_hits": int(total.get("sampled_task_cache_hits", 0) or 0),
+            "sampled_task_cache_misses": int(
+                total.get("sampled_task_cache_misses", 0) or 0
+            ),
+            "sampled_task_cache_writes": int(
+                total.get("sampled_task_cache_writes", 0) or 0
+            ),
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),
             "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
@@ -6141,6 +6487,13 @@ def _evaluate_sampled_budget_tasks(
             ),
             "sampled_task_solve_max_sec": float(
                 task_timing_max.get("solve_budget_batch", 0.0)
+            ),
+            "sampled_task_cache_hits": int(total.get("sampled_task_cache_hits", 0) or 0),
+            "sampled_task_cache_misses": int(
+                total.get("sampled_task_cache_misses", 0) or 0
+            ),
+            "sampled_task_cache_writes": int(
+                total.get("sampled_task_cache_writes", 0) or 0
             ),
             "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0)),
             "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0)),

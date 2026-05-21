@@ -55,6 +55,9 @@ if __name__ == "__main__":
     parser.add_argument('--openevolve-checkpoint-interval', type=int, default=5)
     parser.add_argument('--openevolve-fail-open', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--openevolve-reuse-output', action='store_true')
+    parser.add_argument('--openevolve-context-cache-dir', type=str, default=None)
+    parser.add_argument('--openevolve-context-cache', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--openevolve-sampled-only', action='store_true')
     parser.add_argument('--noise-estimator', choices=['off', 'finalists'], default='finalists')
     parser.add_argument('--noise-estimator-binary', type=str, default=None)
     parser.add_argument('--noise-estimator-timeout-sec', type=int, default=30)
@@ -144,6 +147,11 @@ if __name__ == "__main__":
         cmds.append("--openevolve-fail-open" if args.openevolve_fail_open else "--no-openevolve-fail-open")
         if args.openevolve_reuse_output:
             cmds.append("--openevolve-reuse-output")
+        cmds.append("--openevolve-context-cache" if args.openevolve_context_cache else "--no-openevolve-context-cache")
+        if args.openevolve_context_cache_dir:
+            cmds += ["--openevolve-context-cache-dir", args.openevolve_context_cache_dir]
+        if args.openevolve_sampled_only:
+            cmds.append("--openevolve-sampled-only")
         cmds += ["--noise-estimator", args.noise_estimator]
         cmds += ["--noise-estimator-timeout-sec", str(args.noise_estimator_timeout_sec)]
         cmds += [

@@ -5359,6 +5359,92 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
     assert captured["selection_objective"] == "cost"
 
 
+def test_stable_context_cache_key_tracks_eval_suite_and_disable(
+    toy_cost_json: str, tmp_path: Path
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_context_cache_dir=str(tmp_path),
+    )
+    other = _params(
+        toy_cost_json,
+        openevolve_eval_suite="toy",
+        openevolve_context_cache_dir=str(tmp_path),
+    )
+    graph = _mul_chain_pdag(params, length=3)
+
+    assert oe_backend._compile_context_cache_key(graph, params) != (
+        oe_backend._compile_context_cache_key(graph, other)
+    )
+    path = oe_backend._stable_context_cache_path(graph, params)
+    assert path is not None
+    assert path.parent == tmp_path.resolve()
+
+    params.openevolve_context_cache = False
+    assert oe_backend._stable_context_cache_path(graph, params) is None
+
+
+def test_sampled_qbp_task_cache_requires_validated_payload(tmp_path: Path):
+    task_context = {
+        "schema_version": "test",
+        "harness": {"sampled_qbp_cache_dir": str(tmp_path)},
+        "io_budgets": [{"in_lvl": -1, "in_scl": 40}],
+    }
+    hints = {"strategy": "bootstrap_mcts", "boundary_state_cap": 4}
+    path = oe_backend._sampled_task_cache_path(task_context, hints, "toy")
+    assert path is not None
+
+    result = {
+        "task_context": task_context,
+        "diagnostics": {"sampled_task_timing_sec": {"total": 3.0}},
+        "assignments": [],
+        "costs": [],
+        "log_tail": "",
+    }
+    oe_backend._write_sampled_task_cache(path, result, validated_assignments=False)
+    assert oe_backend._read_sampled_task_cache(path) is None
+
+    oe_backend._write_sampled_task_cache(path, result, validated_assignments=True)
+    cached = oe_backend._read_sampled_task_cache(path)
+
+    assert cached is not None
+    assert cached["diagnostics"]["sampled_task_cache_hit"] is True
+    assert cached["diagnostics"]["sampled_task_timing_sec"]["total"] == 0.0
+
+
+def test_seed_equivalent_candidate_skips_expensive_sampled_replay(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"objective_cost_usec": 100.0, "valid": True}
+    context_path = tmp_path / "compile_context.json"
+    program_path = tmp_path / "candidate.py"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    program_path.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("sampled replay should be skipped for seed-equivalent policies")
+
+    monkeypatch.setattr(
+        oe_backend,
+        "_policy_effect_summary",
+        lambda *_args, **_kwargs: {"seed_equivalent": True, "effect_score": 0.0},
+    )
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fail_if_called)
+
+    result = evaluate_compile_candidate_program(context_path, program_path)
+
+    assert result["metrics"]["combined_score"] == 0.0
+    assert result["metrics"]["seed_equivalent_policy"] == 1.0
+    assert result["artifacts"]["failure_stage"] == "seed_equivalent_policy_probe_skip"
+
+
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
     toy_cost_json: str,
 ):

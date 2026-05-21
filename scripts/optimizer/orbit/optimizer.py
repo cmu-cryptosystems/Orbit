@@ -54,18 +54,40 @@ def _optimize_and_emit_mlir(og_dag, output_file: str, params: Params, le: Latenc
     for k, v in ilp_times.items():
         timestamps[k] = v
     if assign is None:
+        if (
+            params.placement_backend == "openevolve"
+            and params.openevolve_iterations > 0
+            and getattr(params, "openevolve_sampled_only", False)
+        ):
+            print("OpenEvolve sampled-only mode finished before final MLIR emission.")
+            print(f"Orbit Compilation time: {sum(timestamps.values()):.3f} sec.")
+            print("Timestamps breakdown:")
+            for k, v in timestamps.items():
+                print(f"  '{k}': {v:.3f} sec.")
+            print("=" * 40)
+            return
         raise RuntimeError("No placement solution found for the whole DAG")
 
+    print("OpenEvolve timing: final_compile_tail estimate_assignment start", flush=True)
+    start_time = time.time()
     assign_lat = estimate_assign(assign, le)
+    timestamps['Final Assignment Estimate Time'] = time.time() - start_time
     print(f"Final assignment latency: {assign_lat/1000000:.3f} sec.")
 
+    print("OpenEvolve timing: final_compile_tail decode_assign start", flush=True)
     start_time = time.time()
     fdag = decode_assign(assign, og_dag, og_to_comp)
     timestamps['DAG Decode Time'] = time.time() - start_time
 
+    print("OpenEvolve timing: final_compile_tail estimate_tdag_latency start", flush=True)
+    start_time = time.time()
     final_lat = estimate_tdag_latency(fdag, le)
+    timestamps['Final TDAG Estimate Time'] = time.time() - start_time
     print(f"Final tdag latency: {final_lat/1000000:.3f} sec. (accurate estimation)")
+    print("OpenEvolve timing: final_compile_tail estimate_tdag_breakdown start", flush=True)
+    start_time = time.time()
     final_lat_bd_num, final_lat_bd_costs = estimate_tdag_latency_breakdown(fdag, le)
+    timestamps['Final TDAG Breakdown Time'] = time.time() - start_time
     print("Final tdag latency breakdown (number of operations):")
     for op, stats in sorted(final_lat_bd_num.items()):
         total_op_num = sum(stats.values())
@@ -77,9 +99,15 @@ def _optimize_and_emit_mlir(og_dag, output_file: str, params: Params, le: Latenc
         print(f"  {op}: {total_op_cost/1000000:.3f} sec.")
     print("=" * 40)
 
+    print("OpenEvolve timing: final_compile_tail write_mlir start", flush=True)
     start_time = time.time()
     tdag_to_mlir(fdag, output_file)
     timestamps['DAG Write Time'] = time.time() - start_time
+    print(
+        "OpenEvolve timing: final_compile_tail "
+        f"write_mlir={timestamps['DAG Write Time']:.3f}s",
+        flush=True,
+    )
 
     print(f"Orbit Compilation time: {sum(timestamps.values()):.3f} sec.")
     print("Timestamps breakdown:")
@@ -267,6 +295,23 @@ def main():
         help='Reuse an existing OpenEvolve output directory and skip the LLM call',
     )
     parser.add_argument(
+        '--openevolve-context-cache-dir',
+        type=str,
+        default=None,
+        help='Stable cache directory for OpenEvolve compile contexts and sampled QBP task results',
+    )
+    parser.add_argument(
+        '--openevolve-context-cache',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Reuse stable OpenEvolve compile-context caches across timestamped runs',
+    )
+    parser.add_argument(
+        '--openevolve-sampled-only',
+        action='store_true',
+        help='Stop after sampled OpenEvolve selection; do not run final placement replay or emit MLIR',
+    )
+    parser.add_argument(
         '--noise-estimator',
         choices=['off', 'finalists'],
         default='finalists',
@@ -409,6 +454,9 @@ def main():
                     openevolve_checkpoint_interval=args.openevolve_checkpoint_interval,
                     openevolve_fail_open=args.openevolve_fail_open,
                     openevolve_reuse_output=args.openevolve_reuse_output,
+                    openevolve_context_cache_dir=args.openevolve_context_cache_dir,
+                    openevolve_context_cache=args.openevolve_context_cache,
+                    openevolve_sampled_only=args.openevolve_sampled_only,
                     noise_estimator=args.noise_estimator,
                     noise_estimator_binary=args.noise_estimator_binary,
                     noise_estimator_timeout_sec=args.noise_estimator_timeout_sec,

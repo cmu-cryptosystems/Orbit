@@ -35,17 +35,39 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
     ):
         params.openevolve_compile_hints = run_compile_openevolve(dag, le, params)
     ilp_times['OpenEvolve Compile Harness Time'] = time.time() - start_time
+    if (
+        params.placement_backend == "openevolve"
+        and params.openevolve_iterations > 0
+        and getattr(params, "openevolve_sampled_only", False)
+    ):
+        print(
+            "OpenEvolve sampled-only mode: skipping final placement replay and MLIR emission.",
+            flush=True,
+        )
+        return None, ilp_times
 
     start_time = time.time()
+    print("OpenEvolve timing: final_compile_tail qbp_manager_init start", flush=True)
     qbp_manager = QBPManager(params, le)
     if params.reqbp:
         qbp_manager.load_qbps(qbp_name)
     ilp_times['QBP Manager Init Time'] = time.time() - start_time
+    print(
+        "OpenEvolve timing: final_compile_tail "
+        f"qbp_manager_init={ilp_times['QBP Manager Init Time']:.3f}s",
+        flush=True,
+    )
     
     start_time = time.time()
+    print("OpenEvolve timing: final_compile_tail solve_partition start", flush=True)
     partition_result = solve_partition(dag, qbp_manager, {-1: {params.Sw: 0}}, le, params)
     ilp_times['Placement-QBP Time'] = time.time() - start_time
     ilp_times['ILP-QBP Time'] = ilp_times['Placement-QBP Time']
+    print(
+        "OpenEvolve timing: final_compile_tail "
+        f"solve_partition={ilp_times['Placement-QBP Time']:.3f}s",
+        flush=True,
+    )
     if partition_result is None:
         print("Error: No solution found for whole DAG", file=sys.stderr)
         return None, ilp_times
@@ -61,6 +83,7 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
         ilp_times['QBP Save Time'] = time.time() - start_time
     
     start_time = time.time()
+    print("OpenEvolve timing: final_compile_tail select_final_assignment start", flush=True)
     final_io_choice = None
     final_cost = None
     for (in_lvl, in_scale), out_to_cost in io_to_cost.items():
@@ -75,6 +98,11 @@ def orbit_core(dag: Tdag, le: LatencyEstimator, params: Params):
     
     assign = io_to_assign[final_io_choice[:2]][final_io_choice[2:]]
     ilp_times["Final Assignment Time"] = time.time() - start_time
+    print(
+        "OpenEvolve timing: final_compile_tail "
+        f"select_final_assignment={ilp_times['Final Assignment Time']:.3f}s",
+        flush=True,
+    )
 
     print(f"Final Choice: input (l,s)=({final_io_choice[0]},{final_io_choice[1]}), output (l,s)=({final_io_choice[2]},{final_io_choice[3]}), cost={final_cost}")
     print(f"Final cost (aggregated partition cost): {final_cost/1000000:.3f} sec.")

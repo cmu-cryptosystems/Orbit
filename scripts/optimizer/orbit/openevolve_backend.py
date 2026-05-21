@@ -489,13 +489,17 @@ def place(context):
     when intentionally replacing the full table. Orbit validates and repairs
     every assignment.
 
-    Follow context["evolution_guidance"] and context["harness"]["candidate_examples"]:
-    use evaluator artifacts as execution trace feedback. Keep path-diverse
-    candidates for exploration, but the winning program must reduce
-    objective_cost_usec versus the seed. If candidate_qbp_coverage is low,
-    change boundary-state coverage; if candidate_invalid_reasons point to
-    forced anchors, soften or retarget anchors. Bootstrap counts are
-    diagnostics only; do not optimize toward a fixed count.
+    Follow context["evolution_guidance"], context["harness"]["candidate_examples"],
+    and context["harness"]["top_costly_boundary_groups"]: use evaluator artifacts
+    as execution trace feedback. Keep path-diverse candidates for exploration,
+    but the winning program must reduce objective_cost_usec versus the seed. If
+    candidate_qbp_coverage is low, change boundary-state coverage; if candidate
+    invalid reasons point to forced anchors, soften or retarget anchors. For
+    expensive QBP groups, prefer boundary_group_policies with selectors copied
+    from top_costly_boundary_groups and bounded policy overrides for
+    boundary_state_cap, boundary_scale_policy, scale_lattice, max_scale_candidates,
+    bootstrap_penalty, and MCTS action presets. Bootstrap counts are diagnostics
+    only; do not optimize toward a fixed count.
     """
     target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
     mcts = PlacementMCTS(context)
@@ -670,6 +674,7 @@ def place(context):
         "waterline_budget_repair",
     ]
     policy["mcts_exploration_weight"] = 1.15
+    policy["boundary_group_policies"] = []
     policy["include_seed_repair_actions"] = False
     policy["mcts_prior_order"] = True
     policy["mcts_action_presets"] = mcts.action_presets(
@@ -859,10 +864,12 @@ def place(context):
     built from Orbit's helper API. Orbit validates every assignment and owns
     final repair into Assign objects.
 
-    Follow context["evolution_guidance"] and context["harness"]["candidate_examples"]:
-    use previous evaluator artifacts as execution-trace feedback, keep CKKS
-    legality intact, and mutate only the high-impact policy surface rather
-    than Orbit source code.
+    Follow context["evolution_guidance"], context["harness"]["candidate_examples"],
+    and context["harness"]["top_costly_boundary_groups"]: use previous evaluator
+    artifacts as execution-trace feedback, keep CKKS legality intact, and
+    mutate only the high-impact policy surface rather than Orbit source code.
+    Use boundary_group_policies when one expensive QBP group needs a different
+    boundary lattice, scale policy, or action preset than the global seed.
 
     During sampled evolution, Orbit ranks policies lexicographically: first
     solve every reachable QBP boundary group directly, then minimize total
@@ -1703,6 +1710,12 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 harness["sampled_seed_baseline"] = dict(active_seed)
             harness["active_seed_baseline"] = dict(active_seed)
             harness["seed_baseline"] = dict(active_seed)
+            harness["top_costly_boundary_groups"] = list(
+                selected_record.get("top_costly_boundary_groups", []) or []
+            )[:8]
+            harness["unsolved_boundary_groups"] = dict(
+                selected_record.get("unsolved_boundary_groups", {}) or {}
+            )
             context["reference"] = dict(active_seed)
         harness["initial_policy_source"] = "policy_bank"
     context.setdefault("harness", {})["initial_policy_hints"] = _jsonable_policy_hints(
@@ -2482,6 +2495,7 @@ def _policy_bank_record(
     metrics = evaluation.get("metrics", {}) if isinstance(evaluation, dict) else {}
     artifacts = evaluation.get("artifacts", {}) if isinstance(evaluation, dict) else {}
     gate = _dict_from_jsonish(artifacts.get("correctness_gate", {}))
+    trace = _dict_from_jsonish(artifacts.get("execution_trace", {}))
     objective = _finite_float(metrics.get("objective_cost_usec"), float("inf"))
     reference = _finite_float(metrics.get("reference_objective_cost_usec"), float("inf"))
     improved = bool(
@@ -2526,6 +2540,11 @@ def _policy_bank_record(
         "sampled_frontier_total_rescale_count": _finite_float(
             metrics.get("sampled_frontier_total_rescale_count"), 0.0
         ),
+        "scale_floor_bits": _finite_float(metrics.get("scale_floor_bits"), 0.0),
+        "top_costly_boundary_groups": list(
+            trace.get("top_costly_boundary_groups", []) or []
+        )[:8],
+        "unsolved_boundary_groups": dict(trace.get("unsolved_boundary_groups", {}) or {}),
         "effective_qbp_digest": str(artifacts.get("effective_qbp_digest", ""))[:24],
         "selected_path_digest": str(
             artifacts.get("selected_path_digest")
@@ -2575,6 +2594,11 @@ def _policy_bank_active_seed_baseline(record: dict[str, Any]) -> dict[str, Any]:
         "fallback_selected_budgets": _finite_float(
             record.get("fallback_selected_budgets"), 0.0
         ),
+        "scale_floor_bits": _finite_float(record.get("scale_floor_bits"), 0.0),
+        "top_costly_boundary_groups": list(
+            record.get("top_costly_boundary_groups", []) or []
+        )[:8],
+        "unsolved_boundary_groups": dict(record.get("unsolved_boundary_groups", {}) or {}),
     }
 
 
@@ -2601,6 +2625,9 @@ def _policy_bank_candidate_examples(
                 "selected_path_digest": str(seed.get("selected_path_digest", ""))[:24],
                 "bootstrap_count": _finite_float(seed.get("bootstrap_count"), 0.0),
                 "rescale_count": _finite_float(seed.get("rescale_count"), 0.0),
+                "top_costly_boundary_groups": list(
+                    seed.get("top_costly_boundary_groups", []) or []
+                )[:4],
             }
         )
     ranked = sorted(
@@ -2627,9 +2654,13 @@ def _policy_bank_candidate_examples(
                 "selected_path_digest": str(item.get("path_digest", "")),
                 "bootstrap_count": _finite_float(item.get("sampled_selected_path_bootstraps"), 0.0),
                 "rescale_count": _finite_float(item.get("rescale_count"), 0.0),
+                "scale_floor_bits": _finite_float(item.get("scale_floor_bits"), 0.0),
                 "fallback_selected_budgets": _finite_float(
                     item.get("fallback_selected_budgets"), 0.0
                 ),
+                "top_costly_boundary_groups": list(
+                    item.get("top_costly_boundary_groups", []) or []
+                )[:4],
                 "candidate_mlir_digest": item.get("candidate_mlir_digest", ""),
                 "candidate_mlir_path": item.get("candidate_mlir_path", ""),
                 "why_it_lost": _policy_bank_loss_reason(item),
@@ -4316,7 +4347,10 @@ def _latency_only_combined_score(
         return 0.0
     ratio = reference / cost
     if ratio <= 1.0:
-        return max(1e-6, min(0.999999, ratio))
+        # Valid but slower path-changing candidates are useful exploration
+        # examples, but they must not look almost as good as an actual latency
+        # improvement to OpenEvolve's maximizer.
+        return max(1e-6, min(0.099999, 0.1 * ratio))
     # OpenEvolve maximizes a single score, and raw latency ratios for sampled
     # QBP improvements are often 1.00000x. Keep the ordering purely latency
     # based, but magnify the positive delta so small real improvements are not
@@ -5091,6 +5125,7 @@ def _policy_effect_summary(
             "preferred_node_scales_count",
             "preferred_edge_scales_count",
             "unit_policy_count",
+            "boundary_group_policy_count",
             "portfolio_count",
         )
         if seed_payload.get(key) != candidate_payload.get(key)
@@ -5143,6 +5178,13 @@ def _policy_effect_payload(hints: dict[str, Any]) -> dict[str, Any]:
     if hints.get("unit_policies"):
         payload["unit_policy_count"] = len(hints.get("unit_policies") or [])
         payload["unit_policy_digest"] = _hint_digest(hints.get("unit_policies"))[:16]
+    if hints.get("boundary_group_policies"):
+        payload["boundary_group_policy_count"] = len(
+            hints.get("boundary_group_policies") or []
+        )
+        payload["boundary_group_policy_digest"] = _hint_digest(
+            hints.get("boundary_group_policies")
+        )[:16]
     portfolio = hints.get("portfolio")
     if isinstance(portfolio, list) and portfolio:
         payload["portfolio_count"] = len(portfolio)
@@ -8124,16 +8166,78 @@ def _solve_budget_batch_boundary_mcts(
 def _budget_boundary_groups(io_budgets_list: list[dict]) -> dict[tuple, list[dict]]:
     groups: dict[tuple, list[dict]] = {}
     for budget in io_budgets_list:
-        key = (
-            int(budget.get("in_lvl", -1)),
-            int(budget.get("in_scl", -1)),
-            str(budget.get("maino_v", "")),
-            int(budget.get("main_dag_size", 0) or 0),
-        )
+        key = _budget_boundary_group_key(budget)
         groups.setdefault(key, []).append(budget)
     for budgets in groups.values():
         budgets.sort(key=lambda item: int(item.get("out_lvl", -1)))
     return groups
+
+
+def _budget_boundary_group_key(budget: dict[str, Any]) -> tuple[int, int, str, int]:
+    return (
+        int(budget.get("in_lvl", -1)),
+        int(budget.get("in_scl", -1)),
+        str(budget.get("maino_v", "")),
+        int(budget.get("main_dag_size", 0) or 0),
+    )
+
+
+def _apply_boundary_group_policy_overlays(
+    hints: dict[str, Any],
+    group_key: tuple[int, int, str, int],
+) -> dict[str, Any]:
+    policies = hints.get("boundary_group_policies")
+    if not isinstance(policies, list) or not policies:
+        return hints
+    merged = dict(hints)
+    for item in policies:
+        if not isinstance(item, dict):
+            continue
+        selector = item.get("selector", {})
+        if not _boundary_group_selector_matches_key(selector, group_key):
+            continue
+        patch = item.get("policy", {})
+        if not isinstance(patch, dict):
+            continue
+        presets = patch.get("mcts_action_presets")
+        if isinstance(presets, (dict, list)):
+            merged["mcts_action_presets"] = _merge_mcts_action_presets(
+                merged.get("mcts_action_presets"),
+                presets,
+                replace=_bool_hint(patch.get("replace_mcts_action_presets"), False),
+            )
+        for key, value in patch.items():
+            if key in {
+                "selector",
+                "policy",
+                "mcts_action_presets",
+                "replace_mcts_action_presets",
+                "boundary_group_policies",
+            }:
+                continue
+            if key in _PATCHABLE_POLICY_KEYS or key in {
+                "direct_budget_policy",
+                "forbid_bootstrap",
+                "budget_aggressive",
+                "boundary_scale_policy",
+                "boundary_state_cap",
+                "bootstrap_anchor_count",
+                "bootstrap_anchor_level",
+                "bootstrap_anchor_selector",
+                "bootstrap_anchor_include_patterns",
+                "bootstrap_anchor_exclude_patterns",
+                "force_bootstrap_anchors",
+                "selection_objective",
+                "prefer_component_budget_fit",
+                "noise_slack_model",
+                "mcts_action_cap",
+                "mcts_rollout_budget",
+                "mcts_prior_order",
+                "mcts_action_allowlist",
+                "mcts_action_blocklist",
+            }:
+                merged[key] = value
+    return merged
 
 
 def _seed_fallback_attempts(params: Params) -> list[tuple[str, dict[str, Any]]]:
@@ -8181,6 +8285,8 @@ def _boundary_mcts_group_attempts(
     hints: dict[str, Any],
     diagnostics: dict[str, Any] | None,
 ) -> dict[int, list[_BudgetAttempt]]:
+    group_key = _budget_boundary_group_key(budgets[0]) if budgets else (-1, -1, "", 0)
+    hints = _apply_boundary_group_policy_overlays(hints, group_key)
     policy = _policy_options(hints, params)
     actions = _mcts_actions_from_hints(hints, params)
     rollout_budget = max(len(actions), int(policy["mcts_rollout_budget"]))
@@ -11184,6 +11290,10 @@ def _alphaevolve_guidance(params: Params, unit_bootstrap_budget: dict[str, Any])
             "mcts_actions[*].policy.bootstrap_penalty",
             "mcts_actions[*].policy.selection_bootstrap_penalty",
             "mcts_actions[*].policy.noise_slack_model",
+            "boundary_group_policies[*].selector",
+            "boundary_group_policies[*].policy.boundary_state_cap",
+            "boundary_group_policies[*].policy.boundary_scale_policy",
+            "boundary_group_policies[*].policy.max_scale_candidates",
             "mcts_rollout_budget",
             "mcts_action_cap",
         ],
@@ -11271,6 +11381,7 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
         "component_bootstrap_budgets",
         "unit_bootstrap_budgets",
         "mcts_action_presets",
+        "boundary_group_policies",
     ]
     summary = {key: hints.get(key) for key in keys if key in hints}
     for key in ("preferred_node_levels", "preferred_node_scales", "preferred_edge_scales"):
@@ -11279,6 +11390,10 @@ def _compact_policy_summary(hints: dict[str, Any]) -> str:
             summary[f"{key}_count"] = len(value)
     if hints.get("unit_policies"):
         summary["unit_policy_count"] = len(hints.get("unit_policies") or [])
+    if hints.get("boundary_group_policies"):
+        summary["boundary_group_policy_count"] = len(
+            hints.get("boundary_group_policies") or []
+        )
     if hints.get("__repair_reasons"):
         summary["repair_count"] = _repair_count(hints)
     return json.dumps(summary, sort_keys=True)
@@ -12514,6 +12629,39 @@ class PlacementMCTS:
     def target_units(self, limit: int | None = None) -> list[dict[str, Any]]:
         return target_units(self.context, limit)
 
+    def top_costly_boundary_groups(self, limit: int | None = None) -> list[dict[str, Any]]:
+        groups = (
+            self.context.get("harness", {}).get("top_costly_boundary_groups", [])
+            if isinstance(self.context.get("harness", {}), dict)
+            else []
+        )
+        result = [dict(item) for item in groups if isinstance(item, dict)]
+        return result[:limit] if limit is not None else result
+
+    def boundary_group_policy(
+        self,
+        group: dict[str, Any],
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        selector = group.get("group_key", group) if isinstance(group, dict) else {}
+        policy = self.boundary_policy(**{
+            key: value
+            for key, value in overrides.items()
+            if key in {
+                "boundary_state_cap",
+                "max_scale_candidates",
+                "boundary_scale_policy",
+                "bootstrap_penalty",
+                "selection_bootstrap_penalty",
+                "beam_width",
+                "state_cap_per_node",
+            }
+        })
+        for key, value in overrides.items():
+            if key not in policy:
+                policy[key] = value
+        return {"selector": selector, "policy": policy}
+
     def constraint_violations(self) -> list[dict[str, Any]]:
         return constraint_violations(self.context)
 
@@ -13344,6 +13492,7 @@ def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None
         "portfolio",
         "patches",
         "unit_policies",
+        "boundary_group_policies",
         "mcts_actions",
         "mcts_action_presets",
         "mcts_action_allowlist",
@@ -13405,6 +13554,9 @@ def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None
             if isinstance(item, dict)
         ]
     result["unit_policies"] = _normalize_unit_policies(value.get("unit_policies"), context)
+    result["boundary_group_policies"] = _normalize_boundary_group_policies(
+        value.get("boundary_group_policies"), context
+    )
     result = _apply_patch_vocabulary(result, value.get("patches", []), context)
     result["api_version"] = value.get("api_version", "placement-builder-v1")
     return _sanitize_candidate_hints(result, context)
@@ -13427,6 +13579,56 @@ def _normalize_unit_policies(value: Any, context: dict[str, Any] | None) -> list
             policy = {}
         normalized.append({"selector": dict(selector), "policy": _with_default_policy(policy)})
     return normalized
+
+
+def _normalize_boundary_group_policies(
+    value: Any, context: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Normalize sparse QBP boundary-group policy overlays.
+
+    Candidate programs get group selectors from execution traces. Selectors are
+    intentionally data-shaped dictionaries so this remains graph-general and
+    does not depend on BERT layer labels.
+    """
+
+    if isinstance(value, dict):
+        raw_items = []
+        for key, policy in value.items():
+            selector: dict[str, Any]
+            if isinstance(key, str) and key.strip().startswith("{"):
+                try:
+                    selector = json.loads(key)
+                except Exception:
+                    selector = {"key": key}
+            elif isinstance(key, str):
+                selector = {"key": key}
+            else:
+                selector = {}
+            raw_items.append({"selector": selector, "policy": policy})
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        selector = item.get("selector", item.get("group_key", {}))
+        if isinstance(selector, str):
+            selector = {"key": selector}
+        if not isinstance(selector, dict):
+            continue
+        policy = item.get("policy", {})
+        if not isinstance(policy, dict):
+            policy = {}
+        if not _boundary_group_selector_is_well_formed(selector):
+            continue
+        if context is not None and not _selector_matches_any_boundary_group(selector, context):
+            # Keep group overlays only when they can affect the sampled context.
+            continue
+        normalized.append({"selector": dict(selector), "policy": _with_default_policy(policy)})
+    return normalized[:32]
 
 
 def _sanitize_candidate_hints(
@@ -13459,6 +13661,19 @@ def _sanitize_candidate_hints(
         _sanitize_policy_values(policy, context, repairs, f"unit_policies[{idx}]")
         sanitized_units.append({"selector": selector, "policy": policy})
     result["unit_policies"] = sanitized_units
+    sanitized_boundary_groups = []
+    for idx, item in enumerate(result.get("boundary_group_policies", []) or []):
+        if not isinstance(item, dict):
+            repairs.append(f"boundary_group_policies[{idx}] dropped non-dict item")
+            continue
+        selector = item.get("selector", {})
+        if not _selector_matches_any_boundary_group(selector, context):
+            repairs.append(f"boundary_group_policies[{idx}] dropped unmatched selector")
+            continue
+        policy = _with_default_policy(item.get("policy", {}))
+        _sanitize_policy_values(policy, context, repairs, f"boundary_group_policies[{idx}]")
+        sanitized_boundary_groups.append({"selector": selector, "policy": policy})
+    result["boundary_group_policies"] = sanitized_boundary_groups
     sanitized_portfolio = []
     for idx, item in enumerate(result.get("portfolio", []) or []):
         if not isinstance(item, dict):
@@ -13676,6 +13891,62 @@ def _selector_matches_any_unit(selector: Any, context: dict[str, Any]) -> bool:
     return any(_selector_matches_unit(selector, unit) for unit in units if isinstance(unit, dict))
 
 
+def _boundary_group_selector_is_well_formed(selector: Any) -> bool:
+    if not isinstance(selector, dict):
+        return False
+    if "group_key" in selector and isinstance(selector.get("group_key"), dict):
+        selector = selector["group_key"]
+    return any(
+        key in selector
+        for key in (
+            "in_lvl",
+            "in_scl",
+            "maino_v",
+            "main_dag_size",
+            "key",
+        )
+    )
+
+
+def _selector_matches_any_boundary_group(selector: Any, context: dict[str, Any]) -> bool:
+    if not _boundary_group_selector_is_well_formed(selector):
+        return False
+    budgets = context.get("io_budgets", [])
+    if not isinstance(budgets, list) or not budgets:
+        return True
+    groups = _budget_boundary_groups(
+        [_io_budget_from_json(item) for item in budgets if isinstance(item, dict)]
+    )
+    return any(_boundary_group_selector_matches_key(selector, key) for key in groups)
+
+
+def _boundary_group_selector_matches_key(selector: Any, group_key: tuple) -> bool:
+    if not isinstance(selector, dict):
+        return False
+    if "group_key" in selector and isinstance(selector.get("group_key"), dict):
+        selector = selector["group_key"]
+    if "key" in selector:
+        return str(selector.get("key")) == _boundary_group_key_string(group_key)
+    fields = {
+        "in_lvl": int(group_key[0]),
+        "in_scl": int(group_key[1]),
+        "maino_v": str(group_key[2]),
+        "main_dag_size": int(group_key[3]),
+    }
+    for key, expected in fields.items():
+        if key in selector and selector.get(key) is not None:
+            if str(selector.get(key)) != str(expected):
+                return False
+    return True
+
+
+def _boundary_group_key_string(group_key: tuple) -> str:
+    return (
+        f"in_lvl={int(group_key[0])};in_scl={int(group_key[1])};"
+        f"maino_v={str(group_key[2])};main_dag_size={int(group_key[3])}"
+    )
+
+
 def _selector_matches_unit(selector: dict[str, Any], unit: dict[str, Any]) -> bool:
     unit_selector = unit.get("selector", {})
     unit_id = str(unit.get("id", ""))
@@ -13798,6 +14069,27 @@ def _apply_patch_vocabulary(
                 str(patch.get("operation", "prefer_high_level")),
                 context,
             )
+        elif op == "target_boundary_group":
+            selector = patch.get("selector") or patch.get("group_key") or {}
+            if isinstance(selector, dict):
+                policy = {
+                    key: value
+                    for key, value in patch.items()
+                    if key in _PATCHABLE_POLICY_KEYS
+                    or key
+                    in {
+                        "boundary_scale_policy",
+                        "boundary_state_cap",
+                        "scale_lattice",
+                        "bootstrap_penalty",
+                        "max_scale_candidates",
+                        "beam_width",
+                        "state_cap_per_node",
+                    }
+                }
+                result.setdefault("boundary_group_policies", []).append(
+                    {"selector": selector, "policy": policy}
+                )
         elif op == "target_nonlinear":
             _apply_selector_patch(
                 result,
@@ -14072,9 +14364,26 @@ def _boundary_group_top_cost_summary(
     )
     result = []
     for item in ranked[: max(0, int(limit))]:
+        group_key = item.get("group_key", {})
         result.append(
             {
-                "group_key": item.get("group_key", {}),
+                "group_key": group_key,
+                "key": _boundary_group_key_string(
+                    (
+                        _safe_int(group_key.get("in_lvl"), -1)
+                        if isinstance(group_key, dict)
+                        else -1,
+                        _safe_int(group_key.get("in_scl"), -1)
+                        if isinstance(group_key, dict)
+                        else -1,
+                        str(group_key.get("maino_v", ""))
+                        if isinstance(group_key, dict)
+                        else "",
+                        _safe_int(group_key.get("main_dag_size"), 0)
+                        if isinstance(group_key, dict)
+                        else 0,
+                    )
+                ),
                 "requested_output_levels": item.get("requested_output_levels", []),
                 "min_cost_usec": _finite_float(item.get("min_cost_usec"), 0.0),
                 "max_cost_usec": _finite_float(item.get("max_cost_usec"), 0.0),

@@ -2745,6 +2745,77 @@ def test_policy_bank_active_seed_becomes_latency_reference():
     assert effective["seed_equivalent_path"] is True
 
 
+def test_boundary_group_policy_overlay_targets_sampled_group():
+    context = {
+        "io_budgets": [
+            {
+                "in_lvl": 14,
+                "in_scl": 40,
+                "out_lvl": 12,
+                "out_scl": 40,
+                "main_dag_size": 0,
+            }
+        ]
+    }
+    group_key = (14, 40, "", 0)
+    raw = [
+        {
+            "selector": {"in_lvl": 14, "in_scl": 40, "main_dag_size": 0},
+            "policy": {
+                "boundary_scale_policy": "waterline",
+                "boundary_state_cap": 9,
+                "bootstrap_penalty": 45_000_000.0,
+            },
+        }
+    ]
+
+    normalized = oe_backend._normalize_boundary_group_policies(raw, context)
+    merged = oe_backend._apply_boundary_group_policy_overlays(
+        {"boundary_scale_policy": "frontier", "boundary_group_policies": normalized},
+        group_key,
+    )
+
+    assert len(normalized) == 1
+    assert merged["boundary_scale_policy"] == "waterline"
+    assert merged["boundary_state_cap"] == 9
+    assert merged["bootstrap_penalty"] == 45_000_000.0
+
+
+def test_policy_bank_record_carries_boundary_trace_examples():
+    evaluation = {
+        "metrics": {
+            "latency_only_correct": 1.0,
+            "objective_cost_usec": 90.0,
+            "reference_objective_cost_usec": 100.0,
+            "scale_floor_bits": 36.0,
+        },
+        "artifacts": {
+            "correctness_gate": {"reasons": []},
+            "execution_trace": json.dumps(
+                {
+                    "top_costly_boundary_groups": [
+                        {
+                            "group_key": {"in_lvl": 14, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                            "min_cost_usec": 12.0,
+                        }
+                    ],
+                    "unsolved_boundary_groups": {"reasons": {}},
+                }
+            ),
+        },
+    }
+
+    record = oe_backend._policy_bank_record("candidate", {"strategy": "bootstrap_mcts"}, evaluation)
+    examples = oe_backend._policy_bank_candidate_examples(
+        {"reference": {"objective_cost_usec": 100.0}},
+        [record],
+    )
+
+    assert record["scale_floor_bits"] == 36.0
+    assert record["top_costly_boundary_groups"][0]["group_key"]["in_lvl"] == 14
+    assert examples[1]["top_costly_boundary_groups"][0]["min_cost_usec"] == 12.0
+
+
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):
     params = _params(
         toy_cost_json,
@@ -3487,7 +3558,7 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
     improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
     much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
-    assert 0.0 < slower_score < 1.0
+    assert 0.0 < slower_score < 0.1
     assert improved_score > 1.0
     assert improved_score > slower_score
     assert much_better_score > improved_score

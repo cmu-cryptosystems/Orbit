@@ -10,6 +10,7 @@ import os
 import hashlib
 import queue as queue_module
 import shutil
+import signal
 import tempfile
 import time
 import traceback
@@ -2111,6 +2112,11 @@ def _policy_bank_full_validation_worker(
     replay_hints: dict[str, Any],
     sampled_reject_reason: str,
 ) -> None:
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
     try:
         record = _policy_bank_full_validation_record(
             idx,
@@ -2161,10 +2167,22 @@ def _run_policy_bank_full_validation_variant(
     proc.start()
     proc.join(timeout_sec)
     if proc.is_alive():
-        proc.terminate()
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
+        else:
+            proc.terminate()
         proc.join(5)
         if proc.is_alive() and hasattr(proc, "kill"):
-            proc.kill()
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
             proc.join(5)
         return {
             "index": idx,

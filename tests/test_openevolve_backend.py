@@ -1310,10 +1310,10 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 24
-    assert captured["mcts_action_cap"] <= 12
-    assert captured["mcts_max_repair_bootstraps"] <= 128
-    assert captured["boundary_state_cap"] == 12
+    assert captured["mcts_rollout_budget"] <= 8
+    assert captured["mcts_action_cap"] <= 4
+    assert captured["mcts_max_repair_bootstraps"] <= 32
+    assert captured["boundary_state_cap"] == 8
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(

@@ -3699,6 +3699,71 @@ def test_sampled_policy_clamps_nested_qbp_lattice_controls(toy_cost_json: str):
     assert oe_backend._promotion_complexity_reasons(sampled) == []
 
 
+def test_promotion_probe_hints_are_lightweight_and_targeted(toy_cost_json: str):
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "mcts_action_presets": {
+            "budget_fulfillment_beam": {
+                "policy": {
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "beam_width": 8,
+                    "state_cap_per_node": 32,
+                }
+            },
+            "dense_boundary_cost_beam": {
+                "policy": {
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "beam_width": 8,
+                    "state_cap_per_node": 32,
+                }
+            },
+        },
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "policy": {
+                    "boundary_state_cap": 8,
+                    "max_scale_candidates": 48,
+                    "beam_width": 8,
+                    "state_cap_per_node": 32,
+                },
+            },
+            {
+                "selector": {"in_lvl": 8, "in_scl": 51, "maino_v": "", "main_dag_size": 0},
+                "policy": {"boundary_state_cap": 8, "max_scale_candidates": 48},
+            },
+        ],
+        "unit_policies": [
+            {"selector": {"layer": "0"}, "policy": {"boundary_state_cap": 8}},
+        ],
+    }
+    tasks = [
+        {
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    assert probe["mcts_action_cap"] == 2
+    assert probe["mcts_rollout_budget"] == 3
+    assert set(probe["mcts_action_presets"]) == {"budget_fulfillment_beam"}
+    preset = probe["mcts_action_presets"]["budget_fulfillment_beam"]["policy"]
+    assert preset["boundary_state_cap"] <= 4
+    assert preset["max_scale_candidates"] <= 16
+    assert preset["beam_width"] <= 4
+    assert preset["state_cap_per_node"] <= 8
+    assert len(probe["boundary_group_policies"]) == 1
+    assert probe["boundary_group_policies"][0]["selector"]["in_lvl"] == -1
+    assert probe["boundary_group_policies"][0]["policy"]["max_scale_candidates"] <= 16
+    assert probe["unit_policies"] == []
+
+
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_code = "def place(context):\n    return {'tag': 'result_best'}\n"

@@ -10272,6 +10272,147 @@ def _promotion_complexity_reasons(hints: dict[str, Any]) -> list[str]:
     return reasons[:8]
 
 
+def _promotion_probe_limits() -> dict[str, int]:
+    return {
+        "max_scale_candidates": 16,
+        "state_cap_per_node": 8,
+        "beam_width": 4,
+        "boundary_state_cap": 4,
+        "mcts_rollout_budget": 3,
+        "mcts_action_cap": 2,
+        "mcts_max_repair_bootstraps": 8,
+    }
+
+
+def _clamp_promotion_probe_patch(policy: dict[str, Any]) -> dict[str, Any]:
+    clamped = dict(policy)
+    defaults = {
+        "max_scale_candidates": 16,
+        "state_cap_per_node": 8,
+        "beam_width": 4,
+        "boundary_state_cap": 4,
+        "mcts_rollout_budget": 3,
+        "mcts_action_cap": 2,
+        "mcts_max_repair_bootstraps": 8,
+    }
+    for key, limit in _promotion_probe_limits().items():
+        if key in clamped:
+            clamped[key] = min(limit, _int_hint(clamped.get(key), defaults[key]))
+    return clamped
+
+
+def _clamp_promotion_probe_items(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    result: list[Any] = []
+    for item in value:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+        updated = dict(item)
+        policy = updated.get("policy")
+        if isinstance(policy, dict):
+            updated["policy"] = _clamp_promotion_probe_patch(policy)
+        else:
+            updated = _clamp_promotion_probe_patch(updated)
+        result.append(updated)
+    return result
+
+
+def _clamp_promotion_probe_presets(value: Any) -> Any:
+    allowed = {"budget_fulfillment_beam", "wide_boundary_cost_beam"}
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for name, preset in value.items():
+            if str(name) not in allowed:
+                continue
+            if not isinstance(preset, dict):
+                result[str(name)] = preset
+                continue
+            updated = dict(preset)
+            policy = updated.get("policy")
+            if isinstance(policy, dict):
+                updated["policy"] = _clamp_promotion_probe_patch(policy)
+            else:
+                updated = _clamp_promotion_probe_patch(updated)
+            result[str(name)] = updated
+        return result
+    if isinstance(value, list):
+        return [
+            item
+            for item in _clamp_promotion_probe_items(value)
+            if isinstance(item, dict) and str(item.get("name", "")) in allowed
+        ]
+    return value
+
+
+def _boundary_group_selector_matches_sampled_tasks(
+    selector: Any,
+    tasks: list[dict[str, Any]],
+) -> bool:
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        for group_key in task.get("group_keys", []) or []:
+            if isinstance(group_key, dict):
+                key_tuple = (
+                    int(group_key.get("in_lvl", -1)),
+                    int(group_key.get("in_scl", -1)),
+                    str(group_key.get("maino_v", "")),
+                    int(group_key.get("main_dag_size", 0) or 0),
+                )
+                if _boundary_group_selector_matches_key(selector, key_tuple):
+                    return True
+        task_context = task.get("context", {})
+        budgets = task_context.get("io_budgets", []) if isinstance(task_context, dict) else []
+        if isinstance(budgets, list):
+            groups = _budget_boundary_groups(
+                [item for item in budgets if isinstance(item, dict)]
+            )
+            if any(_boundary_group_selector_matches_key(selector, key) for key in groups):
+                return True
+    return False
+
+
+def _promotion_probe_hints(
+    eval_hints: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    probe = deepcopy(eval_hints)
+    probe.pop("portfolio", None)
+    probe["allow_seed_fallback"] = True
+    probe["budget_aggressive"] = False
+    probe["mcts_action_allowlist"] = ["budget_fulfillment_beam", "wide_boundary_cost_beam"]
+    probe["mcts_action_cap"] = 2
+    probe["mcts_rollout_budget"] = 3
+    probe["mcts_max_repair_bootstraps"] = min(
+        8,
+        _int_hint(probe.get("mcts_max_repair_bootstraps"), 8),
+    )
+    probe = _clamp_promotion_probe_patch(probe)
+    probe["mcts_action_presets"] = _clamp_promotion_probe_presets(
+        probe.get("mcts_action_presets")
+    )
+    probe["mcts_actions"] = _clamp_promotion_probe_items(probe.get("mcts_actions"))
+    policies = []
+    for item in probe.get("boundary_group_policies", []) or []:
+        if not isinstance(item, dict):
+            continue
+        selector = item.get("selector", {})
+        if not _boundary_group_selector_matches_sampled_tasks(selector, selected_probe_tasks):
+            continue
+        updated = dict(item)
+        policy = updated.get("policy")
+        if isinstance(policy, dict):
+            updated["policy"] = _clamp_promotion_probe_patch(policy)
+        policies.append(updated)
+        if len(policies) >= 1:
+            break
+    probe["boundary_group_policies"] = policies
+    probe["unit_policies"] = []
+    return probe
+
+
 def _write_promotion_progress(
     promotion_dir: Path,
     *,
@@ -10540,6 +10681,7 @@ def _run_sampled_promotion_pass(
                 selected=best is not None,
             )
             continue
+        probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True
@@ -10560,19 +10702,20 @@ def _run_sampled_promotion_pass(
         )
         probe_result = _evaluate_sampled_budget_tasks_for_promotion(
             probe_context,
-            eval_hints,
+            probe_hints,
             timeout_sec=eval_timeout_sec,
         )
         probe_latency = _promotion_latency(probe_result)
         probe_record = _promotion_record_summary(
             index=index,
             stage="probe_qbp",
-            hints=eval_hints,
+            hints=probe_hints,
             result=probe_result,
             reason="",
             code_digest=code_digest,
         )
         probe_record["reference_latency_usec"] = probe_reference_cost
+        probe_record["full_policy_summary"] = _compact_policy_summary(eval_hints)
         records.append(probe_record)
         _write_promotion_progress(
             promotion_dir,

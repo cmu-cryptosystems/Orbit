@@ -3368,14 +3368,24 @@ def evaluate_compile_candidate_program(
         candidate_validity = candidate_solved / requested_budgets
         effective_validity = solved_budgets / requested_budgets
         requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+        has_boundary_group_diagnostics = int(
+            diagnostics.get("requested_boundary_groups", 0) or 0
+        ) > 0
+        has_boundary_group_diagnostics = int(
+            diagnostics.get("requested_boundary_groups", 0) or 0
+        ) > 0
         solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
         candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
         fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
         invalid_groups = int(diagnostics.get("invalid_boundary_groups", 0) or 0)
         unreachable_groups = int(diagnostics.get("unreachable_boundary_groups", 0) or 0)
         scored_groups = _scored_boundary_group_count(diagnostics)
-        boundary_group_validity = min(1.0, solved_groups / scored_groups)
-        candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
+        if has_boundary_group_diagnostics:
+            boundary_group_validity = min(1.0, solved_groups / scored_groups)
+            candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
+        else:
+            boundary_group_validity = min(1.0, effective_validity)
+            candidate_qbp_coverage = min(1.0, candidate_validity)
         repair_count = _repair_count(eval_hints)
         unit_coverage = _unit_coverage(context, eval_hints)
         reference = context.get("reference", {})
@@ -8608,6 +8618,9 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         candidate_solved = int(diagnostics.get("candidate_solved_budgets", solved))
         fallback_selected = int(diagnostics.get("fallback_selected_budgets", 0))
         requested_groups = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
+        has_boundary_group_diagnostics = int(
+            diagnostics.get("requested_boundary_groups", 0) or 0
+        ) > 0
         solved_groups = int(diagnostics.get("solved_boundary_groups", 0) or 0)
         candidate_groups = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
         fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
@@ -8618,8 +8631,12 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         requested = max(1, len(io_budgets))
         effective_validity = solved / requested
         validity = candidate_solved / requested
-        boundary_group_validity = min(1.0, solved_groups / scored_groups)
-        candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
+        if has_boundary_group_diagnostics:
+            boundary_group_validity = min(1.0, solved_groups / scored_groups)
+            candidate_qbp_coverage = min(1.0, candidate_groups / scored_groups)
+        else:
+            boundary_group_validity = min(1.0, effective_validity)
+            candidate_qbp_coverage = min(1.0, validity)
         repair_count = _repair_count(hints)
         unit_coverage = _unit_coverage(context, hints)
         avg_cost = sum(costs) / solved if costs else float("inf")
@@ -8666,39 +8683,30 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
             + 0.13 * risk_score
             + 0.12 * reserve_score
         )
-        if effective_validity < 1.0 or boundary_group_validity < 1.0:
-            bootstrap_frontier = target_bootstrap_score if validity > 0.0 else 0.0
-            combined_score = min(
-                0.999,
-                0.28 * effective_validity
-                + 0.20 * boundary_group_validity
-                + 0.18 * candidate_qbp_coverage
-                + 0.24 * bootstrap_frontier
-                + 0.10 * quality_score
+        latency_correct = (
+            bool(costs)
+            and math.isfinite(avg_cost)
+            and avg_cost > 0.0
+            and effective_validity >= 1.0
+            and boundary_group_validity >= 1.0
+            and candidate_solved > 0
+            and fallback_selected == 0
+            and fallback_groups == 0
+            and invalid_groups == 0
+        )
+        if latency_correct:
+            reference_for_score = (
+                reference_avg
+                if math.isfinite(reference_avg) and reference_avg > 0.0
+                else avg_cost
             )
-        elif candidate_solved == 0 or fallback_selected > 0 or fallback_groups > 0:
-            if _context_budget_aggressive(context):
-                combined_score = min(
-                    0.999,
-                    0.36 * validity
-                    + 0.18 * candidate_qbp_coverage
-                    + 0.20 * fallback_score
-                    + 0.18 * quality_score
-                    + 0.08 * unit_coverage
-                )
-            else:
-                combined_score = min(0.999, 0.40 * validity + 0.30 * quality_score)
+            combined_score = max(0.0, reference_for_score / avg_cost)
         else:
-            improvement_fraction = candidate_improved / requested
-            combined_score = (
-                1.0
-                + quality_score
-                + 0.05 * improvement_fraction
-                + 0.02 * candidate_qbp_coverage
-            )
+            combined_score = 0.0
         return {
             "metrics": {
                 "combined_score": float(combined_score),
+                "latency_only_correct": float(latency_correct),
                 "validity": float(validity),
                 "effective_validity": float(effective_validity),
                 "candidate_validity": float(validity),
@@ -10041,18 +10049,8 @@ def _best_candidate_attempt(
 
 def _selection_objective(policy: dict[str, Any]) -> str:
     objective = str(policy.get("selection_objective", "cost")).strip().lower()
-    if _bool_hint(policy.get("prefer_component_budget_fit"), False):
-        return "component_budget_fit"
-    if objective in {
-        "component_budget_fit",
-        "target_bootstrap_fit",
-        "budget_fit",
-        "min_bootstrap",
-        "low_bootstrap",
-    }:
-        if objective == "low_bootstrap":
-            return "min_bootstrap"
-        return objective
+    if objective in {"cost", "latency", "runtime"}:
+        return "cost"
     return "cost"
 
 

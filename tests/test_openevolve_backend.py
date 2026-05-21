@@ -363,7 +363,7 @@ def test_seed_fallback_does_not_reward_invalid_candidate(
     assert invalid["metrics"]["validity"] == 0.0
     assert invalid["metrics"]["effective_validity"] == 1.0
     assert invalid["metrics"]["fallback_selected_budgets"] == 1.0
-    assert invalid["metrics"]["combined_score"] > 0.0
+    assert invalid["metrics"]["combined_score"] == 0.0
     assert invalid["metrics"]["combined_score"] < seed["metrics"]["combined_score"]
 
 
@@ -3037,7 +3037,7 @@ def test_force_bootstrap_anchor_selects_refresh_transition(toy_cost_json: str):
     assert not params.check_res(10, params.Sw, out_level, out_scale)
 
 
-def test_component_budget_selection_prefers_budget_fit_over_low_cost(toy_cost_json: str):
+def test_component_budget_selection_uses_cost_objective(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_target_bootstrap_count=1)
     graph = Tdag(params, "selection_objective")
     graph.add_node(
@@ -3087,13 +3087,10 @@ def test_component_budget_selection_prefers_budget_fit_over_low_cost(toy_cost_js
         policy,
     )
 
-    assert (
-        oe_backend._best_candidate_attempt([low_attempt, maintained_attempt], params, policy)
-        is maintained_attempt
-    )
+    assert oe_backend._best_candidate_attempt([low_attempt, maintained_attempt], params, policy) is low_attempt
 
 
-def test_min_bootstrap_selection_prefers_fewer_refreshes(toy_cost_json: str):
+def test_min_bootstrap_selection_is_normalized_to_cost(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_target_bootstrap_count=9)
     graph = Tdag(params, "min_bootstrap_selection")
     graph.add_node("x", op="input", weight=1, op_descr={}, comment="scope=test.x")
@@ -3132,10 +3129,7 @@ def test_min_bootstrap_selection_prefers_fewer_refreshes(toy_cost_json: str):
         policy,
     )
 
-    assert (
-        oe_backend._best_candidate_attempt([refresh_attempt, no_refresh_attempt], params, policy)
-        is no_refresh_attempt
-    )
+    assert oe_backend._best_candidate_attempt([refresh_attempt, no_refresh_attempt], params, policy) is refresh_attempt
 
 
 def test_cost_root_ignores_exploratory_non_cost_action_objectives(toy_cost_json: str):
@@ -3483,8 +3477,7 @@ def test_partition_fallback_selected_candidate_scores_below_valid(
     assert result["metrics"]["fallback_selected_budgets"] == 1.0
     assert result["metrics"]["candidate_only_avg_latency_usec"] == 30.0
     assert json.loads(result["artifacts"]["selected_source_counts"]) == {"seed_fallback": 1}
-    assert result["metrics"]["combined_score"] < 1.0
-    assert result["metrics"]["combined_score"] > 0.0
+    assert result["metrics"]["combined_score"] == 0.0
 
 
 def test_polybert_sampled_budgets_keep_bypass_and_cost_extremes(toy_cost_json: str):
@@ -3520,7 +3513,7 @@ def test_polybert_sampled_budgets_keep_bypass_and_cost_extremes(toy_cost_json: s
     assert all(levels == set(range(1, params.lvl_ub + 1)) for levels in by_group.values())
 
 
-def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
+def test_evaluator_rejects_partial_validity_even_when_latency_improves(
     toy_cost_json: str, tmp_path: Path
 ):
     params = _params(toy_cost_json)
@@ -3548,8 +3541,8 @@ def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
 
     assert seed["metrics"]["validity"] == evolved["metrics"]["validity"] == 0.5
     assert evolved["metrics"]["avg_latency_usec"] < seed["metrics"]["avg_latency_usec"]
-    assert evolved["metrics"]["combined_score"] > seed["metrics"]["combined_score"]
-    assert evolved["metrics"]["combined_score"] < 1.0
+    assert evolved["metrics"]["combined_score"] == 0.0
+    assert seed["metrics"]["combined_score"] == 0.0
 
 
 def test_fail_open_rejects_sampled_only_policy_bank_seed():

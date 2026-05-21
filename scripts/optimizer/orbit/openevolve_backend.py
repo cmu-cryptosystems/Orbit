@@ -10265,12 +10265,39 @@ def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]
     old_value = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS")
     os.environ["ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS"] = str(_promotion_probe_limit())
     try:
-        return _experience_probe_tasks(context)
+        selected, reference_cost = _experience_probe_tasks(context)
     finally:
         if old_value is None:
             os.environ.pop("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS", None)
         else:
             os.environ["ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS"] = old_value
+    if selected and not math.isfinite(reference_cost):
+        reference_cost = _promotion_fallback_probe_reference_cost(context, len(selected))
+    return selected, reference_cost
+
+
+def _promotion_fallback_probe_reference_cost(
+    context: dict[str, Any],
+    selected_task_count: int,
+) -> float:
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    for source in (
+        harness.get("sampled_seed_baseline"),
+        context.get("reference"),
+        harness.get("seed_baseline"),
+    ):
+        if not isinstance(source, dict):
+            continue
+        for key in ("sampled_dp_latency_usec", "objective_cost_usec", "final_latency_usec"):
+            value = _finite_float(source.get(key), float("inf"))
+            if math.isfinite(value) and value > 0:
+                return float(value)
+    full_reference = _promotion_reference_latency(context)
+    tasks = context.get("sampled_budget_tasks")
+    task_count = len(tasks) if isinstance(tasks, list) and tasks else max(1, selected_task_count)
+    if math.isfinite(full_reference) and full_reference > 0:
+        return float(full_reference * max(1, selected_task_count) / max(1, task_count))
+    return float("inf")
 
 
 def _promotion_result_direct_valid(result: dict[str, Any]) -> bool:

@@ -1688,7 +1688,23 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             initial_hints,
             "Policy-bank latency-improved OpenEvolve initial program.",
         )
-        context.setdefault("harness", {})["initial_policy_source"] = "policy_bank"
+        harness = context.setdefault("harness", {})
+        selected_record = policy_bank.get("selected_record")
+        if isinstance(selected_record, dict):
+            active_seed = _policy_bank_active_seed_baseline(selected_record)
+            active_seed["source"] = "policy_bank"
+            active_seed["policy_summary"] = selected_record.get("policy_summary", {})
+            harness.setdefault("pre_policy_bank_reference", dict(context.get("reference", {})))
+            if isinstance(harness.get("sampled_seed_baseline"), dict):
+                harness.setdefault(
+                    "pre_policy_bank_sampled_seed_baseline",
+                    dict(harness["sampled_seed_baseline"]),
+                )
+                harness["sampled_seed_baseline"] = dict(active_seed)
+            harness["active_seed_baseline"] = dict(active_seed)
+            harness["seed_baseline"] = dict(active_seed)
+            context["reference"] = dict(active_seed)
+        harness["initial_policy_source"] = "policy_bank"
     context.setdefault("harness", {})["initial_policy_hints"] = _jsonable_policy_hints(
         initial_hints
     )
@@ -1856,6 +1872,7 @@ def _run_compile_policy_bank_prepass(
         "examples": examples,
         "summary": summary,
         "initial_hints": best_improved[1] if best_improved is not None else None,
+        "selected_record": best_improved[2] if best_improved is not None else None,
     }
 
 
@@ -2429,10 +2446,18 @@ def _policy_bank_record(
     )
     return {
         "label": label,
+        "valid": bool(metrics.get("latency_only_correct", 0.0)),
         "correct": bool(metrics.get("latency_only_correct", 0.0)),
         "latency_improved": improved,
         "combined_score": _finite_float(metrics.get("combined_score"), 0.0),
         "objective_cost_usec": objective,
+        "sampled_dp_latency_usec": _finite_float(
+            metrics.get("sampled_dp_latency_usec"), objective
+        ),
+        "total_frontier_cost_usec": _finite_float(
+            metrics.get("total_frontier_cost_usec"), objective
+        ),
+        "final_latency_usec": _finite_float(metrics.get("final_latency_usec"), objective),
         "reference_objective_cost_usec": reference,
         "objective_delta_usec": (
             objective - reference
@@ -2446,12 +2471,66 @@ def _policy_bank_record(
         "sampled_selected_path_bootstraps": _finite_float(
             metrics.get("sampled_selected_path_bootstraps"), 0.0
         ),
+        "bootstrap_count": _finite_float(metrics.get("bootstrap_count"), 0.0),
+        "sampled_frontier_total_bootstrap_count": _finite_float(
+            metrics.get("sampled_frontier_total_bootstrap_count"), 0.0
+        ),
         "rescale_count": _finite_float(metrics.get("rescale_count"), 0.0),
+        "sampled_selected_path_rescales": _finite_float(
+            metrics.get("sampled_selected_path_rescales"), 0.0
+        ),
+        "sampled_frontier_total_rescale_count": _finite_float(
+            metrics.get("sampled_frontier_total_rescale_count"), 0.0
+        ),
+        "effective_qbp_digest": str(artifacts.get("effective_qbp_digest", ""))[:24],
+        "selected_path_digest": str(
+            artifacts.get("sampled_selected_path_digest")
+            or artifacts.get("selected_path_digest")
+            or ""
+        )[:24],
         "path_digest": str(artifacts.get("sampled_selected_path_digest", ""))[:24],
         "candidate_mlir_digest": str(artifacts.get("candidate_mlir_digest", "")),
         "candidate_mlir_path": str(artifacts.get("candidate_mlir_path", "")),
         "gate_reasons": list(gate.get("reasons", []) or [])[:8],
         "policy_summary": json.loads(_compact_policy_summary(hints)),
+    }
+
+
+def _policy_bank_active_seed_baseline(record: dict[str, Any]) -> dict[str, Any]:
+    objective = _finite_float(record.get("objective_cost_usec"), float("inf"))
+    final_latency = _finite_float(record.get("final_latency_usec"), objective)
+    sampled_latency = _finite_float(record.get("sampled_dp_latency_usec"), objective)
+    total_frontier = _finite_float(record.get("total_frontier_cost_usec"), objective)
+    bootstrap_count = _finite_float(
+        record.get("bootstrap_count"),
+        _finite_float(record.get("sampled_selected_path_bootstraps"), 0.0),
+    )
+    rescale_count = _finite_float(
+        record.get("rescale_count"),
+        _finite_float(record.get("sampled_selected_path_rescales"), 0.0),
+    )
+    return {
+        "label": record.get("label"),
+        "valid": bool(record.get("correct", record.get("valid", False))),
+        "objective_cost_usec": objective,
+        "sampled_dp_latency_usec": sampled_latency,
+        "total_frontier_cost_usec": total_frontier,
+        "final_latency_usec": final_latency,
+        "bootstrap_count": bootstrap_count,
+        "rescale_count": rescale_count,
+        "effective_qbp_digest": str(record.get("effective_qbp_digest", ""))[:24],
+        "selected_path_digest": str(
+            record.get("selected_path_digest") or record.get("path_digest") or ""
+        )[:24],
+        "candidate_qbp_coverage": _finite_float(
+            record.get("candidate_qbp_coverage"), 0.0
+        ),
+        "boundary_group_validity": _finite_float(
+            record.get("boundary_group_validity"), 0.0
+        ),
+        "fallback_selected_budgets": _finite_float(
+            record.get("fallback_selected_budgets"), 0.0
+        ),
     }
 
 
@@ -3962,6 +4041,7 @@ def _baseline_objective_cost_usec(context: dict[str, Any], fallback: float) -> f
     harness = context.get("harness", {})
     eval_suite = str(harness.get("eval_suite", "polybert-sampled"))
     candidates: list[Any] = []
+    candidates.append(harness.get("active_seed_baseline"))
     if eval_suite != "polybert-full":
         candidates.append(harness.get("sampled_seed_baseline"))
     candidates.extend([harness.get("seed_baseline"), context.get("reference")])
@@ -5194,8 +5274,11 @@ def _result_effective_summary(
     path_digest = _selected_path_digest(result, diagnostics)
     reference = context.get("reference", {}) if isinstance(context, dict) else {}
     harness = context.get("harness", {}) if isinstance(context, dict) else {}
+    if isinstance(harness, dict) and isinstance(harness.get("active_seed_baseline"), dict):
+        reference = harness["active_seed_baseline"]
     if (
         isinstance(harness, dict)
+        and not isinstance(harness.get("active_seed_baseline"), dict)
         and str(harness.get("eval_suite", "polybert-sampled")) != "polybert-full"
         and isinstance(harness.get("sampled_seed_baseline"), dict)
     ):

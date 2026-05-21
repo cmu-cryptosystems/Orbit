@@ -2643,8 +2643,14 @@ def test_policy_bank_prepass_enabled_by_default(
                 "candidate_qbp_coverage": 1.0,
                 "boundary_group_validity": 1.0,
                 "fallback_selected_budgets": 0.0,
+                "sampled_dp_latency_usec": 90.0,
+                "sampled_selected_path_bootstraps": 2.0,
             },
-            "artifacts": {"correctness_gate": {"reasons": []}},
+            "artifacts": {
+                "correctness_gate": {"reasons": []},
+                "sampled_selected_path_digest": "policy-bank-path",
+                "effective_qbp_digest": "policy-bank-qbp",
+            },
         }
 
     monkeypatch.setattr(oe_backend, "evaluate_compile_candidate_program", fake_evaluate)
@@ -2660,7 +2666,63 @@ def test_policy_bank_prepass_enabled_by_default(
     assert result["summary"]["enabled"] is True
     assert result["summary"]["selected_initial_label"] == "fast_waterline"
     assert result["initial_hints"]["boundary_scale_policy"] == "waterline"
+    assert result["selected_record"]["objective_cost_usec"] == 90.0
+    active = oe_backend._policy_bank_active_seed_baseline(result["selected_record"])
+    assert active["objective_cost_usec"] == 90.0
+    assert active["selected_path_digest"] == "policy-bank-path"
     assert evaluated_programs
+
+
+def test_policy_bank_active_seed_becomes_latency_reference():
+    active_result = {
+        "sampled_selected_path_bootstraps": 2.0,
+        "sampled_selected_path_rescales": 3.0,
+    }
+    active_digest = oe_backend._selected_path_digest(active_result, {})
+    context = {
+        "reference": {
+            "objective_cost_usec": 100.0,
+            "selected_path_digest": "old-path",
+        },
+        "harness": {
+            "eval_suite": "polybert-sampled",
+            "sampled_seed_baseline": {
+                "objective_cost_usec": 100.0,
+                "selected_path_digest": "old-path",
+            },
+            "active_seed_baseline": {
+                "objective_cost_usec": 90.0,
+                "selected_path_digest": active_digest,
+            },
+        },
+    }
+    result = {
+        "valid": True,
+        "sampled_progress_only": True,
+        "sampled_dp_latency_usec": 90.0,
+    }
+    diagnostics = {
+        "requested_boundary_groups": 1,
+        "solved_boundary_groups": 1,
+        "candidate_solved_boundary_groups": 1,
+    }
+
+    objective = oe_backend._cost_minimization_objective(
+        context,
+        result,
+        diagnostics,
+        effective_validity=1.0,
+        repair_count=0,
+    )
+    effective = oe_backend._result_effective_summary(
+        context,
+        active_result,
+        {},
+    )
+
+    assert objective["reference_objective_cost_usec"] == 90.0
+    assert oe_backend._objective_improved_vs_seed(objective) is False
+    assert effective["seed_equivalent_path"] is True
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):

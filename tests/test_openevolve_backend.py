@@ -5657,14 +5657,46 @@ def test_historical_context_reuse_prefers_lowest_latency(
         path.write_text(json.dumps(context), encoding="utf-8")
         return path
 
-    write_context("newer_slow", 200.0, 4)
-    best_path = write_context("older_fast", 100.0, 2)
+    write_context("one_task_fast", 50.0, 1)
+    write_context("newer_slow", 200.0, 8)
+    best_path = write_context("older_fast", 100.0, 8)
 
     loaded = oe_backend._load_historical_compile_context(stable_path, graph, params)
     assert loaded is not None
     cached, path = loaded
     assert path == best_path
     assert cached["reference"]["sampled_dp_latency_usec"] == 100.0
+
+
+def test_historical_context_reuse_falls_back_when_min_tasks_missing(
+    toy_cost_json: str, tmp_path: Path
+):
+    cache_dir = tmp_path / ".openevolve_context_cache"
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_context_cache_dir=str(cache_dir),
+        openevolve_sampled_only=True,
+    )
+    graph = _mul_chain_pdag(params, length=3)
+    stable_path = oe_backend._stable_context_cache_path(graph, params)
+    assert stable_path is not None
+    path = tmp_path / "tiny" / "workdir" / "compile_oe_mul_chain" / "compile_context.json"
+    path.parent.mkdir(parents=True)
+    context = build_compile_context(graph, params)
+    context["reference"] = {"valid": True, "sampled_dp_latency_usec": 50.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [{"in_lvl": -1, "in_scl": 40}],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    path.write_text(json.dumps(context), encoding="utf-8")
+
+    loaded = oe_backend._load_historical_compile_context(stable_path, graph, params)
+    assert loaded is not None
+    assert loaded[1] == path
 
 
 def test_cached_context_reference_latency_prefers_sampled_objective(

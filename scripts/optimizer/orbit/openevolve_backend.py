@@ -2283,6 +2283,14 @@ def _historical_context_limit() -> int:
         return 128
 
 
+def _historical_context_min_tasks() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_CONTEXT_HISTORY_MIN_TASKS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 8
+    except ValueError:
+        return 8
+
+
 def _cached_context_reference_latency(cached: dict[str, Any] | None) -> float:
     if not isinstance(cached, dict):
         return float("inf")
@@ -2320,14 +2328,20 @@ def _load_historical_compile_context(
     ]
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     best: tuple[float, int, float, dict[str, Any], Path] | None = None
+    fallback_best: tuple[float, int, float, dict[str, Any], Path] | None = None
+    min_tasks = _historical_context_min_tasks()
     for path in candidates[: _historical_context_limit()]:
         cached = _load_cached_compile_context(path, dag, params)
         if cached is not None:
             latency = _cached_context_reference_latency(cached)
             task_count = len(cached.get("sampled_budget_tasks") or [])
             item = (latency, -task_count, -path.stat().st_mtime, cached, path)
-            if best is None or item[:3] < best[:3]:
+            if fallback_best is None or item[:3] < fallback_best[:3]:
+                fallback_best = item
+            if task_count >= min_tasks and (best is None or item[:3] < best[:3]):
                 best = item
+    if best is None:
+        best = fallback_best
     if best is None:
         return None
     return best[3], best[4]

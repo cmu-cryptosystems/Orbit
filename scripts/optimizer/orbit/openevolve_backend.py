@@ -574,12 +574,12 @@ def place(context):
             policy["selection_objective"] = "min_bootstrap"
         elif name == "component_budget_repair":
             action["prior"] = 0.28
-            policy["selection_objective"] = "component_budget_fit"
-            policy["prefer_component_budget_fit"] = True
+            policy["selection_objective"] = "cost"
+            policy["prefer_component_budget_fit"] = False
             policy["force_bootstrap_anchors"] = False
             policy["bootstrap_anchor_count"] = 0
-            policy["boundary_state_cap"] = 4
-            policy["max_scale_candidates"] = 32
+            policy["boundary_state_cap"] = 6
+            policy["max_scale_candidates"] = 48
             policy["bootstrap_penalty"] = 50_000_000.0
             policy["selection_bootstrap_penalty"] = 0.0
         elif name == "waterline_budget_repair":
@@ -726,12 +726,12 @@ def place(context):
         component_budget_repair={
             "prior": 0.28,
             "policy": {
-                "selection_objective": "component_budget_fit",
-                "prefer_component_budget_fit": True,
+                "selection_objective": "cost",
+                "prefer_component_budget_fit": False,
                 "force_bootstrap_anchors": False,
-                "bootstrap_anchor_count": max(2, min(8, target_bootstraps or 4)),
-                "boundary_state_cap": 4,
-                "max_scale_candidates": 32,
+                "bootstrap_anchor_count": 0,
+                "boundary_state_cap": 6,
+                "max_scale_candidates": 48,
                 "bootstrap_penalty": 50_000_000.0,
                 "selection_bootstrap_penalty": 0.0,
             },
@@ -853,12 +853,12 @@ def place(context):
                 policy["selection_objective"] = "min_bootstrap"
             elif name == "component_budget_repair":
                 action["prior"] = 0.28
-                policy["selection_objective"] = "component_budget_fit"
-                policy["prefer_component_budget_fit"] = True
+                policy["selection_objective"] = "cost"
+                policy["prefer_component_budget_fit"] = False
                 policy["force_bootstrap_anchors"] = False
                 policy["bootstrap_anchor_count"] = 0
-                policy["boundary_state_cap"] = 4
-                policy["max_scale_candidates"] = 32
+                policy["boundary_state_cap"] = 6
+                policy["max_scale_candidates"] = 48
                 policy["bootstrap_penalty"] = 50_000_000.0
                 policy["selection_bootstrap_penalty"] = 0.0
             elif name == "waterline_budget_repair":
@@ -972,12 +972,12 @@ def place(context):
             component_budget_repair={
                 "prior": 0.28,
                 "policy": {
-                    "selection_objective": "component_budget_fit",
-                    "prefer_component_budget_fit": True,
+                    "selection_objective": "cost",
+                    "prefer_component_budget_fit": False,
                     "force_bootstrap_anchors": False,
-                    "bootstrap_anchor_count": max(2, min(8, target_bootstraps or 4)),
-                    "boundary_state_cap": 4,
-                    "max_scale_candidates": 32,
+                    "bootstrap_anchor_count": 0,
+                    "boundary_state_cap": 6,
+                    "max_scale_candidates": 48,
                     "bootstrap_penalty": 50_000_000.0,
                     "selection_bootstrap_penalty": 0.0,
                 },
@@ -4087,12 +4087,12 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
             policy["selection_objective"] = "min_bootstrap"
         elif name == "component_budget_repair":
             action["prior"] = 0.28
-            policy["selection_objective"] = "component_budget_fit"
-            policy["prefer_component_budget_fit"] = True
+            policy["selection_objective"] = "cost"
+            policy["prefer_component_budget_fit"] = False
             policy["force_bootstrap_anchors"] = False
             policy["bootstrap_anchor_count"] = 0
-            policy["boundary_state_cap"] = 4
-            policy["max_scale_candidates"] = 32
+            policy["boundary_state_cap"] = 6
+            policy["max_scale_candidates"] = 48
             policy["bootstrap_penalty"] = 50_000_000.0
             policy["selection_bootstrap_penalty"] = 0.0
         elif name == "waterline_budget_repair":
@@ -4238,12 +4238,12 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
         component_budget_repair={
             "prior": 0.28,
             "policy": {
-                "selection_objective": "component_budget_fit",
-                "prefer_component_budget_fit": True,
+                "selection_objective": "cost",
+                "prefer_component_budget_fit": False,
                 "force_bootstrap_anchors": False,
-                "bootstrap_anchor_count": max(2, min(8, target_bootstraps or 4)),
-                "boundary_state_cap": 4,
-                "max_scale_candidates": 32,
+                "bootstrap_anchor_count": 0,
+                "boundary_state_cap": 6,
+                "max_scale_candidates": 48,
                 "bootstrap_penalty": 50_000_000.0,
                 "selection_bootstrap_penalty": 0.0,
             },
@@ -4613,6 +4613,7 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     bounded = _with_default_policy(hints)
     portfolio = bounded.pop("portfolio", None)
     budget_aggressive = _bool_hint(bounded.get("budget_aggressive"), False)
+    mcts_broad = str(bounded.get("strategy")) == "bootstrap_mcts"
     # Sampled evolution is intentionally lenient: failed direct candidate budgets
     # are repaired through the deterministic seed, then scored via
     # candidate_validity and fallback_selected_budgets. Finalist replay disables
@@ -4621,16 +4622,25 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     bounded["allow_bootstrap"] = _bool_hint(bounded.get("allow_bootstrap"), budget_aggressive)
     bounded["refresh_fanout_at_level_floor"] = True
     bounded["max_scale_candidates"] = min(
-        24 if budget_aggressive else 16,
-        _int_hint(bounded.get("max_scale_candidates"), 20 if budget_aggressive else 16),
+        32 if (budget_aggressive or mcts_broad) else 16,
+        _int_hint(
+            bounded.get("max_scale_candidates"),
+            32 if mcts_broad else (20 if budget_aggressive else 16),
+        ),
     )
     bounded["state_cap_per_node"] = min(
-        16 if budget_aggressive else 8,
-        _int_hint(bounded.get("state_cap_per_node"), 12 if budget_aggressive else 8),
+        24 if (budget_aggressive or mcts_broad) else 8,
+        _int_hint(
+            bounded.get("state_cap_per_node"),
+            24 if mcts_broad else (12 if budget_aggressive else 8),
+        ),
     )
     bounded["beam_width"] = min(
-        6 if budget_aggressive else 4,
-        _int_hint(bounded.get("beam_width"), 5 if budget_aggressive else 4),
+        8 if (budget_aggressive or mcts_broad) else 4,
+        _int_hint(
+            bounded.get("beam_width"),
+            8 if mcts_broad else (5 if budget_aggressive else 4),
+        ),
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
         if not _bool_hint(bounded.get("enable_sampled_latency_beam"), False):
@@ -4638,23 +4648,23 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 bounded.get("mcts_actions")
             )
         bounded["mcts_rollout_budget"] = min(
-            4 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_rollout_budget"), 4 if budget_aggressive else 2),
+            12 if budget_aggressive else 8,
+            _int_hint(bounded.get("mcts_rollout_budget"), 12 if budget_aggressive else 8),
         )
         bounded["mcts_action_cap"] = min(
-            7 if budget_aggressive else 2,
-            _int_hint(bounded.get("mcts_action_cap"), 7 if budget_aggressive else 2),
+            10 if budget_aggressive else 6,
+            _int_hint(bounded.get("mcts_action_cap"), 10 if budget_aggressive else 6),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
-            64 if budget_aggressive else 4,
+            64 if budget_aggressive else 16,
             _int_hint(
                 bounded.get("mcts_max_repair_bootstraps"),
-                64 if budget_aggressive else 4,
+                64 if budget_aggressive else 16,
             ),
         )
         bounded["boundary_state_cap"] = min(
-            4 if budget_aggressive else 2,
-            _int_hint(bounded.get("boundary_state_cap"), 4 if budget_aggressive else 2),
+            8 if budget_aggressive else 6,
+            _int_hint(bounded.get("boundary_state_cap"), 8 if budget_aggressive else 6),
         )
     if isinstance(portfolio, list) and portfolio:
         sampled_portfolio = [
@@ -4699,17 +4709,17 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
             ):
                 cheap = dict(item)
                 cheap_policy = dict(policy)
-                cheap_policy["beam_width"] = min(3, _int_hint(cheap_policy.get("beam_width"), 3))
+                cheap_policy["beam_width"] = min(5, _int_hint(cheap_policy.get("beam_width"), 5))
                 cheap_policy["state_cap_per_node"] = min(
-                    8, _int_hint(cheap_policy.get("state_cap_per_node"), 8)
+                    16, _int_hint(cheap_policy.get("state_cap_per_node"), 16)
                 )
                 cheap_policy["max_scale_candidates"] = min(
-                    16,
-                    _int_hint(cheap_policy.get("max_scale_candidates"), 16),
+                    32,
+                    _int_hint(cheap_policy.get("max_scale_candidates"), 32),
                 )
                 cheap_policy["boundary_state_cap"] = min(
-                    4,
-                    _int_hint(cheap_policy.get("boundary_state_cap"), 4),
+                    6,
+                    _int_hint(cheap_policy.get("boundary_state_cap"), 6),
                 )
                 cheap_policy["bootstrap_penalty"] = max(
                     0.0 if _selection_objective(cheap_policy) == "cost" else 750_000_000.0,
@@ -4736,7 +4746,7 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
                     ),
                 )
                 cheap_policy["selection_objective"] = str(
-                    cheap_policy.get("selection_objective", "target_bootstrap_fit")
+                    cheap_policy.get("selection_objective", "cost")
                 )
                 cheap["policy"] = cheap_policy
                 filtered.append(cheap)
@@ -4834,8 +4844,8 @@ def _finalist_hints_for_full_bundle(hints: dict[str, Any]) -> dict[str, Any]:
             _int_hint(bounded.get("mcts_max_repair_bootstraps"), 128 if budget_aggressive else 6),
         )
         bounded["boundary_state_cap"] = min(
-            8 if budget_aggressive else 6,
-            _int_hint(bounded.get("boundary_state_cap"), 6 if budget_aggressive else 4),
+            12 if budget_aggressive else 8,
+            _int_hint(bounded.get("boundary_state_cap"), 8 if budget_aggressive else 6),
         )
     return bounded
 
@@ -8734,7 +8744,7 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
         else max(8, min(64, int(getattr(params, "openevolve_mcts_rollout_budget", 24))))
     )
     budget_aggressive = bool(getattr(params, "openevolve_budget_aggressive", False)) if params else False
-    sampled_repair_cap = 128 if budget_aggressive else max(4, target)
+    sampled_repair_cap = 128 if budget_aggressive else max(16, target)
     policy = _low_scale_frontier_policy()
     policy.update(
         {
@@ -8761,8 +8771,8 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
             "mcts_exploration_weight": 1.4,
             "mcts_max_repair_bootstraps": sampled_repair_cap,
             "target_bootstrap_count": target,
-            "mcts_action_cap": 4,
-            "boundary_state_cap": 4,
+            "mcts_action_cap": 6,
+            "boundary_state_cap": 6,
             "enable_direct_budget_beam": False,
             "include_seed_repair_actions": False,
             "selection_objective": "cost",
@@ -8774,7 +8784,7 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
             for floor in getattr(params, "openevolve_scale_floor_candidates", [])
             if int(floor) < int(params.Sw)
         ]
-        policy["mcts_action_cap"] = 8
+        policy["mcts_action_cap"] = 10
         policy["mcts_action_allowlist"] = [
             "budget_fulfillment_beam",
             "wide_boundary_cost_beam",
@@ -8936,7 +8946,7 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             0.0, min(8.0, _float_hint(hints.get("mcts_exploration_weight"), 1.4))
         ),
         "mcts_max_repair_bootstraps": max(
-            0, min(1024, _int_hint(hints.get("mcts_max_repair_bootstraps"), 4))
+            0, min(1024, _int_hint(hints.get("mcts_max_repair_bootstraps"), 16))
         ),
         "enable_direct_budget_beam": _bool_hint(hints.get("enable_direct_budget_beam"), False),
         "force_bootstrap_nodes": {
@@ -12234,7 +12244,7 @@ def _sanitize_policy_values(
     clamp_int("mcts_rollout_budget", 1, 256)
     clamp_int("mcts_max_repair_bootstraps", 0, 1024)
     clamp_int("mcts_action_cap", 1, 64)
-    clamp_int("boundary_state_cap", 1, 8)
+    clamp_int("boundary_state_cap", 1, 12)
     clamp_int("bootstrap_anchor_count", 0, 64)
     clamp_int("bootstrap_anchor_level", int(ckks["lvl_lb"]), int(ckks["lvl_ub"]))
     if policy.get("min_internal_level") is not None:

@@ -1214,9 +1214,9 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     )
     assert any(action["policy"].get("forbid_bootstrap") for action in hints["mcts_actions"])
     assert any(action["policy"]["allow_bootstrap"] for action in hints["mcts_actions"])
-    assert sampled["mcts_rollout_budget"] <= 2
-    assert sampled["mcts_action_cap"] <= 2
-    assert sampled["mcts_max_repair_bootstraps"] <= 4
+    assert sampled["mcts_rollout_budget"] <= 8
+    assert sampled["mcts_action_cap"] <= 6
+    assert sampled["mcts_max_repair_bootstraps"] <= 16
     capped_action_names = [
         action["name"]
         for action in sampled["mcts_actions"][: sampled["mcts_action_cap"]]
@@ -1234,9 +1234,9 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
         "tuneinsight_avgcase_cost_beam",
         "tuneinsight_deferred_bootstrap_beam",
     ]
-    assert sampled_latency_actions[0]["policy"]["beam_width"] <= 4
-    assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 12
-    assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 16
+    assert sampled_latency_actions[0]["policy"]["beam_width"] <= 5
+    assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 16
+    assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 32
 
 
 def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
@@ -1299,10 +1299,10 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 4
-    assert captured["mcts_action_cap"] <= 7
+    assert captured["mcts_rollout_budget"] <= 12
+    assert captured["mcts_action_cap"] <= 10
     assert captured["mcts_max_repair_bootstraps"] <= 64
-    assert captured["boundary_state_cap"] == 4
+    assert captured["boundary_state_cap"] == 8
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(
@@ -4280,7 +4280,7 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
 
     assert captured["strategy"] == "bootstrap_mcts"
     assert captured["mcts_rollout_budget"] >= 8
-    assert captured["mcts_action_cap"] == 8
+    assert captured["mcts_action_cap"] == 10
     assert captured["mcts_action_allowlist"] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
@@ -4292,7 +4292,7 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
         "minimal_bootstrap_repair",
         "waterline_budget_repair",
     ]
-    assert captured["boundary_state_cap"] == 4
+    assert captured["boundary_state_cap"] == 6
     assert captured["selection_objective"] == "cost"
 
 

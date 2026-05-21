@@ -7058,68 +7058,130 @@ def _full_validate_policy_bank_seed(
     finalist_dir.mkdir(parents=True, exist_ok=True)
     full_context = json.loads(json.dumps(sampled_context))
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
-    replay_hints = _policy_bank_full_compile_replay_hints(initial_hints)
     summary_path = finalist_dir / "policy_bank_full_validation.json"
-    try:
-        result = _evaluate_compile_hints(
-            full_context,
-            replay_hints,
-            suppress_output=True,
-            evaluating_candidate=False,
-        )
-    except Exception as exc:
-        summary_path.write_text(
-            json.dumps(
+    records: list[dict[str, Any]] = []
+    best: tuple[float, int, int, dict[str, Any], dict[str, Any]] | None = None
+    for idx, (label, replay_hints) in enumerate(
+        _policy_bank_full_validation_variants(initial_hints)
+    ):
+        try:
+            result = _evaluate_compile_hints(
+                full_context,
+                replay_hints,
+                suppress_output=True,
+                evaluating_candidate=False,
+            )
+        except Exception as exc:
+            records.append(
                 {
+                    "index": idx,
+                    "label": label,
                     "valid": False,
                     "sampled_reject_reason": sampled_reject_reason,
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}",
                     "policy_summary": _compact_policy_summary(replay_hints),
-                },
-                indent=2,
-                sort_keys=True,
+                }
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        return None
+            continue
 
-    diagnostics = result.get("diagnostics", {})
-    if not isinstance(diagnostics, dict):
-        diagnostics = {}
-    valid = bool(result.get("valid", False))
-    fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
-    fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
+        diagnostics = result.get("diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        valid = bool(result.get("valid", False))
+        fallback_groups = int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0)
+        fallback_budgets = int(result.get("fallback_selected_budgets", 0) or 0)
+        invalid_reasons = diagnostics.get("invalid_reasons", {})
+        record = {
+            "index": idx,
+            "label": label,
+            "valid": valid,
+            "sampled_reject_reason": sampled_reject_reason,
+            "final_latency_usec": result.get("final_latency_usec"),
+            "objective_cost_usec": result.get(
+                "objective_cost_usec", result.get("final_latency_usec")
+            ),
+            "bootstrap_count": result.get("bootstrap_count"),
+            "rescale_count": result.get("rescale_count"),
+            "fallback_selected_groups": fallback_groups,
+            "fallback_selected_budgets": fallback_budgets,
+            "candidate_qbp_coverage": result.get("candidate_qbp_coverage"),
+            "effective_qbp_digest": _effective_qbp_digest(diagnostics),
+            "selected_path_digest": _selected_path_digest(result, diagnostics),
+            "invalid_reasons": invalid_reasons if isinstance(invalid_reasons, dict) else {},
+            "log_tail": str(result.get("log_tail", ""))[-2000:],
+            "policy_summary": _compact_policy_summary(replay_hints),
+        }
+        records.append(record)
+        latency = _finite_float(result.get("final_latency_usec"), float("inf"))
+        if valid and fallback_groups == 0 and fallback_budgets == 0 and math.isfinite(latency):
+            item = (
+                latency,
+                int(result.get("bootstrap_count", 0) or 0),
+                int(result.get("rescale_count", 0) or 0),
+                replay_hints,
+                record,
+            )
+            if best is None or item[:3] < best[:3]:
+                best = item
+
     summary = {
-        "valid": valid,
+        "valid": best is not None,
         "sampled_reject_reason": sampled_reject_reason,
-        "final_latency_usec": result.get("final_latency_usec"),
-        "objective_cost_usec": result.get(
-            "objective_cost_usec", result.get("final_latency_usec")
-        ),
-        "bootstrap_count": result.get("bootstrap_count"),
-        "rescale_count": result.get("rescale_count"),
-        "fallback_selected_groups": fallback_groups,
-        "fallback_selected_budgets": fallback_budgets,
-        "candidate_qbp_coverage": result.get("candidate_qbp_coverage"),
-        "effective_qbp_digest": _effective_qbp_digest(diagnostics),
-        "selected_path_digest": _selected_path_digest(result, diagnostics),
-        "policy_summary": _compact_policy_summary(replay_hints),
+        "selected_index": None if best is None else best[4]["index"],
+        "selected_label": None if best is None else best[4]["label"],
+        "records": records,
     }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    if not valid or fallback_groups > 0 or fallback_budgets > 0:
+    if best is None:
         return None
 
-    promoted = deepcopy(replay_hints)
+    result_record = best[4]
+    promoted = deepcopy(best[3])
     promoted["policy_bank_full_validated_initial"] = True
-    promoted["policy_bank_full_validation_latency_usec"] = result.get("final_latency_usec")
-    promoted["policy_bank_full_validation_bootstrap_count"] = result.get("bootstrap_count")
-    promoted["policy_bank_full_validation_rescale_count"] = result.get("rescale_count")
-    promoted["policy_bank_full_validation_digest"] = summary["selected_path_digest"]
+    promoted["policy_bank_full_validation_variant"] = result_record["label"]
+    promoted["policy_bank_full_validation_latency_usec"] = result_record.get("final_latency_usec")
+    promoted["policy_bank_full_validation_bootstrap_count"] = result_record.get("bootstrap_count")
+    promoted["policy_bank_full_validation_rescale_count"] = result_record.get("rescale_count")
+    promoted["policy_bank_full_validation_digest"] = result_record["selected_path_digest"]
     return promoted
+
+
+def _policy_bank_full_validation_variants(
+    initial_hints: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    bounded = _policy_bank_full_compile_replay_hints(initial_hints)
+    broad = deepcopy(initial_hints)
+    broad.pop("portfolio", None)
+    broad.pop("policy_bank_lightweight", None)
+    broad["policy_bank_full_compile_replay"] = True
+    broad["policy_bank_full_validation_variant"] = "broad_action_replay"
+    broad["allow_seed_fallback"] = True
+    broad["mcts_rollout_budget"] = max(4, _int_hint(broad.get("mcts_rollout_budget"), 4))
+    broad["mcts_action_cap"] = max(2, _int_hint(broad.get("mcts_action_cap"), 2))
+    broad["boundary_state_cap"] = max(6, _int_hint(broad.get("boundary_state_cap"), 6))
+    broad["max_scale_candidates"] = max(24, _int_hint(broad.get("max_scale_candidates"), 24))
+    broad["state_cap_per_node"] = max(16, _int_hint(broad.get("state_cap_per_node"), 16))
+    broad["mcts_action_allowlist"] = [
+        "budget_fulfillment_beam",
+        "dense_boundary_cost_beam",
+        "wide_boundary_cost_beam",
+    ]
+    if not broad.get("mcts_actions") and broad.get("mcts_action_presets"):
+        presets = broad.get("mcts_action_presets")
+        if isinstance(presets, dict):
+            broad["mcts_actions"] = [
+                {"name": name, **value}
+                for name, value in presets.items()
+                if isinstance(value, dict)
+            ]
+
+    return [
+        ("sampled_overlay_bounded", bounded),
+        ("broad_action_replay", broad),
+    ]
 
 
 def _policy_bank_full_compile_replay_hints(hints: dict[str, Any]) -> dict[str, Any]:

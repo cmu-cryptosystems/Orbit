@@ -2692,6 +2692,24 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     best_program.write_text(best_code, encoding="utf-8")
     record_harness_timing("write_best_program")
     try:
+        promoted_hints = _run_sampled_promotion_pass(
+            root,
+            output_dir,
+            context,
+            best_code,
+            params,
+            initial_hints,
+        )
+        record_harness_timing("sampled_promotion")
+        if promoted_hints is not None:
+            _write_sampled_selection_summary(
+                root,
+                output_dir,
+                "sampled_promotion_selected",
+                fail_open=False,
+                selected_sampled_best=True,
+            )
+            return promoted_hints
         sampled_reject_reason = _sampled_best_invalid_reason(output_dir)
         if (
             params.openevolve_finalists <= 0
@@ -4992,10 +5010,12 @@ def _experience_surrogate_only_result(
             "experience_surrogate_score": float(surrogate.get("score", 0.0)),
             "experience_probe_promoted": 0.0,
             "experience_probe_task_count": 0.0,
+            "candidate_stage_rank": 0.0,
             "policy_effect_score": float(policy_effect.get("effect_score", 0.0)),
             "seed_equivalent_policy": float(bool(policy_effect.get("seed_equivalent", False))),
         }
     )
+    result.setdefault("artifacts", {})["candidate_stage"] = "surrogate"
     result.setdefault("artifacts", {})["experience_surrogate"] = json.dumps(
         {
             **surrogate,
@@ -5067,6 +5087,8 @@ def _experience_probe_skip_result(
             "experience_probe_candidate_qbp_coverage": float(direct_coverage),
             "experience_probe_boundary_group_validity": float(boundary_validity),
             "experience_probe_task_count": float(len(selected_tasks)),
+            "experience_probe_promoted": 1.0,
+            "candidate_stage_rank": 1.0,
             "policy_effect_score": float(policy_effect.get("effect_score", 0.0)),
             "seed_equivalent_policy": float(bool(policy_effect.get("seed_equivalent", False))),
             "sampled_task_cache_hits": float(
@@ -5081,6 +5103,7 @@ def _experience_probe_skip_result(
         }
     )
     artifacts = result.setdefault("artifacts", {})
+    artifacts["candidate_stage"] = "probe_qbp"
     artifacts["experience_probe"] = json.dumps(
         {
             "reason": reason,
@@ -5432,9 +5455,13 @@ def evaluate_compile_candidate_program(
             candidate_trace_features,
         )
         mark_timing("trace_features_feedback")
+        candidate_stage = "full_replay" if eval_suite == "polybert-full" else "sampled_qbp"
+        candidate_stage_rank = 3.0 if candidate_stage == "full_replay" else 2.0
         evaluation = {
             "metrics": {
                 "combined_score": float(combined_score),
+                "candidate_stage_rank": float(candidate_stage_rank),
+                "experience_probe_promoted": 1.0,
                 "latency_only_correct": float(bool(correctness_gate["correct"])),
                 "validity": float(result["validity"]),
                 "effective_validity": float(effective_validity),
@@ -5585,6 +5612,7 @@ def evaluate_compile_candidate_program(
                 "graph_edges": float(len(context["tdag"]["edges"])),
             },
             "artifacts": {
+                "candidate_stage": candidate_stage,
                 "reference_final_latency_usec": str(reference.get("final_latency_usec", "none")),
                 "objective_cost_usec": f"{objective['objective_cost_usec']:.3f}",
                 "base_objective_cost_usec": f"{objective['base_objective_cost_usec']:.3f}",
@@ -9830,6 +9858,15 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
     metrics = info.get("metrics") if isinstance(info, dict) else None
     if not isinstance(metrics, dict):
         return None
+    if _finite_float(metrics.get("experience_surrogate_score"), 0.0) > 0.0 and (
+        _finite_float(metrics.get("experience_probe_promoted"), 0.0) <= 0.0
+    ):
+        return "sampled_best_surrogate_only"
+    if (
+        _finite_float(metrics.get("experience_probe_task_count"), 0.0) > 0.0
+        and _finite_float(metrics.get("latency_only_correct"), 0.0) <= 0.0
+    ):
+        return "sampled_best_probe_only_not_selectable"
     validity = _finite_float(metrics.get("validity"), 0.0)
     effective_validity = _finite_float(metrics.get("effective_validity"), validity)
     combined_score = _finite_float(metrics.get("combined_score"), 0.0)
@@ -9856,6 +9893,265 @@ def _sampled_best_invalid_reason(output_dir: Path) -> str | None:
     ):
         return "sampled_best_has_no_direct_qbp_coverage"
     return None
+
+
+def _promotion_candidate_limit(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_CANDIDATES", "").strip()
+    try:
+        value = int(raw) if raw else 16
+    except ValueError:
+        value = 16
+    return max(0, min(128, value))
+
+
+def _promotion_result_direct_valid(result: dict[str, Any]) -> bool:
+    if not bool(result.get("valid", False)):
+        return False
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    if _finite_float(result.get("boundary_group_validity"), 0.0) < 1.0:
+        return False
+    if _finite_float(result.get("candidate_qbp_coverage"), 0.0) < 1.0:
+        return False
+    if int(result.get("fallback_selected_budgets", 0) or 0) > 0:
+        return False
+    if int(result.get("fallback_selected_groups", 0) or 0) > 0:
+        return False
+    if int(diagnostics.get("fallback_selected_boundary_groups", 0) or 0) > 0:
+        return False
+    if int(result.get("invalid_boundary_groups", 0) or 0) > 0:
+        return False
+    if int(diagnostics.get("invalid_boundary_groups", 0) or 0) > 0:
+        return False
+    return True
+
+
+def _promotion_latency(result: dict[str, Any]) -> float:
+    for key in ("sampled_dp_latency_usec", "objective_cost_usec", "final_latency_usec"):
+        value = _finite_float(result.get(key), float("inf"))
+        if math.isfinite(value) and value > 0:
+            return float(value)
+    return float("inf")
+
+
+def _promotion_reference_latency(context: dict[str, Any]) -> float:
+    fallback = _finite_float(
+        context.get("reference", {}).get("sampled_dp_latency_usec")
+        if isinstance(context.get("reference"), dict)
+        else None,
+        float("inf"),
+    )
+    value = _baseline_objective_cost_usec(context, fallback)
+    return float(value) if math.isfinite(value) and value > 0 else float("inf")
+
+
+def _promotion_record_summary(
+    *,
+    index: int,
+    stage: str,
+    hints: dict[str, Any] | None,
+    result: dict[str, Any] | None = None,
+    reason: str = "",
+    code_digest: str = "",
+) -> dict[str, Any]:
+    result = result if isinstance(result, dict) else {}
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return {
+        "index": int(index),
+        "stage": stage,
+        "reason": reason,
+        "code_digest": code_digest,
+        "valid": bool(result.get("valid", False)),
+        "direct_valid": bool(_promotion_result_direct_valid(result)) if result else False,
+        "latency_usec": _promotion_latency(result) if result else None,
+        "candidate_qbp_coverage": _finite_float(
+            result.get("candidate_qbp_coverage"), 0.0
+        )
+        if result
+        else 0.0,
+        "boundary_group_validity": _finite_float(
+            result.get("boundary_group_validity"), 0.0
+        )
+        if result
+        else 0.0,
+        "fallback_selected_budgets": int(result.get("fallback_selected_budgets", 0) or 0)
+        if result
+        else 0,
+        "fallback_selected_groups": int(result.get("fallback_selected_groups", 0) or 0)
+        if result
+        else 0,
+        "selected_path_digest": str(result.get("sampled_selected_path_digest", "")),
+        "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0)
+        if result
+        else 0.0,
+        "rescale_count": _finite_float(result.get("rescale_count"), 0.0)
+        if result
+        else 0.0,
+        "sampled_task_cache_hits": int(result.get("sampled_task_cache_hits", 0) or 0)
+        if result
+        else 0,
+        "sampled_task_cache_misses": int(result.get("sampled_task_cache_misses", 0) or 0)
+        if result
+        else 0,
+        "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
+        "policy_summary": _compact_policy_summary(hints or {}),
+    }
+
+
+def _run_sampled_promotion_pass(
+    root: Path,
+    output_dir: Path,
+    context: dict[str, Any],
+    best_code: str,
+    params: Params,
+    initial_hints: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if params.openevolve_eval_suite == "polybert-full":
+        return None
+    if not context.get("sampled_budget_tasks"):
+        return None
+    limit = _promotion_candidate_limit(params)
+    if limit <= 0:
+        return None
+    promotion_dir = root / "sampled_promotion"
+    promotion_dir.mkdir(parents=True, exist_ok=True)
+    selected_probe_tasks, probe_reference_cost = _experience_probe_tasks(context)
+    if not selected_probe_tasks or not math.isfinite(probe_reference_cost):
+        return None
+
+    full_reference_cost = _promotion_reference_latency(context)
+    codes = _discover_finalist_codes(output_dir, best_code, limit)
+    records: list[dict[str, Any]] = []
+    best: tuple[float, float, float, int, dict[str, Any], dict[str, Any], str] | None = None
+    seen: set[str] = set()
+
+    for index, code in enumerate(codes):
+        code_digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        if code_digest in seen:
+            continue
+        seen.add(code_digest)
+        hints = _hints_from_code(code, context)
+        if hints is None:
+            records.append(
+                _promotion_record_summary(
+                    index=index,
+                    stage="static",
+                    hints=None,
+                    reason="candidate_hints_not_loadable",
+                    code_digest=code_digest,
+                )
+            )
+            continue
+        static = _static_validate_hints(context, hints)
+        if not static.get("valid", False):
+            records.append(
+                _promotion_record_summary(
+                    index=index,
+                    stage="static",
+                    hints=hints,
+                    reason="static_invalid:" + ",".join(static.get("reasons", [])[:3]),
+                    code_digest=code_digest,
+                )
+            )
+            continue
+        eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
+        probe_context = deepcopy(context)
+        probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
+        probe_context.setdefault("harness", {})["experience_probe"] = True
+        probe_result = _evaluate_sampled_budget_tasks(
+            probe_context,
+            eval_hints,
+            suppress_output=True,
+        )
+        probe_latency = _promotion_latency(probe_result)
+        probe_record = _promotion_record_summary(
+            index=index,
+            stage="probe_qbp",
+            hints=eval_hints,
+            result=probe_result,
+            reason="",
+            code_digest=code_digest,
+        )
+        probe_record["reference_latency_usec"] = probe_reference_cost
+        records.append(probe_record)
+        if not _promotion_result_direct_valid(probe_result):
+            probe_record["reason"] = "probe_not_direct_valid"
+            continue
+        if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
+            probe_record["reason"] = "probe_not_latency_improved"
+            continue
+
+        full_result = _evaluate_sampled_budget_tasks(
+            context,
+            eval_hints,
+            suppress_output=True,
+        )
+        full_latency = _promotion_latency(full_result)
+        full_record = _promotion_record_summary(
+            index=index,
+            stage="sampled_qbp",
+            hints=eval_hints,
+            result=full_result,
+            reason="",
+            code_digest=code_digest,
+        )
+        full_record["reference_latency_usec"] = full_reference_cost
+        full_record["probe_latency_usec"] = probe_latency
+        records.append(full_record)
+        if not _promotion_result_direct_valid(full_result):
+            full_record["reason"] = "sampled_not_direct_valid"
+            continue
+        if not (math.isfinite(full_latency) and full_latency < full_reference_cost):
+            full_record["reason"] = "sampled_not_latency_improved"
+            continue
+        item = (
+            full_latency,
+            _finite_float(full_result.get("bootstrap_count"), 0.0),
+            _finite_float(full_result.get("rescale_count"), 0.0),
+            index,
+            eval_hints,
+            full_record,
+            code,
+        )
+        if best is None or item[:4] < best[:4]:
+            best = item
+
+    summary = {
+        "candidate_count": len(codes),
+        "evaluated_count": len(seen),
+        "probe_reference_latency_usec": probe_reference_cost,
+        "sampled_reference_latency_usec": full_reference_cost,
+        "selected": best is not None,
+        "selected_index": None if best is None else best[3],
+        "selected_latency_usec": None if best is None else best[0],
+        "selected_record": None if best is None else best[5],
+        "records": records,
+    }
+    (promotion_dir / "promotion_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "OpenEvolve compile harness: sampled promotion "
+        f"candidates={len(codes)} selected={best is not None} "
+        f"sampled_reference={full_reference_cost}.",
+        flush=True,
+    )
+    if best is None:
+        return None
+    selected_hints = deepcopy(best[4])
+    selected_hints["openevolve_promotion_validated"] = True
+    selected_hints["openevolve_promotion_stage"] = "sampled_qbp"
+    selected_hints["openevolve_promotion_latency_usec"] = float(best[0])
+    selected_hints["openevolve_promotion_reference_latency_usec"] = float(full_reference_cost)
+    selected_hints["openevolve_promotion_code_digest"] = hashlib.sha256(
+        best[6].encode("utf-8")
+    ).hexdigest()
+    (promotion_dir / "selected_program.py").write_text(best[6], encoding="utf-8")
+    return selected_hints
 
 
 def _write_sampled_selection_summary(

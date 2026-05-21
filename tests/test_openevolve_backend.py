@@ -5553,6 +5553,176 @@ def test_experience_surrogate_skips_unpromising_candidate_without_qbp(
     assert result["metrics"]["experience_probe_promoted"] == 0.0
 
 
+def test_surrogate_only_best_is_not_selectable(tmp_path: Path):
+    info_dir = tmp_path / "best"
+    info_dir.mkdir()
+    (info_dir / "best_program_info.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "combined_score": 1.25,
+                    "validity": 0.0,
+                    "effective_validity": 0.0,
+                    "experience_surrogate_score": 0.9,
+                    "experience_probe_promoted": 0.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert oe_backend._sampled_best_invalid_reason(tmp_path) == "sampled_best_surrogate_only"
+
+
+def test_sampled_promotion_selects_real_qbp_latency_winner(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["harness"]["sampled_seed_baseline"] = {
+        "sampled_dp_latency_usec": 100.0,
+        "objective_cost_usec": 100.0,
+    }
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    codes = [
+        "def place(context):\n    return {'marker': 'slow'}\n",
+        "def place(context):\n    return {'marker': 'fast'}\n",
+    ]
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: codes)
+
+    def fake_hints(code, _context):
+        return {"marker": "fast" if "fast" in code else "slow"}
+
+    def fake_static(_context, _hints):
+        return {"valid": True, "reasons": []}
+
+    def fake_eval(sampled_context, hints, *, suppress_output):
+        assert suppress_output is True
+        is_probe = bool(sampled_context.get("harness", {}).get("experience_probe"))
+        marker = hints["marker"]
+        latency = 80.0 if marker == "fast" else 120.0
+        if is_probe and marker == "slow":
+            latency = 110.0
+        return {
+            "valid": True,
+            "validity": 1.0,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": latency,
+            "objective_cost_usec": latency,
+            "bootstrap_count": 2,
+            "rescale_count": 5,
+            "sampled_selected_path_digest": marker,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "selected_source_counts": {marker: 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_hints_from_code", fake_hints)
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", fake_static)
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        codes[0],
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert selected["marker"] == "fast"
+    assert selected["openevolve_promotion_validated"] is True
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["selected"] is True
+    assert summary["selected_latency_usec"] == 80.0
+
+
+def test_sampled_promotion_fails_open_when_no_candidate_improves(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'slow'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(oe_backend, "_hints_from_code", lambda *_args: {"marker": "slow"})
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+
+    def fake_eval(_context, _hints, *, suppress_output):
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 120.0,
+            "objective_cost_usec": 120.0,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {},
+    )
+
+    assert selected is None
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["selected"] is False
+
+
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
     toy_cost_json: str,
 ):

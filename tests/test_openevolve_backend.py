@@ -2696,6 +2696,35 @@ def test_policy_bank_qbp_worker_count_avoids_nested_oversubscription(
     assert oe_backend._policy_bank_qbp_worker_count(params, 16) == 12
 
 
+def test_openevolve_evaluator_qbp_worker_count_avoids_nested_oversubscription(
+    toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_parallel_evaluations=8,
+    )
+    params.threads = 96
+
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_EVALUATOR_QBP_WORKERS", raising=False)
+    assert oe_backend._openevolve_evaluator_qbp_worker_count(params) == 12
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_EVALUATOR_QBP_WORKERS", "6")
+    assert oe_backend._openevolve_evaluator_qbp_worker_count(params) == 6
+
+
+def test_temporary_qbp_worker_env_restores_existing_values(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_QBP_WORKERS", "96")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", "96")
+
+    with oe_backend._temporary_qbp_worker_env(6):
+        assert os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] == "6"
+        assert os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] == "6"
+
+    assert os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] == "96"
+    assert os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] == "96"
+
+
 def test_policy_bank_full_validation_timeout_follows_evaluator_timeout(
     toy_cost_json: str, monkeypatch: pytest.MonkeyPatch
 ):

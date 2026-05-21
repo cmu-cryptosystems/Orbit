@@ -1943,7 +1943,8 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             return _recover_compile_hints(output_dir, context, initial_hints, params)
     else:
         try:
-            with worker._openevolve_runtime_env():
+            qbp_worker_override = _openevolve_evaluator_qbp_worker_count(params)
+            with worker._openevolve_runtime_env(), _temporary_qbp_worker_env(qbp_worker_override):
                 result = run_evolution(
                     initial_program=initial_path,
                     evaluator=evaluator_path,
@@ -2318,11 +2319,7 @@ def _run_compile_policy_bank_prepass(
             )
     else:
         qbp_worker_override = _policy_bank_qbp_worker_count(params, workers)
-        old_qbp_workers = os.environ.get("ORBIT_OPENEVOLVE_QBP_WORKERS")
-        old_qbp_cap = os.environ.get("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS")
-        os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = str(qbp_worker_override)
-        os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = str(qbp_worker_override)
-        try:
+        with _temporary_qbp_worker_env(qbp_worker_override):
             with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
                 future_to_job = {
                     executor.submit(
@@ -2343,15 +2340,6 @@ def _run_compile_policy_bank_prepass(
                         )
                         evaluation.setdefault("artifacts", {})["traceback"] = traceback.format_exc()[-4000:]
                     consume_record(label, hints, evaluation)
-        finally:
-            if old_qbp_workers is None:
-                os.environ.pop("ORBIT_OPENEVOLVE_QBP_WORKERS", None)
-            else:
-                os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = old_qbp_workers
-            if old_qbp_cap is None:
-                os.environ.pop("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", None)
-            else:
-                os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = old_qbp_cap
     summary = {
         "enabled": True,
         "variant_count": len(variants),
@@ -2425,6 +2413,38 @@ def _policy_bank_qbp_worker_count(params: Params, policy_bank_workers: int) -> i
     threads = max(1, int(getattr(params, "threads", 1) or 1))
     bank_workers = max(1, int(policy_bank_workers or 1))
     return max(1, min(8, threads // bank_workers))
+
+
+def _openevolve_evaluator_qbp_worker_count(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_EVALUATOR_QBP_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    parallel = max(1, int(getattr(params, "openevolve_parallel_evaluations", 1) or 1))
+    threads = max(1, int(getattr(params, "threads", 1) or 1))
+    return max(1, min(12, threads // parallel))
+
+
+@contextmanager
+def _temporary_qbp_worker_env(worker_count: int):
+    old_qbp_workers = os.environ.get("ORBIT_OPENEVOLVE_QBP_WORKERS")
+    old_qbp_cap = os.environ.get("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS")
+    worker_count = max(1, int(worker_count or 1))
+    os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = str(worker_count)
+    os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = str(worker_count)
+    try:
+        yield
+    finally:
+        if old_qbp_workers is None:
+            os.environ.pop("ORBIT_OPENEVOLVE_QBP_WORKERS", None)
+        else:
+            os.environ["ORBIT_OPENEVOLVE_QBP_WORKERS"] = old_qbp_workers
+        if old_qbp_cap is None:
+            os.environ.pop("ORBIT_OPENEVOLVE_MAX_QBP_WORKERS", None)
+        else:
+            os.environ["ORBIT_OPENEVOLVE_MAX_QBP_WORKERS"] = old_qbp_cap
 
 
 def _graph_maintenance_anchor_hint(context: dict[str, Any]) -> int:

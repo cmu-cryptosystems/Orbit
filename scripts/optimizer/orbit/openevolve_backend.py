@@ -1848,12 +1848,25 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     best_program.write_text(best_code, encoding="utf-8")
     try:
         sampled_reject_reason = _sampled_best_invalid_reason(output_dir)
-        if sampled_reject_reason is not None and params.openevolve_finalists <= 0:
+        if (
+            params.openevolve_finalists <= 0
+            and params.openevolve_eval_suite != "polybert-full"
+        ):
+            _write_sampled_selection_summary(
+                root,
+                output_dir,
+                sampled_reject_reason or "sampled_smoke_no_full_replay",
+                fail_open=True,
+                selected_sampled_best=sampled_reject_reason is None,
+            )
+            return _bounded_fail_open_hints(initial_hints)
+        if sampled_reject_reason is not None:
             _write_sampled_selection_summary(
                 root,
                 output_dir,
                 sampled_reject_reason,
-                fail_open=True,
+                fail_open=False,
+                selected_sampled_best=False,
             )
             return _bounded_fail_open_hints(initial_hints)
         finalist_hints = _run_full_bundle_finalists(
@@ -6767,6 +6780,7 @@ def _write_sampled_selection_summary(
     reason: str,
     *,
     fail_open: bool,
+    selected_sampled_best: bool = False,
 ) -> None:
     info_path = output_dir / "best" / "best_program_info.json"
     info: dict[str, Any] = {}
@@ -6779,7 +6793,7 @@ def _write_sampled_selection_summary(
         (root / "sampled_selection_summary.json").write_text(
             json.dumps(
                 {
-                    "selected_sampled_best": False,
+                    "selected_sampled_best": bool(selected_sampled_best),
                     "fail_open": bool(fail_open),
                     "reason": reason,
                     "best_metrics": info.get("metrics", {}),

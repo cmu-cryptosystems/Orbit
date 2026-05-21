@@ -2691,6 +2691,8 @@ def test_policy_bank_prepass_enabled_by_default(
 
     assert result["summary"]["enabled"] is True
     assert result["summary"]["selected_initial_label"] == "fast_waterline"
+    assert result["initial_hints"]["policy_bank_validated_initial"] is True
+    assert result["initial_hints"]["policy_bank_selected_label"] == "fast_waterline"
     assert result["initial_hints"]["boundary_scale_policy"] == "waterline"
     assert result["selected_record"]["objective_cost_usec"] == 90.0
     active = oe_backend._policy_bank_active_seed_baseline(result["selected_record"])
@@ -3513,6 +3515,23 @@ def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
     assert evolved["metrics"]["avg_latency_usec"] < seed["metrics"]["avg_latency_usec"]
     assert evolved["metrics"]["combined_score"] > seed["metrics"]["combined_score"]
     assert evolved["metrics"]["combined_score"] < 1.0
+
+
+def test_fail_open_preserves_validated_policy_bank_seed():
+    initial = {
+        "strategy": "bootstrap_mcts",
+        "policy_bank_validated_initial": True,
+        "policy_bank_selected_label": "latency_beam_waterline48_compact",
+        "policy_bank_lightweight": True,
+        "boundary_state_cap": 8,
+    }
+
+    fallback = oe_backend._bounded_fail_open_hints(initial)
+
+    assert fallback["fail_open_reason"] == "policy_bank_validated_seed"
+    assert fallback["policy_bank_selected_label"] == "latency_beam_waterline48_compact"
+    assert fallback["boundary_state_cap"] == 8
+    assert "policy_bank_lightweight" not in fallback
 
 
 def test_compile_harness_scores_final_compile_latency(toy_cost_json: str, tmp_path: Path):

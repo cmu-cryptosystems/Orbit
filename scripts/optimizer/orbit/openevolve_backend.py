@@ -2097,10 +2097,16 @@ def _run_compile_policy_bank_prepass(
         f"best={summary['selected_initial_label']}.",
         flush=True,
     )
+    selected_hints = None
+    if best_improved is not None:
+        selected_hints = deepcopy(best_improved[1])
+        selected_hints["policy_bank_validated_initial"] = True
+        selected_hints["policy_bank_selected_label"] = str(best_improved[2].get("label", ""))
+        selected_hints["policy_bank_selected_objective_cost_usec"] = float(best_improved[0])
     return {
         "examples": examples,
         "summary": summary,
-        "initial_hints": best_improved[1] if best_improved is not None else None,
+        "initial_hints": selected_hints,
         "selected_record": best_improved[2] if best_improved is not None else None,
     }
 
@@ -6974,6 +6980,12 @@ def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, 
     the final safety net.
     """
 
+    if initial_hints is not None:
+        if _bool_hint(initial_hints.get("policy_bank_validated_initial"), False):
+            fallback = deepcopy(initial_hints)
+            fallback.pop("policy_bank_lightweight", None)
+            fallback["fail_open_reason"] = "policy_bank_validated_seed"
+            return fallback
     fallback = _zero_iteration_portfolio_hints()
     fallback["fail_open_reason"] = "zero_iteration_seed_portfolio"
     if initial_hints is not None:

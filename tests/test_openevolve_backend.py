@@ -2230,6 +2230,16 @@ def test_sampled_fallback_only_best_skips_expensive_full_bundle(tmp_path: Path):
     )
 
 
+def test_unreachable_boundary_groups_still_count_for_scoring():
+    diagnostics = {
+        "requested_boundary_groups": 16,
+        "unreachable_boundary_groups": 6,
+        "solved_boundary_groups": 10,
+    }
+
+    assert oe_backend._scored_boundary_group_count(diagnostics) == 16
+
+
 def test_full_bundle_finalist_variants_include_bounded_portfolio(toy_cost_json: str, tmp_path: Path):
     params = _params(toy_cost_json)
     context = build_context(_mul_chain_pdag(params, length=4), [{"in_lvl": -1, "in_scl": 40}], params)
@@ -3517,7 +3527,7 @@ def test_evaluator_uses_quality_as_partial_validity_tiebreaker(
     assert evolved["metrics"]["combined_score"] < 1.0
 
 
-def test_fail_open_preserves_validated_policy_bank_seed():
+def test_fail_open_rejects_sampled_only_policy_bank_seed():
     initial = {
         "strategy": "bootstrap_mcts",
         "policy_bank_validated_initial": True,
@@ -3550,7 +3560,48 @@ def test_fail_open_preserves_validated_policy_bank_seed():
 
     fallback = oe_backend._bounded_fail_open_hints(initial)
 
-    assert fallback["fail_open_reason"] == "policy_bank_validated_seed"
+    assert fallback["fail_open_reason"] == "zero_iteration_seed_portfolio"
+    assert fallback["rejected_initial_reason"] == "sampled_policy_bank_not_full_validated"
+    assert fallback["rejected_policy_bank_selected_label"] == "latency_beam_waterline48_compact"
+    assert fallback["strategy"] == "level_preserving"
+    assert "policy_bank_full_compile_replay" not in fallback
+
+
+def test_fail_open_preserves_full_validated_policy_bank_seed():
+    initial = {
+        "strategy": "bootstrap_mcts",
+        "policy_bank_validated_initial": True,
+        "policy_bank_full_validated_initial": True,
+        "policy_bank_selected_label": "latency_beam_waterline48_compact",
+        "policy_bank_lightweight": True,
+        "boundary_state_cap": 8,
+        "mcts_actions": [
+            {"name": "budget_fulfillment_beam", "policy": {"strategy": "latency_beam"}},
+            {"name": "dense_boundary_cost_beam", "policy": {"strategy": "latency_beam"}},
+        ],
+        "mcts_action_allowlist": [
+            "budget_fulfillment_beam",
+            "dense_boundary_cost_beam",
+        ],
+        "policy_bank_selected_top_costly_boundary_groups": [
+            {
+                "group_key": {
+                    "in_lvl": 8,
+                    "in_scl": 51,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                },
+                "selected_source_counts": {
+                    "candidate:boundary_mcts:dense_boundary_cost_beam:0": 4,
+                    "candidate:boundary_mcts:budget_fulfillment_beam:0": 1,
+                },
+            }
+        ],
+    }
+
+    fallback = oe_backend._bounded_fail_open_hints(initial)
+
+    assert fallback["fail_open_reason"] == "policy_bank_full_validated_seed"
     assert fallback["policy_bank_selected_label"] == "latency_beam_waterline48_compact"
     assert fallback["boundary_state_cap"] == 8
     assert fallback["policy_bank_full_compile_replay"] is True

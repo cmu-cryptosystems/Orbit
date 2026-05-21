@@ -4446,8 +4446,13 @@ def _is_retryable_bypass_failure(exc: BaseException) -> bool:
 
 def _scored_boundary_group_count(diagnostics: dict[str, Any]) -> int:
     requested = max(1, int(diagnostics.get("requested_boundary_groups", 0) or 1))
-    unreachable = max(0, int(diagnostics.get("unreachable_boundary_groups", 0) or 0))
-    return max(1, requested - unreachable)
+    # Do not remove "unreachable" sampled groups from the correctness
+    # denominator. The sampled prepass can misclassify downstream boundary
+    # states as unreachable when the current policy simply failed to connect a
+    # complete QBP path. Keeping the raw requested count makes OpenEvolve solve
+    # the Orbit-shaped boundary table instead of optimizing a locally repaired
+    # subset that later fails during full compile.
+    return requested
 
 
 def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -6992,15 +6997,21 @@ def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, 
     """
 
     if initial_hints is not None:
-        if _bool_hint(initial_hints.get("policy_bank_validated_initial"), False):
+        if _bool_hint(initial_hints.get("policy_bank_full_validated_initial"), False):
             fallback = _policy_bank_full_compile_replay_hints(initial_hints)
             fallback.pop("policy_bank_lightweight", None)
-            fallback["fail_open_reason"] = "policy_bank_validated_seed"
+            fallback["fail_open_reason"] = "policy_bank_full_validated_seed"
             return fallback
     fallback = _zero_iteration_portfolio_hints()
     fallback["fail_open_reason"] = "zero_iteration_seed_portfolio"
     if initial_hints is not None:
         fallback["recovered_from_initial_digest"] = _hint_digest(initial_hints)
+        if _bool_hint(initial_hints.get("policy_bank_validated_initial"), False):
+            fallback["rejected_initial_reason"] = "sampled_policy_bank_not_full_validated"
+            if initial_hints.get("policy_bank_selected_label") is not None:
+                fallback["rejected_policy_bank_selected_label"] = str(
+                    initial_hints.get("policy_bank_selected_label")
+                )
     return fallback
 
 

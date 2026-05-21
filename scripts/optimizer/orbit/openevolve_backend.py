@@ -1884,6 +1884,19 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             )
             context["reference"] = dict(active_seed)
         harness["initial_policy_source"] = "policy_bank"
+    elif getattr(params, "openevolve_reuse_output", False):
+        reusable_initial = _load_reusable_policy_bank_initial_hints(output_dir, context)
+        if reusable_initial is not None:
+            initial_hints = reusable_initial
+            initial_source = _program_source_from_hints(
+                initial_hints,
+                "Reused policy-bank latency-improved OpenEvolve initial program.",
+            )
+            harness = context.setdefault("harness", {})
+            harness["initial_policy_source"] = "reused_policy_bank"
+            label = str(initial_hints.get("policy_bank_selected_label", ""))
+            if label:
+                harness["reused_policy_bank_selected_label"] = label
     context.setdefault("harness", {})["initial_policy_hints"] = _jsonable_policy_hints(
         initial_hints
     )
@@ -7865,6 +7878,48 @@ def _load_reusable_best_code(output_dir: Path) -> str | None:
     candidates = _discover_finalist_codes(output_dir, "", 1)
     if candidates:
         return candidates[0]
+    return None
+
+
+def _load_reusable_policy_bank_initial_hints(
+    output_dir: Path, context: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Recover a sampled policy-bank seed from a reused OpenEvolve workspace."""
+
+    bank_dir = output_dir / "policy_bank"
+    summary_path = bank_dir / "policy_bank_summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    label = str(summary.get("selected_initial_label") or "").strip()
+    if not label:
+        return None
+    safe_label = _safe_filename(label)
+    candidates = sorted(bank_dir.glob(f"*_{safe_label}.py"))
+    if not candidates:
+        candidates = [
+            path
+            for path in sorted(bank_dir.glob("*.py"))
+            if safe_label in path.name or label in path.name
+        ]
+    for program_path in candidates:
+        try:
+            hints = _load_candidate_hints(program_path, context)
+        except Exception:
+            continue
+        if not isinstance(hints, dict):
+            continue
+        hints = deepcopy(hints)
+        hints["policy_bank_validated_initial"] = True
+        hints["policy_bank_selected_label"] = label
+        hints["policy_bank_reused_initial"] = True
+        objective = summary.get("selected_initial_objective_cost_usec")
+        if objective is not None:
+            hints["policy_bank_selected_objective_cost_usec"] = objective
+        return hints
     return None
 
 

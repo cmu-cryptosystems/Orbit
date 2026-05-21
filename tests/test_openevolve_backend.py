@@ -3105,6 +3105,23 @@ def test_policy_bank_record_carries_boundary_trace_examples():
     assert examples[1]["top_costly_boundary_groups"][0]["min_cost_usec"] == 12.0
 
 
+def test_candidate_place_timeout_rejects_pathological_program(
+    tmp_path: Path, monkeypatch
+):
+    program_path = tmp_path / "slow_candidate.py"
+    program_path.write_text(
+        "import time\n"
+        "def place(context):\n"
+        "    time.sleep(2)\n"
+        "    return {'strategy': 'bootstrap_mcts'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PLACE_TIMEOUT_SEC", "1")
+
+    with pytest.raises(oe_backend.PlacementError, match="timed out"):
+        oe_backend._load_candidate_hints(program_path, {"harness": {}, "params": {}})
+
+
 def test_merge_candidate_examples_preserves_seed_mlir_preview():
     examples = oe_backend._merge_candidate_examples(
         [

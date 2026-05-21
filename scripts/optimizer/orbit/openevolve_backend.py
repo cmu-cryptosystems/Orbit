@@ -16115,8 +16115,53 @@ def _load_candidate_hints(program_path: Path, context: dict[str, Any]) -> dict[s
     spec.loader.exec_module(module)
     if not hasattr(module, "place"):
         return {}
-    hints = module.place(context)
+    hints = _call_candidate_place(module.place, context)
     return _normalize_candidate_hints(hints, context)
+
+
+def _candidate_place_timeout_sec(context: dict[str, Any] | None) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PLACE_TIMEOUT_SEC", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if isinstance(context, dict):
+        harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+        params = context.get("params", {}) if isinstance(context.get("params"), dict) else {}
+        for value in (
+            harness.get("candidate_place_timeout_sec"),
+            params.get("openevolve_candidate_place_timeout_sec"),
+        ):
+            if value is not None:
+                return max(1, _safe_int(value, 10))
+    return 10
+
+
+def _call_candidate_place(place_fn: Any, context: dict[str, Any]) -> Any:
+    """Call candidate place(context) with a tight timeout.
+
+    OpenEvolve-generated programs should describe compact policies, not run
+    graph search inside Python before Orbit can clamp and validate the result.
+    This prevents a single pathological mutation from consuming the whole
+    evaluator timeout.
+    """
+
+    timeout = _candidate_place_timeout_sec(context)
+    if timeout <= 0 or not hasattr(signal, "SIGALRM"):
+        return place_fn(context)
+    old_handler = signal.getsignal(signal.SIGALRM)
+
+    def _timeout(_signum: int, _frame: Any) -> None:
+        raise PlacementError(f"candidate place(context) timed out after {timeout}s")
+
+    try:
+        signal.signal(signal.SIGALRM, _timeout)
+        signal.setitimer(signal.ITIMER_REAL, float(timeout))
+        return place_fn(context)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def _context_initial_policy_hints(context: dict[str, Any] | None) -> dict[str, Any]:

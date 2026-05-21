@@ -226,6 +226,7 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["openevolve_llm_timeout_sec"] == 180
     assert init["openevolve_llm_retries"] == 1
     assert init["openevolve_llm_retry_delay_sec"] == 2
+    assert init["openevolve_llm_max_tokens"] == 50_000
     assert init["openevolve_evaluator_timeout_sec"] == 180
     assert init["openevolve_parallel_evaluations"] == 1
     assert init["openevolve_checkpoint_interval"] == 5

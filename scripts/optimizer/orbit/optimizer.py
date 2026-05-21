@@ -251,6 +251,7 @@ def main():
     parser.add_argument('--openevolve-llm-timeout-sec', type=int, default=180)
     parser.add_argument('--openevolve-llm-retries', type=int, default=1)
     parser.add_argument('--openevolve-llm-retry-delay-sec', type=int, default=2)
+    parser.add_argument('--openevolve-llm-max-tokens', type=int, default=50_000)
     parser.add_argument('--openevolve-evaluator-timeout-sec', type=int, default=180)
     parser.add_argument('--openevolve-parallel-evaluations', type=int, default=1)
     parser.add_argument('--openevolve-checkpoint-interval', type=int, default=5)
@@ -402,6 +403,7 @@ def main():
                     openevolve_llm_timeout_sec=args.openevolve_llm_timeout_sec,
                     openevolve_llm_retries=args.openevolve_llm_retries,
                     openevolve_llm_retry_delay_sec=args.openevolve_llm_retry_delay_sec,
+                    openevolve_llm_max_tokens=args.openevolve_llm_max_tokens,
                     openevolve_evaluator_timeout_sec=args.openevolve_evaluator_timeout_sec,
                     openevolve_parallel_evaluations=args.openevolve_parallel_evaluations,
                     openevolve_checkpoint_interval=args.openevolve_checkpoint_interval,

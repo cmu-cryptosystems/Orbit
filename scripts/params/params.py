@@ -6,7 +6,7 @@ DEFAULT_OPENEVOLVE_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_OPENEVOLVE_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_OPENEVOLVE_OPENAI_MODEL = "gpt-5.5"
 DEFAULT_OPENEVOLVE_OPENAI_API_BASE = "https://api.openai.com/v1"
-DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS = 2048
+DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS = 50_000
 
 DEFAULT_RESILIENCE_ERROR_MODEL = {
     "input_error_abs": 0.0,
@@ -85,6 +85,7 @@ class Params:
         openevolve_llm_timeout_sec=180,
         openevolve_llm_retries=1,
         openevolve_llm_retry_delay_sec=2,
+        openevolve_llm_max_tokens=None,
         openevolve_evaluator_timeout_sec=180,
         openevolve_parallel_evaluations=1,
         openevolve_checkpoint_interval=5,
@@ -369,9 +370,20 @@ class Params:
                 else json_parsed.get("openevolve_checkpoint_interval", 5)
             ),
         )
-        self.openevolve_llm_max_tokens = int(json_parsed.get(
-            "openevolve_llm_max_tokens", DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS
-        ))
+        self.openevolve_llm_max_tokens = max(
+            256,
+            min(
+                50_000,
+                int(
+                    openevolve_llm_max_tokens
+                    if openevolve_llm_max_tokens is not None
+                    else json_parsed.get(
+                        "openevolve_llm_max_tokens",
+                        DEFAULT_OPENEVOLVE_LLM_MAX_TOKENS,
+                    )
+                ),
+            ),
+        )
         self.openevolve_fail_open = bool(
             openevolve_fail_open
             if openevolve_fail_open is not None

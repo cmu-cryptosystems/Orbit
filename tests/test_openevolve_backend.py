@@ -774,6 +774,9 @@ def test_initial_compile_seed_exposes_active_bootstrap_mcts_knobs(
     assert hints["mcts_action_allowlist"] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
+        "waterline_cost_beam",
+        "dense_boundary_cost_beam",
+        "nonlinear_phase_boundary_beam",
         "profile_waterline_repair",
         "tuneinsight_avgcase_cost_beam",
         "tuneinsight_deferred_bootstrap_beam",
@@ -1227,13 +1230,14 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
         for action in sampled["mcts_actions"]
         if action.get("policy", {}).get("strategy") == "latency_beam"
     ]
-    assert [action["name"] for action in sampled_latency_actions] == [
+    sampled_latency_names = [action["name"] for action in sampled_latency_actions]
+    assert sampled_latency_names[:2] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
-        "profile_waterline_repair",
-        "tuneinsight_avgcase_cost_beam",
-        "tuneinsight_deferred_bootstrap_beam",
     ]
+    assert "profile_waterline_repair" in sampled_latency_names
+    assert "tuneinsight_avgcase_cost_beam" in sampled_latency_names
+    assert "tuneinsight_deferred_bootstrap_beam" in sampled_latency_names
     assert sampled_latency_actions[0]["policy"]["beam_width"] <= 5
     assert sampled_latency_actions[0]["policy"]["state_cap_per_node"] <= 16
     assert sampled_latency_actions[0]["policy"]["max_scale_candidates"] <= 32
@@ -1299,10 +1303,10 @@ def test_compile_evaluator_caps_bootstrap_mcts_sampled_rollouts(
 
     assert result["metrics"]["validity"] == 1.0
     assert captured["strategy"] == "bootstrap_mcts"
-    assert captured["mcts_rollout_budget"] <= 12
-    assert captured["mcts_action_cap"] <= 10
-    assert captured["mcts_max_repair_bootstraps"] <= 64
-    assert captured["boundary_state_cap"] == 8
+    assert captured["mcts_rollout_budget"] <= 24
+    assert captured["mcts_action_cap"] <= 12
+    assert captured["mcts_max_repair_bootstraps"] <= 128
+    assert captured["boundary_state_cap"] == 12
 
 
 def test_bootstrap_mcts_rejects_rollouts_over_repair_cap(
@@ -2393,12 +2397,169 @@ def test_mcts_candidate_actions_include_component_budget_repair(toy_cost_json: s
     assert component["policy"]["force_bootstrap_anchors"] is False
 
 
+def test_nonlinear_phase_boundary_anchor_selector_prefers_phase_nodes(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "phase_anchor_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    phase_nodes = {
+        "numerator_sum": "scope=fhe_bert.bert.encoder.layer.0.attention.self.qk_softmax;op=qk_numerator_sum",
+        "row_sum": "scope=fhe_bert.bert.encoder.layer.0.attention.self.qk_softmax;op=qk_row_sum_add",
+        "inv_seed": "scope=fhe_bert.bert.encoder.layer.0.attention.output.LayerNorm;op=inv_sqrt_seed",
+        "newton_update": "scope=fhe_bert.bert.encoder.layer.0.attention.output.LayerNorm;op=inv_sqrt_newton_update",
+    }
+    excluded_nodes = {
+        "denom_rescale": "scope=fhe_bert.bert.encoder.layer.0.attention.self.qk_softmax;op=denominator_rescale",
+        "newton_xy": "scope=fhe_bert.bert.encoder.layer.0.attention.output.LayerNorm;op=inv_sqrt_newton_xy",
+        "softmax_mul": "scope=fhe_bert.bert.encoder.layer.0.attention.self.qk_softmax;op=softmax_mul",
+    }
+    prev = "arg0"
+    for node, comment in {**excluded_nodes, **phase_nodes}.items():
+        graph.add_node(
+            node,
+            op="mul",
+            weight=1,
+            op_descr={"single": 1, "double": 0},
+            comment=comment,
+        )
+        graph.add_edge(prev, node, weight=1)
+        prev = node
+    graph.inputs = {"arg0"}
+    graph.outputs = {prev}
+
+    anchors = oe_backend._bootstrap_anchor_nodes(
+        graph,
+        params,
+        {},
+        {
+            "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+            "bootstrap_anchor_count": 8,
+        },
+    )
+
+    assert set(phase_nodes).issubset(set(anchors))
+    assert not set(excluded_nodes).intersection(anchors)
+
+
+def test_candidate_actions_include_nonlinear_phase_boundary_policy(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_toy_pdag(params), [{"in_lvl": params.lvl_ub, "in_scl": params.Sw}], params)
+
+    actions = candidate_actions(context, action_cap=12)
+    phase = next(action for action in actions if action["name"] == "nonlinear_phase_boundary_beam")
+    waterline = next(action for action in actions if action["name"] == "waterline_cost_beam")
+    sampled = oe_backend._sampled_lightweight_mcts_actions(actions)
+    sampled_names = [action["name"] for action in sampled]
+
+    assert waterline["policy"]["boundary_scale_policy"] == "waterline"
+    assert waterline["policy"]["selection_objective"] == "cost"
+    assert "waterline_cost_beam" in sampled_names[:4]
+    assert phase["policy"]["bootstrap_anchor_selector"] == "nonlinear_phase_boundaries"
+    assert phase["policy"]["selection_objective"] == "cost"
+    assert "nonlinear_phase_boundary_beam" in sampled_names[:8]
+
+
+def test_sampled_boundary_group_limit_scales_with_parallelism(toy_cost_json: str):
+    local_params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=64,
+        openevolve_parallel_evaluations=1,
+    )
+    neptune_params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=64,
+        openevolve_parallel_evaluations=8,
+    )
+    tiny_params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=10,
+        openevolve_parallel_evaluations=8,
+    )
+
+    assert oe_backend._sampled_compile_boundary_group_limit(local_params) == 16
+    assert oe_backend._sampled_compile_boundary_group_limit(neptune_params) == 32
+    assert oe_backend._sampled_compile_boundary_group_limit(tiny_params) == 10
+
+
+def test_compile_context_carries_evaluator_timeout(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=321)
+    context = build_context(_toy_pdag(params), [{"in_lvl": params.lvl_ub, "in_scl": params.Sw}], params)
+
+    assert context["params"]["openevolve_evaluator_timeout_sec"] == 321
+    source = oe_backend._compile_evaluator_source(Path("/tmp/context.json"))
+    assert "ctx.Process(" in source
+    assert "_os.setsid()" in source
+    assert "_os.killpg(proc.pid, _signal.SIGTERM)" in source
+    assert "_os.killpg(proc.pid, _signal.SIGKILL)" in source
+    assert "compile_evaluator_timeout" in source
+
+
+def test_bootstrap_mcts_context_collection_uses_fast_seed(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_eval_suite="polybert-sampled",
+    )
+    initial = {
+        "strategy": "bootstrap_mcts",
+        "mcts_action_cap": 12,
+        "mcts_rollout_budget": 24,
+    }
+
+    hints = oe_backend._context_collection_seed_hints(initial, params)
+
+    assert hints is not initial
+    assert hints["context_collection_seed"] is True
+    assert hints["strategy"] == "bootstrap_mcts"
+    assert hints["policy_bank_lightweight"] is True
+    assert hints["budget_aggressive"] is True
+    assert hints["mcts_rollout_budget"] == 4
+    assert hints["mcts_action_cap"] == 2
+    assert hints["mcts_action_allowlist"] == [
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+    ]
+
+
+def test_reference_json_adds_reference_boundary_action(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "reference_anchor_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "seed",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.attention.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    graph.add_edge("arg0", "seed")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"seed"}
+    context = build_context(graph, [{"in_lvl": params.lvl_ub, "in_scl": params.Sw}], params)
+    context.setdefault("harness", {})["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+
+    actions = candidate_actions(context, action_cap=12)
+    reference = next(action for action in actions if action["name"] == "reference_boundary_cost_beam")
+    anchors = oe_backend._bootstrap_anchor_nodes(graph, params, {}, reference["policy"])
+
+    assert reference["policy"]["bootstrap_anchor_selector"] == "reference_bootstrap_locations"
+    assert "inv_sqrt_seed" in reference["policy"]["bootstrap_anchor_include_patterns"]
+    assert anchors == ["seed"]
+
+
 def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)
     initial = oe_backend._bootstrap_mcts_initial_policy_for_context(context)
 
     variants = oe_backend._compile_policy_bank_variants(initial, context, params)
+    labels = [label for label, _hints in variants]
+    waterline_hints = dict(variants[labels.index("waterline_direct_cost_compact")][1])
+    waterline_presets = waterline_hints["mcts_action_presets"]
 
     def target_values(value):
         if isinstance(value, dict):
@@ -2411,6 +2572,33 @@ def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_j
                 yield from target_values(item)
 
     assert variants
+    assert labels[0] == "waterline_direct_cost_compact"
+    assert waterline_hints["selection_objective"] == "cost"
+    assert waterline_hints["boundary_scale_policy"] == "waterline"
+    assert waterline_hints["max_scale_candidates"] == 32
+    assert waterline_hints["mcts_action_cap"] == 10
+    assert [action["name"] for action in waterline_hints["mcts_actions"]] == [
+        "strict_no_bootstrap",
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "waterline_budget_repair",
+        "component_budget_repair",
+        "waterline_cost_beam",
+        "dense_boundary_cost_beam",
+    ]
+    assert "waterline_cost_beam" not in waterline_hints["mcts_action_allowlist"]
+    assert "waterline_cost_beam" not in waterline_presets
+    assert set(waterline_presets) == {
+        "budget_fulfillment_beam",
+        "dense_boundary_cost_beam",
+        "nonlinear_phase_boundary_beam",
+        "wide_boundary_cost_beam",
+    }
+    assert waterline_presets["budget_fulfillment_beam"]["policy"]["bootstrap_penalty"] == 25_000_000.0
+    assert waterline_presets["wide_boundary_cost_beam"]["policy"]["boundary_scale_policy"] == "waterline"
     assert all("gurobi" not in label.lower() for label, _ in variants)
     assert all("boundary40" not in label.lower() for label, _ in variants)
     assert all(
@@ -2418,6 +2606,61 @@ def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_j
         for _label, hints in variants
         for raw in target_values(hints)
     )
+
+
+def test_policy_bank_prepass_enabled_by_default(
+    toy_cost_json: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=4), params)
+    context_path = tmp_path / "compile_context.json"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    initial = oe_backend._bootstrap_mcts_initial_policy_for_context(context)
+    candidate = {**initial, "boundary_scale_policy": "waterline", "selection_objective": "cost"}
+
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_POLICY_BANK", raising=False)
+    monkeypatch.setattr(
+        oe_backend,
+        "_compile_policy_bank_variants",
+        lambda _initial, _context, _params: [("fast_waterline", candidate)],
+    )
+    evaluated_programs: list[Path] = []
+
+    def fake_evaluate(_context_path, program_path):
+        evaluated_programs.append(Path(program_path))
+        assert "policy_bank_lightweight" not in Path(program_path).read_text(encoding="utf-8")
+        return {
+            "metrics": {
+                "latency_only_correct": 1.0,
+                "combined_score": 2.0,
+                "objective_cost_usec": 90.0,
+                "reference_objective_cost_usec": 100.0,
+                "objective_improved_vs_seed": 1.0,
+                "candidate_qbp_coverage": 1.0,
+                "boundary_group_validity": 1.0,
+                "fallback_selected_budgets": 0.0,
+            },
+            "artifacts": {"correctness_gate": {"reasons": []}},
+        }
+
+    monkeypatch.setattr(oe_backend, "evaluate_compile_candidate_program", fake_evaluate)
+
+    result = oe_backend._run_compile_policy_bank_prepass(
+        context_path,
+        context,
+        initial,
+        tmp_path / "openevolve_output",
+        params,
+    )
+
+    assert result["summary"]["enabled"] is True
+    assert result["summary"]["selected_initial_label"] == "fast_waterline"
+    assert result["initial_hints"]["boundary_scale_policy"] == "waterline"
+    assert evaluated_programs
 
 
 def test_estimator_relaxed_candidate_actions_include_scale_floors(toy_cost_json: str):
@@ -2756,10 +2999,10 @@ def place(context):
     hints = oe_backend._load_candidate_hints(program_path, context)
 
     assert hints["strategy"] == "level_preserving"
-    assert hints["max_scale_candidates"] == 64
+    assert hints["max_scale_candidates"] == 100
     assert len(hints["unit_policies"]) == 1
     assert hints["unit_policies"][0]["policy"]["min_internal_level"] == params.lvl_ub
-    assert hints["unit_policies"][0]["policy"]["beam_width"] == 8
+    assert hints["unit_policies"][0]["policy"]["beam_width"] == 12
     assert hints["preferred_node_scales"] == {}
     assert oe_backend._repair_count(hints) >= 4
 
@@ -2785,6 +3028,45 @@ def test_unit_policy_shape_keeps_flat_policy_compatibility(toy_cost_json: str):
     assert flat["max_scale_candidates"] == 7
     assert structured["max_scale_candidates"] == 9
     assert structured["unit_policies"][0]["policy"]["max_scale_candidates"] == 5
+
+
+def test_sparse_candidate_inherits_initial_mcts_presets(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    context = build_context(_toy_pdag(params), [{"in_lvl": -1, "in_scl": 40}], params)
+    context.setdefault("harness", {})["initial_policy_hints"] = {
+        "strategy": "bootstrap_mcts",
+        "boundary_scale_policy": "waterline",
+        "mcts_action_presets": {
+            "budget_fulfillment_beam": {
+                "prior": 0.6,
+                "policy": {
+                    "beam_width": 12,
+                    "boundary_scale_policy": "waterline",
+                    "max_scale_candidates": 32,
+                    "bootstrap_penalty": 25_000_000.0,
+                    "selection_objective": "cost",
+                },
+            }
+        },
+    }
+
+    hints = oe_backend._normalize_candidate_hints(
+        {
+            "mcts_action_presets": {
+                "budget_fulfillment_beam": {
+                    "policy": {"beam_width": 10},
+                }
+            }
+        },
+        context,
+    )
+
+    preset = hints["mcts_action_presets"]["budget_fulfillment_beam"]
+    assert preset["prior"] == pytest.approx(0.6)
+    assert preset["policy"]["beam_width"] == 10
+    assert preset["policy"]["boundary_scale_policy"] == "waterline"
+    assert preset["policy"]["max_scale_candidates"] == 32
+    assert preset["policy"]["selection_objective"] == "cost"
 
 
 def test_sampled_compile_eval_rejects_expensive_policy(toy_cost_json: str):
@@ -3113,13 +3395,20 @@ def test_latency_only_score_tiers_slower_candidates_below_improvements():
         "reference_objective_cost_usec": 1000.0,
         "base_objective_cost_usec": 1000.0,
     }
+    much_better = {
+        "objective_cost_usec": 900.0,
+        "reference_objective_cost_usec": 1000.0,
+        "base_objective_cost_usec": 1000.0,
+    }
 
     slower_score = oe_backend._latency_only_combined_score(slower, correct=True)
     improved_score = oe_backend._latency_only_combined_score(improved, correct=True)
+    much_better_score = oe_backend._latency_only_combined_score(much_better, correct=True)
 
     assert 0.0 < slower_score < 1.0
     assert improved_score > 1.0
     assert improved_score > slower_score
+    assert much_better_score > improved_score
     assert oe_backend._latency_only_combined_score(improved, correct=False) == 0.0
 
 
@@ -3202,7 +3491,7 @@ def test_generated_gemini_config_defaults(toy_cost_json: str, monkeypatch):
     assert config.llm.timeout == 180
     assert config.llm.retries == 1
     assert config.llm.retry_delay == 2
-    assert config.llm.max_tokens == 2048
+    assert config.llm.max_tokens == 50_000
     assert config.llm.models[0].timeout == 180
     assert config.evaluator.timeout == 180
     assert config.evaluator.parallel_evaluations == 1
@@ -4284,6 +4573,7 @@ def test_zero_iteration_worker_uses_bootstrap_mcts_seed_by_default(toy_cost_json
     assert captured["mcts_action_allowlist"] == [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
+        "waterline_cost_beam",
         "profile_waterline_repair",
         "tuneinsight_avgcase_cost_beam",
         "tuneinsight_deferred_bootstrap_beam",

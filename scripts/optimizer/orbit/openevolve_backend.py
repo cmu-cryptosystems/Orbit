@@ -211,7 +211,7 @@ class OpenEvolvePlacementWorker:
         config.llm.timeout = self.params.openevolve_llm_timeout_sec
         config.llm.retries = self.params.openevolve_llm_retries
         config.llm.retry_delay = self.params.openevolve_llm_retry_delay_sec
-        config.llm.max_tokens = max(256, min(4096, int(self.params.openevolve_llm_max_tokens)))
+        config.llm.max_tokens = max(256, min(50_000, int(self.params.openevolve_llm_max_tokens)))
         config.llm.temperature = 0.3
         config.llm.models = [
             self._llm_model_config(LLMModelConfig, spec, config, multi_model)
@@ -483,8 +483,11 @@ def place(context):
     table for action priors, enabled/disabled actions, beam settings, scale
     candidates, repair aggressiveness, and graph maintenance pressure. Use
     mcts_action_cap and mcts_action_allowlist/blocklist to force small
-    ablations when selected_source_counts are unchanged. Orbit validates and
-    repairs every assignment.
+    ablations when selected_source_counts are unchanged. Candidate dictionaries
+    are sparse overlays on the current best seed: omitted preset fields inherit
+    the seed values, and replace_mcts_action_presets=True should be used only
+    when intentionally replacing the full table. Orbit validates and repairs
+    every assignment.
 
     Follow context["evolution_guidance"] and context["harness"]["candidate_examples"]:
     use evaluator artifacts as execution trace feedback. Keep path-diverse
@@ -497,6 +500,11 @@ def place(context):
     target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
     mcts = PlacementMCTS(context)
     actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+    reference_action_names = [
+        str(action.get("name"))
+        for action in actions
+        if str(action.get("name", "")) == "reference_boundary_cost_beam"
+    ]
     for action in actions:
         policy = action.get("policy", {})
         name = action.get("name", "")
@@ -521,6 +529,47 @@ def place(context):
             policy["max_scale_candidates"] = 64
             policy["boundary_scale_policy"] = "frontier"
             policy["bootstrap_penalty"] = 50_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "dense_boundary_cost_beam":
+            action["prior"] = 0.40
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 16
+            policy["max_scale_candidates"] = 96
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "dense"
+            policy["bootstrap_penalty"] = 25_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "nonlinear_phase_boundary_beam":
+            action["prior"] = 0.44
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 12
+            policy["max_scale_candidates"] = 80
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "waterline_sf"
+            policy["bootstrap_anchor_selector"] = "nonlinear_phase_boundaries"
+            policy["bootstrap_anchor_count"] = 64
+            policy["force_bootstrap_anchors"] = False
+            policy["bootstrap_penalty"] = 35_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "reference_boundary_cost_beam":
+            action["prior"] = 0.50
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 12
+            policy["max_scale_candidates"] = 80
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "waterline_sf"
+            policy["bootstrap_anchor_selector"] = "reference_bootstrap_locations"
+            policy["force_bootstrap_anchors"] = False
+            policy["bootstrap_penalty"] = 30_000_000.0
             policy["selection_bootstrap_penalty"] = 0.0
             policy["selection_objective"] = "cost"
         elif name == "profile_waterline_repair":
@@ -607,6 +656,10 @@ def place(context):
     policy["mcts_action_allowlist"] = [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
+        "waterline_cost_beam",
+        "dense_boundary_cost_beam",
+        "nonlinear_phase_boundary_beam",
+        *reference_action_names,
         "profile_waterline_repair",
         "tuneinsight_avgcase_cost_beam",
         "tuneinsight_deferred_bootstrap_beam",
@@ -644,6 +697,59 @@ def place(context):
                 "selection_bootstrap_penalty": 0.0,
                 "selection_objective": "cost",
             },
+        },
+        dense_boundary_cost_beam={
+            "prior": 0.40,
+            "policy": {
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 16,
+                "max_scale_candidates": 96,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "dense",
+                "bootstrap_penalty": 25_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        nonlinear_phase_boundary_beam={
+            "prior": 0.44,
+            "policy": {
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                "bootstrap_anchor_count": 64,
+                "force_bootstrap_anchors": False,
+                "bootstrap_penalty": 35_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        **{
+            name: {
+                "prior": 0.50,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 30_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            }
+            for name in reference_action_names
         },
         profile_waterline_repair={
             "prior": 0.24,
@@ -776,6 +882,11 @@ def place(context):
         # allow/block lists, beam settings, scale candidates, and repair
         # aggressiveness in this compact action table.
         actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+        reference_action_names = [
+            str(action.get("name"))
+            for action in actions
+            if str(action.get("name", "")) == "reference_boundary_cost_beam"
+        ]
         for action in actions:
             policy = action.get("policy", {})
             name = action.get("name", "")
@@ -800,6 +911,47 @@ def place(context):
                 policy["max_scale_candidates"] = 64
                 policy["boundary_scale_policy"] = "frontier"
                 policy["bootstrap_penalty"] = 50_000_000.0
+                policy["selection_bootstrap_penalty"] = 0.0
+                policy["selection_objective"] = "cost"
+            elif name == "dense_boundary_cost_beam":
+                action["prior"] = 0.40
+                policy["strategy"] = "latency_beam"
+                policy["beam_width"] = 10
+                policy["state_cap_per_node"] = 48
+                policy["boundary_state_cap"] = 16
+                policy["max_scale_candidates"] = 96
+                policy["boundary_scale_policy"] = "frontier"
+                policy["scale_lattice"] = "dense"
+                policy["bootstrap_penalty"] = 25_000_000.0
+                policy["selection_bootstrap_penalty"] = 0.0
+                policy["selection_objective"] = "cost"
+            elif name == "nonlinear_phase_boundary_beam":
+                action["prior"] = 0.44
+                policy["strategy"] = "latency_beam"
+                policy["beam_width"] = 10
+                policy["state_cap_per_node"] = 48
+                policy["boundary_state_cap"] = 12
+                policy["max_scale_candidates"] = 80
+                policy["boundary_scale_policy"] = "frontier"
+                policy["scale_lattice"] = "waterline_sf"
+                policy["bootstrap_anchor_selector"] = "nonlinear_phase_boundaries"
+                policy["bootstrap_anchor_count"] = 64
+                policy["force_bootstrap_anchors"] = False
+                policy["bootstrap_penalty"] = 35_000_000.0
+                policy["selection_bootstrap_penalty"] = 0.0
+                policy["selection_objective"] = "cost"
+            elif name == "reference_boundary_cost_beam":
+                action["prior"] = 0.50
+                policy["strategy"] = "latency_beam"
+                policy["beam_width"] = 10
+                policy["state_cap_per_node"] = 48
+                policy["boundary_state_cap"] = 12
+                policy["max_scale_candidates"] = 80
+                policy["boundary_scale_policy"] = "frontier"
+                policy["scale_lattice"] = "waterline_sf"
+                policy["bootstrap_anchor_selector"] = "reference_bootstrap_locations"
+                policy["force_bootstrap_anchors"] = False
+                policy["bootstrap_penalty"] = 30_000_000.0
                 policy["selection_bootstrap_penalty"] = 0.0
                 policy["selection_objective"] = "cost"
             elif name == "profile_waterline_repair":
@@ -881,6 +1033,10 @@ def place(context):
         policy["mcts_action_allowlist"] = [
             "budget_fulfillment_beam",
             "wide_boundary_cost_beam",
+            "waterline_cost_beam",
+            "dense_boundary_cost_beam",
+            "nonlinear_phase_boundary_beam",
+            *reference_action_names,
             "profile_waterline_repair",
             "tuneinsight_avgcase_cost_beam",
             "tuneinsight_deferred_bootstrap_beam",
@@ -917,6 +1073,59 @@ def place(context):
                     "selection_bootstrap_penalty": 0.0,
                     "selection_objective": "cost",
                 },
+            },
+            dense_boundary_cost_beam={
+                "prior": 0.40,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 16,
+                    "max_scale_candidates": 96,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "dense",
+                    "bootstrap_penalty": 25_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            },
+            nonlinear_phase_boundary_beam={
+                "prior": 0.44,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                    "bootstrap_anchor_count": 64,
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 35_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            },
+            **{
+                name: {
+                    "prior": 0.50,
+                    "policy": {
+                        "strategy": "latency_beam",
+                        "beam_width": 10,
+                        "state_cap_per_node": 48,
+                        "boundary_state_cap": 12,
+                        "max_scale_candidates": 80,
+                        "boundary_scale_policy": "frontier",
+                        "scale_lattice": "waterline_sf",
+                        "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                        "force_bootstrap_anchors": False,
+                        "bootstrap_penalty": 30_000_000.0,
+                        "selection_bootstrap_penalty": 0.0,
+                        "selection_objective": "cost",
+                    },
+                }
+                for name in reference_action_names
             },
             profile_waterline_repair={
                 "prior": 0.24,
@@ -1041,12 +1250,76 @@ def evaluate(program_path):
 
 
 def _compile_evaluator_source(context_path: Path) -> str:
-    return f'''from openevolve.evaluation_result import EvaluationResult
-from scripts.optimizer.orbit.openevolve_backend import evaluate_compile_candidate_program
+    return f'''import json
+import multiprocessing as _multiprocessing
+import os as _os
+import queue as _queue
+import signal as _signal
+import traceback
+from pathlib import Path
+
+from openevolve.evaluation_result import EvaluationResult
+from scripts.optimizer.orbit.openevolve_backend import (
+    _invalid_compile_result,
+    evaluate_compile_candidate_program,
+)
+
+
+def _evaluate_child(context_path, program_path, result_queue):
+    try:
+        _os.setsid()
+    except Exception:
+        pass
+    try:
+        result = evaluate_compile_candidate_program(context_path, program_path)
+    except BaseException as exc:
+        result = _invalid_compile_result(
+            "compile_evaluator_exception",
+            [f"{{type(exc).__name__}}: {{str(exc)[:240]}}"],
+        )
+        result.setdefault("artifacts", {{}})["traceback"] = traceback.format_exc()[-4000:]
+    result_queue.put(result)
 
 
 def evaluate(program_path):
-    result = evaluate_compile_candidate_program({str(context_path)!r}, program_path)
+    timeout = 180
+    try:
+        context = json.loads(Path({str(context_path)!r}).read_text(encoding="utf-8"))
+        timeout = int(context.get("params", {{}}).get("openevolve_evaluator_timeout_sec", timeout))
+    except Exception:
+        timeout = 180
+    ctx = _multiprocessing.get_context("fork")
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_evaluate_child,
+        args=({str(context_path)!r}, str(program_path), result_queue),
+    )
+    proc.start()
+    proc.join(max(1, timeout))
+    if proc.is_alive():
+        try:
+            _os.killpg(proc.pid, _signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            try:
+                _os.killpg(proc.pid, _signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.join(5)
+        result = _invalid_compile_result(
+            "compile_evaluator_timeout",
+            [f"candidate exceeded evaluator timeout {{timeout}}s"],
+        )
+    else:
+        try:
+            result = result_queue.get_nowait()
+        except _queue.Empty:
+            result = _invalid_compile_result(
+                "compile_evaluator_no_result",
+                [f"candidate evaluator exited with code {{proc.exitcode}} and produced no result"],
+            )
     return EvaluationResult(metrics=result["metrics"], artifacts=result["artifacts"])
 '''
 
@@ -1126,6 +1399,9 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "openevolve_reference_json": params.openevolve_reference_json,
             "openevolve_finalists": params.openevolve_finalists,
             "openevolve_parallel_evaluations": params.openevolve_parallel_evaluations,
+            "openevolve_evaluator_timeout_sec": getattr(
+                params, "openevolve_evaluator_timeout_sec", 180
+            ),
             "openevolve_budget_aggressive": getattr(params, "openevolve_budget_aggressive", True),
             "openevolve_target_bootstrap_count": getattr(params, "openevolve_target_bootstrap_count", 0),
             "noise_estimator": params.noise_estimator,
@@ -1352,7 +1628,8 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         _merge_cached_compile_context(context, cached_context, params)
     else:
         print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
-        reference = _evaluate_compile_hints(context, initial_hints, suppress_output=True)
+        context_collection_hints = _context_collection_seed_hints(initial_hints, params)
+        reference = _evaluate_compile_hints(context, context_collection_hints, suppress_output=True)
         context["reference"] = {
             "final_latency_usec": reference.get("final_latency_usec"),
             "objective_cost_usec": reference.get(
@@ -1365,8 +1642,10 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             "valid": reference.get("valid", False),
             "effective_qbp_digest": _effective_qbp_digest(reference.get("diagnostics", {})),
             "selected_path_digest": _selected_path_digest(reference, reference.get("diagnostics", {})),
-            "source": "initial_seed",
-            "policy_summary": _compact_policy_summary(initial_hints),
+            "source": "context_collection_seed"
+            if context_collection_hints is not initial_hints
+            else "initial_seed",
+            "policy_summary": _compact_policy_summary(context_collection_hints),
         }
         context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
         if reference.get("sampled_budget_tasks"):
@@ -1377,9 +1656,11 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                     _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
                     suppress_output=True,
                 )
-                context.setdefault("harness", {})["sampled_seed_baseline"] = _placement_baseline_from_result(
-                    sampled_reference
-                )
+                sampled_baseline = _placement_baseline_from_result(sampled_reference)
+                sampled_baseline["source"] = "sampled_initial_seed"
+                sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
+                context.setdefault("harness", {})["sampled_seed_baseline"] = sampled_baseline
+                context["reference"] = dict(sampled_baseline)
         context["placement_profile"] = reference.get("bottleneck_summary", [])
         print(
             "OpenEvolve compile harness: seed baseline "
@@ -1408,6 +1689,9 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
             "Policy-bank latency-improved OpenEvolve initial program.",
         )
         context.setdefault("harness", {})["initial_policy_source"] = "policy_bank"
+    context.setdefault("harness", {})["initial_policy_hints"] = _jsonable_policy_hints(
+        initial_hints
+    )
     context.setdefault("harness", {})["candidate_examples"] = policy_bank.get("examples", [])
     context.setdefault("harness", {})["policy_bank_summary"] = policy_bank.get("summary", {})
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1492,17 +1776,13 @@ def _run_compile_policy_bank_prepass(
     output_dir: Path,
     params: Params,
 ) -> dict[str, Any]:
-    if os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    policy_bank_toggle = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK", "").strip().lower()
+    if policy_bank_toggle in {"0", "false", "no", "off"}:
         return {
             "examples": [],
             "summary": {
                 "enabled": False,
-                "reason": "disabled_by_default_for_positive_evolution",
+                "reason": "disabled_by_environment",
             },
             "initial_hints": None,
         }
@@ -1516,6 +1796,13 @@ def _run_compile_policy_bank_prepass(
     bank_dir = output_dir / "policy_bank"
     bank_dir.mkdir(parents=True, exist_ok=True)
     variants = _compile_policy_bank_variants(initial_hints, context, params)
+    max_variants_raw = os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_MAX", "").strip()
+    if max_variants_raw:
+        try:
+            max_variants = max(1, int(max_variants_raw))
+            variants = variants[:max_variants]
+        except ValueError:
+            pass
     records: list[dict[str, Any]] = []
     best_improved: tuple[float, dict[str, Any], dict[str, Any]] | None = None
     print(
@@ -1524,7 +1811,13 @@ def _run_compile_policy_bank_prepass(
     )
     for idx, (label, hints) in enumerate(variants):
         eval_hints = dict(hints)
-        eval_hints["policy_bank_lightweight"] = True
+        if os.environ.get("ORBIT_OPENEVOLVE_POLICY_BANK_LIGHTWEIGHT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            eval_hints["policy_bank_lightweight"] = True
         program_path = bank_dir / f"{idx:02d}_{_safe_filename(label)}.py"
         program_path.write_text(
             _program_source_from_hints(eval_hints, f"Policy-bank candidate {label}."),
@@ -1610,11 +1903,13 @@ def _compile_policy_bank_variants(
         label: str,
         updates: dict[str, Any],
         preset_updates: dict[str, dict[str, Any]] | None = None,
+        *,
+        replace_presets: bool = False,
     ) -> None:
         hints = deepcopy(initial_hints)
         hints.update(updates)
         if preset_updates:
-            presets = deepcopy(hints.get("mcts_action_presets", {}))
+            presets = {} if replace_presets else deepcopy(hints.get("mcts_action_presets", {}))
             for name, patch in preset_updates.items():
                 base = deepcopy(presets.get(name, {}))
                 base_policy = deepcopy(base.get("policy", {}))
@@ -1625,6 +1920,195 @@ def _compile_policy_bank_variants(
                 presets[name] = base
             hints["mcts_action_presets"] = presets
         variants.append((label, hints))
+
+    waterline_direct_policy = {
+        "selection_objective": "cost",
+        "bootstrap_penalty": 25_000_000.0,
+        "max_scale_candidates": 32,
+        "boundary_scale_policy": "waterline",
+    }
+    waterline_direct_actions = [
+        action
+        for action in candidate_actions(context, action_cap=12)
+        if str(action.get("name", "")) != "reference_boundary_cost_beam"
+    ][:10]
+    add(
+        "waterline_direct_cost_compact",
+        {
+            **waterline_direct_policy,
+            "boundary_scale_policy": "waterline",
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 8,
+            "max_scale_candidates": 32,
+            "state_cap_per_node": 40,
+            "beam_width": 12,
+            "selection_bootstrap_penalty": 0.0,
+            "mcts_action_cap": 10,
+            "mcts_rollout_budget": 16,
+            "mcts_exploration_weight": 1.25,
+            "mcts_max_repair_bootstraps": 128,
+            "mcts_actions": waterline_direct_actions,
+            "mcts_action_allowlist": [
+                "budget_fulfillment_beam",
+                "dense_boundary_cost_beam",
+                "nonlinear_phase_boundary_beam",
+                "wide_boundary_cost_beam",
+                "latency_mcts_repair",
+            ],
+        },
+        {
+            "budget_fulfillment_beam": {
+                "prior": 0.60,
+                "policy": {**waterline_direct_policy, "beam_width": 12},
+            },
+            "dense_boundary_cost_beam": {
+                "prior": 0.50,
+                "policy": {**waterline_direct_policy, "strategy": "latency_beam", "beam_width": 12},
+            },
+            "nonlinear_phase_boundary_beam": {
+                "prior": 0.50,
+                "policy": {**waterline_direct_policy, "strategy": "latency_beam", "beam_width": 12},
+            },
+            "wide_boundary_cost_beam": {
+                "prior": 0.40,
+                "policy": {**waterline_direct_policy, "beam_width": 10},
+            },
+        },
+        replace_presets=True,
+    )
+    latency_beam_base = {
+        "strategy": "latency_beam",
+        "prefer_level_preservation": True,
+        "allow_bootstrap": True,
+        "allow_seed_fallback": False,
+        "refresh_fanout_at_level_floor": True,
+        "max_scale_candidates": 48,
+        "bootstrap_penalty": 25_000_000.0,
+        "rescale_penalty": 0.0,
+        "level_drop_penalty": 20_000_000.0,
+        "selection_objective": "cost",
+        "beam_width": 10,
+        "state_cap_per_node": 32,
+        "boundary_state_cap": 8,
+        "target_bootstrap_count": 0,
+        "direct_budget_policy": True,
+    }
+    latency_beam_actions = [
+        {
+            "name": "budget_fulfillment_beam",
+            "prior": 0.60,
+            "policy": {**latency_beam_base, "boundary_scale_policy": "waterline"},
+        },
+        {
+            "name": "wide_boundary_cost_beam",
+            "prior": 0.40,
+            "policy": {**latency_beam_base, "boundary_scale_policy": "frontier"},
+        },
+        {
+            "name": "dense_boundary_cost_beam",
+            "prior": 0.50,
+            "policy": {
+                **latency_beam_base,
+                "scale_lattice": "dense",
+                "boundary_state_cap": 16,
+            },
+        },
+    ]
+    add(
+        "latency_beam_waterline48_compact",
+        {
+            "strategy": "bootstrap_mcts",
+            "budget_aggressive": True,
+            "mcts_rollout_budget": 16,
+            "mcts_exploration_weight": 1.25,
+            "mcts_max_repair_bootstraps": 128,
+            "mcts_action_cap": 10,
+            "mcts_prior_order": True,
+            "mcts_actions": latency_beam_actions,
+            "mcts_action_allowlist": [
+                "budget_fulfillment_beam",
+                "wide_boundary_cost_beam",
+                "dense_boundary_cost_beam",
+                "latency_mcts_repair",
+            ],
+            "boundary_scale_policy": "waterline",
+            "scale_lattice": "waterline_sf",
+            "bootstrap_penalty": 25_000_000.0,
+            "rescale_penalty": 25_000.0,
+        },
+        {
+            action["name"]: {
+                "prior": action["prior"],
+                "policy": action["policy"],
+            }
+            for action in latency_beam_actions
+        },
+        replace_presets=True,
+    )
+    for label, max_scale, boundary_cap, beam_width, bootstrap_penalty in [
+        ("waterline_direct_cost_wide48", 48, 8, 12, 25_000_000.0),
+        ("waterline_direct_cost_wide64", 64, 8, 12, 25_000_000.0),
+        ("waterline_direct_cost_deeper_boundary", 48, 12, 12, 25_000_000.0),
+        ("waterline_direct_cost_beam16", 48, 10, 16, 25_000_000.0),
+        ("waterline_direct_cost_lower_maintenance_penalty", 48, 8, 12, 10_000_000.0),
+        ("waterline_direct_cost_higher_maintenance_penalty", 48, 8, 12, 75_000_000.0),
+    ]:
+        local_policy = {
+            **waterline_direct_policy,
+            "bootstrap_penalty": float(bootstrap_penalty),
+            "max_scale_candidates": int(max_scale),
+            "boundary_scale_policy": "waterline",
+        }
+        add(
+            label,
+            {
+                **local_policy,
+                "scale_lattice": "waterline_sf",
+                "boundary_state_cap": int(boundary_cap),
+                "state_cap_per_node": 48 if boundary_cap >= 10 else 40,
+                "beam_width": int(beam_width),
+                "selection_bootstrap_penalty": 0.0,
+                "mcts_action_cap": 10,
+                "mcts_rollout_budget": 20 if beam_width >= 16 else 16,
+                "mcts_exploration_weight": 1.25,
+                "mcts_max_repair_bootstraps": 128,
+                "mcts_actions": waterline_direct_actions,
+                "mcts_action_allowlist": [
+                    "budget_fulfillment_beam",
+                    "dense_boundary_cost_beam",
+                    "nonlinear_phase_boundary_beam",
+                    "wide_boundary_cost_beam",
+                    "latency_mcts_repair",
+                ],
+            },
+            {
+                "budget_fulfillment_beam": {
+                    "prior": 0.60,
+                    "policy": {**local_policy, "beam_width": int(beam_width)},
+                },
+                "dense_boundary_cost_beam": {
+                    "prior": 0.50,
+                    "policy": {
+                        **local_policy,
+                        "strategy": "latency_beam",
+                        "beam_width": int(beam_width),
+                    },
+                },
+                "nonlinear_phase_boundary_beam": {
+                    "prior": 0.50,
+                    "policy": {
+                        **local_policy,
+                        "strategy": "latency_beam",
+                        "beam_width": int(beam_width),
+                    },
+                },
+                "wide_boundary_cost_beam": {
+                    "prior": 0.40,
+                    "policy": {**local_policy, "beam_width": max(10, int(beam_width) - 2)},
+                },
+            },
+            replace_presets=True,
+        )
 
     add(
         "frontier_wide_low_bootstrap_penalty",
@@ -1798,6 +2282,51 @@ def _compile_policy_bank_variants(
             },
         },
     )
+    add(
+        "nonlinear_phase_boundary_cost",
+        {
+            "boundary_scale_policy": "frontier",
+            "scale_lattice": "waterline_sf",
+            "boundary_state_cap": 12,
+            "max_scale_candidates": 80,
+            "state_cap_per_node": 48,
+            "beam_width": 10,
+            "mcts_action_cap": 12,
+            "mcts_rollout_budget": 24,
+            "selection_objective": "cost",
+            "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+            "bootstrap_anchor_count": 64,
+            "force_bootstrap_anchors": False,
+            "bootstrap_penalty": 35_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+        },
+        {
+            "nonlinear_phase_boundary_beam": {
+                "prior": 0.90,
+                "policy": {
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
+                    "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                    "bootstrap_anchor_count": 64,
+                    "selection_objective": "cost",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 35_000_000.0,
+                },
+            },
+            "budget_fulfillment_beam": {
+                "prior": 0.62,
+                "policy": {
+                    "boundary_scale_policy": "frontier",
+                    "boundary_state_cap": 10,
+                    "max_scale_candidates": 72,
+                    "selection_objective": "cost",
+                    "bootstrap_penalty": 45_000_000.0,
+                },
+            },
+        },
+    )
     for floor in scale_candidates:
         if int(floor) >= waterline:
             continue
@@ -1881,7 +2410,7 @@ def _compile_policy_bank_variants(
                     },
                 },
             )
-    return variants[:10]
+    return variants[:12]
 
 
 def _policy_bank_record(
@@ -2936,7 +3465,14 @@ def _sampled_compile_boundary_group_limit(params: Params) -> int:
     hint = int(getattr(params, "openevolve_max_unit_samples", 64) or 64)
     if getattr(params, "openevolve_eval_suite", "polybert-sampled") == "toy":
         return max(1, min(4, hint))
-    return max(4, min(12, hint))
+    parallel = max(1, int(getattr(params, "openevolve_parallel_evaluations", 1) or 1))
+    if parallel >= 8:
+        cap = 32
+    elif parallel >= 4:
+        cap = 24
+    else:
+        cap = 16
+    return max(4, min(cap, hint))
 
 
 def _rank_sampled_boundary_group_keys(
@@ -3659,7 +4195,7 @@ def _latency_only_combined_score(
     # QBP improvements are often 1.00000x. Keep the ordering purely latency
     # based, but magnify the positive delta so small real improvements are not
     # numerically indistinguishable from the seed in MAP-Elites/selection logs.
-    return 1.0 + min(998.0, max(0.0, ratio - 1.0) * 100_000.0)
+    return 1.0 + max(0.0, ratio - 1.0) * 100_000.0
 
 
 def _execution_trace_artifact(
@@ -3758,6 +4294,9 @@ def _execution_trace_artifact(
             {"invalid_reasons": diagnostics.get("candidate_invalid_reasons", {})}
         ),
         "unsolved_boundary_groups": _boundary_group_unsolved_summary(
+            diagnostics.get("boundary_group_summaries", [])
+        ),
+        "top_costly_boundary_groups": _boundary_group_top_cost_summary(
             diagnostics.get("boundary_group_summaries", [])
         ),
         "scale_floor": scale_floor_summary,
@@ -4014,6 +4553,9 @@ _POLICY_EFFECT_KEYS = (
     "target_bootstrap_count",
     "bootstrap_anchor_count",
     "bootstrap_anchor_level",
+    "bootstrap_anchor_selector",
+    "bootstrap_anchor_include_patterns",
+    "bootstrap_anchor_exclude_patterns",
     "selection_objective",
     "prefer_component_budget_fit",
     "force_bootstrap_anchors",
@@ -4026,6 +4568,11 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
     target_bootstraps = int(context.get("harness", {}).get("target_bootstrap_count", 0) or 0)
     mcts = PlacementMCTS(context)
     actions = mcts.candidate_actions(target_bootstraps=target_bootstraps, action_cap=12)
+    reference_action_names = [
+        str(action.get("name"))
+        for action in actions
+        if str(action.get("name", "")) == "reference_boundary_cost_beam"
+    ]
     for action in actions:
         policy = action.get("policy", {})
         name = str(action.get("name", ""))
@@ -4050,6 +4597,47 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
             policy["max_scale_candidates"] = 64
             policy["boundary_scale_policy"] = "frontier"
             policy["bootstrap_penalty"] = 50_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "dense_boundary_cost_beam":
+            action["prior"] = 0.40
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 16
+            policy["max_scale_candidates"] = 96
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "dense"
+            policy["bootstrap_penalty"] = 25_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "nonlinear_phase_boundary_beam":
+            action["prior"] = 0.44
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 12
+            policy["max_scale_candidates"] = 80
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "waterline_sf"
+            policy["bootstrap_anchor_selector"] = "nonlinear_phase_boundaries"
+            policy["bootstrap_anchor_count"] = 64
+            policy["force_bootstrap_anchors"] = False
+            policy["bootstrap_penalty"] = 35_000_000.0
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
+        elif name == "reference_boundary_cost_beam":
+            action["prior"] = 0.50
+            policy["strategy"] = "latency_beam"
+            policy["beam_width"] = 10
+            policy["state_cap_per_node"] = 48
+            policy["boundary_state_cap"] = 12
+            policy["max_scale_candidates"] = 80
+            policy["boundary_scale_policy"] = "frontier"
+            policy["scale_lattice"] = "waterline_sf"
+            policy["bootstrap_anchor_selector"] = "reference_bootstrap_locations"
+            policy["force_bootstrap_anchors"] = False
+            policy["bootstrap_penalty"] = 30_000_000.0
             policy["selection_bootstrap_penalty"] = 0.0
             policy["selection_objective"] = "cost"
         elif name == "profile_waterline_repair":
@@ -4136,6 +4724,10 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
     policy["mcts_action_allowlist"] = [
         "budget_fulfillment_beam",
         "wide_boundary_cost_beam",
+        "waterline_cost_beam",
+        "dense_boundary_cost_beam",
+        "nonlinear_phase_boundary_beam",
+        *reference_action_names,
         "profile_waterline_repair",
         "tuneinsight_avgcase_cost_beam",
         "tuneinsight_deferred_bootstrap_beam",
@@ -4173,6 +4765,59 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
                 "selection_bootstrap_penalty": 0.0,
                 "selection_objective": "cost",
             },
+        },
+        dense_boundary_cost_beam={
+            "prior": 0.40,
+            "policy": {
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 16,
+                "max_scale_candidates": 96,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "dense",
+                "bootstrap_penalty": 25_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        nonlinear_phase_boundary_beam={
+            "prior": 0.44,
+            "policy": {
+                "strategy": "latency_beam",
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                "bootstrap_anchor_count": 64,
+                "force_bootstrap_anchors": False,
+                "bootstrap_penalty": 35_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        **{
+            name: {
+                "prior": 0.50,
+                "policy": {
+                    "strategy": "latency_beam",
+                    "beam_width": 10,
+                    "state_cap_per_node": 48,
+                    "boundary_state_cap": 12,
+                    "max_scale_candidates": 80,
+                    "boundary_scale_policy": "frontier",
+                    "scale_lattice": "waterline_sf",
+                    "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                    "force_bootstrap_anchors": False,
+                    "bootstrap_penalty": 30_000_000.0,
+                    "selection_bootstrap_penalty": 0.0,
+                    "selection_objective": "cost",
+                },
+            }
+            for name in reference_action_names
         },
         profile_waterline_repair={
             "prior": 0.24,
@@ -4639,30 +5284,30 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
     bounded["allow_bootstrap"] = _bool_hint(bounded.get("allow_bootstrap"), budget_aggressive)
     bounded["refresh_fanout_at_level_floor"] = True
     bounded["max_scale_candidates"] = min(
-        16 if policy_bank_lightweight else (32 if (budget_aggressive or mcts_broad) else 16),
+        16 if policy_bank_lightweight else (96 if (budget_aggressive or mcts_broad) else 16),
         _int_hint(
             bounded.get("max_scale_candidates"),
             16
             if policy_bank_lightweight
-            else (32 if mcts_broad else (20 if budget_aggressive else 16)),
+            else (64 if mcts_broad else (48 if budget_aggressive else 16)),
         ),
     )
     bounded["state_cap_per_node"] = min(
-        8 if policy_bank_lightweight else (24 if (budget_aggressive or mcts_broad) else 8),
+        8 if policy_bank_lightweight else (48 if (budget_aggressive or mcts_broad) else 8),
         _int_hint(
             bounded.get("state_cap_per_node"),
             8
             if policy_bank_lightweight
-            else (24 if mcts_broad else (12 if budget_aggressive else 8)),
+            else (32 if mcts_broad else (24 if budget_aggressive else 8)),
         ),
     )
     bounded["beam_width"] = min(
-        4 if policy_bank_lightweight else (8 if (budget_aggressive or mcts_broad) else 4),
+        4 if policy_bank_lightweight else (12 if (budget_aggressive or mcts_broad) else 4),
         _int_hint(
             bounded.get("beam_width"),
             4
             if policy_bank_lightweight
-            else (8 if mcts_broad else (5 if budget_aggressive else 4)),
+            else (10 if mcts_broad else (8 if budget_aggressive else 4)),
         ),
     )
     if str(bounded.get("strategy")) == "bootstrap_mcts":
@@ -4671,31 +5316,31 @@ def _bounded_sampled_policy(hints: dict[str, Any]) -> dict[str, Any]:
                 bounded.get("mcts_actions")
             )
         bounded["mcts_rollout_budget"] = min(
-            4 if policy_bank_lightweight else (12 if budget_aggressive else 8),
+            4 if policy_bank_lightweight else (24 if budget_aggressive else 8),
             _int_hint(
                 bounded.get("mcts_rollout_budget"),
-                4 if policy_bank_lightweight else (12 if budget_aggressive else 8),
+                4 if policy_bank_lightweight else (24 if budget_aggressive else 8),
             ),
         )
         bounded["mcts_action_cap"] = min(
-            2 if policy_bank_lightweight else (10 if budget_aggressive else 6),
+            2 if policy_bank_lightweight else (12 if budget_aggressive else 6),
             _int_hint(
                 bounded.get("mcts_action_cap"),
-                2 if policy_bank_lightweight else (10 if budget_aggressive else 6),
+                2 if policy_bank_lightweight else (12 if budget_aggressive else 6),
             ),
         )
         bounded["mcts_max_repair_bootstraps"] = min(
-            4 if policy_bank_lightweight else (64 if budget_aggressive else 16),
+            4 if policy_bank_lightweight else (128 if budget_aggressive else 16),
             _int_hint(
                 bounded.get("mcts_max_repair_bootstraps"),
-                4 if policy_bank_lightweight else (64 if budget_aggressive else 16),
+                4 if policy_bank_lightweight else (128 if budget_aggressive else 16),
             ),
         )
         bounded["boundary_state_cap"] = min(
-            2 if policy_bank_lightweight else (8 if budget_aggressive else 6),
+            2 if policy_bank_lightweight else (16 if budget_aggressive else 8),
             _int_hint(
                 bounded.get("boundary_state_cap"),
-                2 if policy_bank_lightweight else (8 if budget_aggressive else 6),
+                2 if policy_bank_lightweight else (12 if budget_aggressive else 6),
             ),
         )
     if isinstance(portfolio, list) and portfolio:
@@ -4732,6 +5377,10 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
             if (
                 str(item.get("name", "")) == "budget_fulfillment_beam"
                 or str(item.get("name", "")) == "wide_boundary_cost_beam"
+                or str(item.get("name", "")) == "waterline_cost_beam"
+                or str(item.get("name", "")) == "dense_boundary_cost_beam"
+                or str(item.get("name", "")) == "nonlinear_phase_boundary_beam"
+                or str(item.get("name", "")) == "reference_boundary_cost_beam"
                 or str(item.get("name", "")) == "profile_waterline_repair"
                 or str(item.get("name", "")) == "tuneinsight_avgcase_cost_beam"
                 or str(item.get("name", "")) == "tuneinsight_deferred_bootstrap_beam"
@@ -4741,17 +5390,37 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
             ):
                 cheap = dict(item)
                 cheap_policy = dict(policy)
-                cheap_policy["beam_width"] = min(5, _int_hint(cheap_policy.get("beam_width"), 5))
+                dense_boundary = str(item.get("name", "")) == "dense_boundary_cost_beam"
+                phase_boundary = str(item.get("name", "")) == "nonlinear_phase_boundary_beam"
+                reference_boundary = str(item.get("name", "")) == "reference_boundary_cost_beam"
+                waterline_cost = str(item.get("name", "")) == "waterline_cost_beam"
+                cheap_policy["beam_width"] = min(
+                    10 if dense_boundary or phase_boundary or reference_boundary else 8 if waterline_cost else 5,
+                    _int_hint(
+                        cheap_policy.get("beam_width"),
+                        10 if dense_boundary or phase_boundary or reference_boundary else 8 if waterline_cost else 5,
+                    ),
+                )
                 cheap_policy["state_cap_per_node"] = min(
-                    16, _int_hint(cheap_policy.get("state_cap_per_node"), 16)
+                    48 if dense_boundary or phase_boundary or reference_boundary else 32 if waterline_cost else 16,
+                    _int_hint(
+                        cheap_policy.get("state_cap_per_node"),
+                        48 if dense_boundary or phase_boundary or reference_boundary else 32 if waterline_cost else 16,
+                    ),
                 )
                 cheap_policy["max_scale_candidates"] = min(
-                    32,
-                    _int_hint(cheap_policy.get("max_scale_candidates"), 32),
+                    96 if dense_boundary else 80 if phase_boundary or reference_boundary else 48 if waterline_cost else 32,
+                    _int_hint(
+                        cheap_policy.get("max_scale_candidates"),
+                        96 if dense_boundary else 80 if phase_boundary or reference_boundary else 48 if waterline_cost else 32,
+                    ),
                 )
                 cheap_policy["boundary_state_cap"] = min(
-                    6,
-                    _int_hint(cheap_policy.get("boundary_state_cap"), 6),
+                    16 if dense_boundary else 12 if phase_boundary or reference_boundary else 8 if waterline_cost else 6,
+                    _int_hint(
+                        cheap_policy.get("boundary_state_cap"),
+                        16 if dense_boundary else 12 if phase_boundary or reference_boundary else 8 if waterline_cost else 6,
+                    ),
                 )
                 cheap_policy["bootstrap_penalty"] = max(
                     0.0 if _selection_objective(cheap_policy) == "cost" else 750_000_000.0,
@@ -4804,25 +5473,33 @@ def _sampled_lightweight_mcts_actions(raw_actions: Any) -> list[dict[str, Any]] 
                 return (0, original_order[id(item)])
             if name == "wide_boundary_cost_beam":
                 return (1, original_order[id(item)])
-            if name == "profile_waterline_repair":
+            if name == "waterline_cost_beam":
                 return (2, original_order[id(item)])
-            if name == "tuneinsight_avgcase_cost_beam":
+            if name == "dense_boundary_cost_beam":
                 return (3, original_order[id(item)])
-            if name == "tuneinsight_deferred_bootstrap_beam":
+            if name == "nonlinear_phase_boundary_beam":
+                return (3, original_order[id(item)])
+            if name == "reference_boundary_cost_beam":
+                return (3, original_order[id(item)])
+            if name == "profile_waterline_repair":
                 return (4, original_order[id(item)])
-            if name.startswith("estimator_relaxed_floor_"):
+            if name == "tuneinsight_avgcase_cost_beam":
                 return (5, original_order[id(item)])
-            if name == "latency_mcts_repair":
+            if name == "tuneinsight_deferred_bootstrap_beam":
                 return (6, original_order[id(item)])
-            if name == "component_budget_repair":
+            if name.startswith("estimator_relaxed_floor_"):
                 return (7, original_order[id(item)])
-            if name == "waterline_budget_repair":
+            if name == "latency_mcts_repair":
                 return (8, original_order[id(item)])
-            if name == "minimal_bootstrap_repair":
+            if name == "component_budget_repair":
                 return (9, original_order[id(item)])
-            if name == "strict_no_bootstrap" or _bool_hint(policy.get("forbid_bootstrap"), False):
+            if name == "waterline_budget_repair":
                 return (10, original_order[id(item)])
-            return (11, original_order[id(item)])
+            if name == "minimal_bootstrap_repair":
+                return (11, original_order[id(item)])
+            if name == "strict_no_bootstrap" or _bool_hint(policy.get("forbid_bootstrap"), False):
+                return (12, original_order[id(item)])
+            return (13, original_order[id(item)])
 
         filtered.sort(key=sampled_action_rank)
     return filtered or raw_actions
@@ -4994,7 +5671,16 @@ def _run_full_bundle_finalists(
     full_context.setdefault("harness", {})["eval_suite"] = "polybert-full"
     reference_hints = _finalist_hints_for_full_bundle(initial_hints or {})
     sampled_reference = sampled_context.get("reference")
-    if isinstance(sampled_reference, dict) and sampled_reference:
+    sampled_reference_source = (
+        str(sampled_reference.get("source", ""))
+        if isinstance(sampled_reference, dict)
+        else ""
+    )
+    if (
+        isinstance(sampled_reference, dict)
+        and sampled_reference
+        and sampled_reference_source not in {"sampled_initial_seed", "context_collection_seed"}
+    ):
         full_context["reference"] = {
             "final_latency_usec": sampled_reference.get("final_latency_usec"),
             "objective_cost_usec": sampled_reference.get(
@@ -5564,6 +6250,51 @@ def _run_full_bundle_finalists(
         },
     )
     return best[16]
+
+
+def _context_collection_seed_hints(
+    initial_hints: dict[str, Any], params: Params
+) -> dict[str, Any]:
+    """Use a cheap QBP-shaped replay to discover sampled boundary groups.
+
+    Positive bootstrap-MCTS runs evolve a broad action policy. Replaying that
+    broad policy over the whole graph just to discover sampled boundary groups
+    is expensive and can dominate short OpenEvolve runs. A plain deterministic
+    smoke policy is too narrow, though: it can collapse the cached context to a
+    single boundary group and leave OpenEvolve with no useful placement surface.
+    Collect tasks with a lightweight bootstrap-MCTS policy so the cached sample
+    still has Orbit-shaped boundary groups, then evaluate the actual seed on
+    those cached tasks.
+    """
+
+    if (
+        getattr(params, "openevolve_search_mode", "") == "bootstrap-mcts"
+        and getattr(params, "openevolve_eval_suite", "polybert-sampled") != "polybert-full"
+    ):
+        hints = _bootstrap_mcts_seed_policy(params)
+        hints.update(
+            {
+                "context_collection_seed": True,
+                "policy_bank_lightweight": True,
+                "budget_aggressive": True,
+                "allow_seed_fallback": True,
+                "allow_bootstrap": True,
+                "include_seed_repair_actions": False,
+                "mcts_rollout_budget": 4,
+                "mcts_action_cap": 2,
+                "mcts_max_repair_bootstraps": 4,
+                "boundary_state_cap": 2,
+                "max_scale_candidates": 16,
+                "state_cap_per_node": 8,
+                "beam_width": 4,
+                "mcts_action_allowlist": [
+                    "budget_fulfillment_beam",
+                    "wide_boundary_cost_beam",
+                ],
+            }
+        )
+        return hints
+    return initial_hints
 
 
 def _bounded_fail_open_hints(initial_hints: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -7923,7 +8654,7 @@ def _boundary_policy_variants(
     state_cap = max(
         1,
         min(
-            8,
+            16,
             _int_hint(base.get("state_cap_per_node"), 8),
             _int_hint(base.get("boundary_state_cap"), 3),
         ),
@@ -8010,6 +8741,24 @@ def _bootstrap_anchor_nodes(
     count = max(0, min(64, _int_hint(policy.get("bootstrap_anchor_count"), 0)))
     if count == 0:
         return []
+    selector = str(policy.get("bootstrap_anchor_selector", "")).strip().lower()
+    if selector in {
+        "nonlinear_phase_boundaries",
+        "nonlinear_phase_boundary",
+        "phase_boundaries",
+        "phase_boundary",
+    }:
+        anchors = _nonlinear_phase_boundary_anchor_nodes(tdag, count, policy)
+        if anchors:
+            return anchors
+    if selector in {
+        "reference_bootstrap_locations",
+        "reference_bootstrap_location",
+        "reference_locations",
+    }:
+        anchors = _reference_bootstrap_anchor_nodes(tdag, count, policy)
+        if anchors:
+            return anchors
     depths = _node_depths(tdag)
     component_targets = _policy_unit_bootstrap_targets(policy)
     if not component_targets:
@@ -8031,6 +8780,135 @@ def _bootstrap_anchor_nodes(
         if tdag.nodes[node].get("op") not in {"input", "constant"}
     ]
     return sorted(candidates, key=rank)[:count]
+
+
+_NONLINEAR_PHASE_INCLUDE_PATTERNS: tuple[tuple[str, int], ...] = (
+    ("layernorm_avg_res_by", 110),
+    ("layernorm_avg_res", 108),
+    ("inv_sqrt_seed", 106),
+    ("inv_sqrt_newton_update", 104),
+    ("layernorm_centered_sigma", 102),
+    ("qk_numerator_sum", 98),
+    ("qk_row_sum_add", 96),
+    ("approx_exp_rescale", 94),
+    ("reciprocal_newton_update", 92),
+    ("attention_value_combined_output", 88),
+    ("attention_value_matmul_output", 86),
+    ("split_output_bias_add", 82),
+    ("pooler_dense", 78),
+)
+
+
+_NONLINEAR_PHASE_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    "variance_residual",
+    "approx_exp_square",
+    "newton_xy",
+    "newton_yx",
+    "newton_yyx",
+    "y_square",
+    "output_rescale",
+    "denominator_rescale",
+    "numerator_rescale",
+    "softmax_mul",
+    "packed_ctpt_linear_rescale",
+    "residual_add",
+)
+
+
+def _string_list_hint(value: Any, limit: int = 32) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        return []
+    result: list[str] = []
+    for item in raw_items[:limit]:
+        text = str(item).strip().lower()
+        if text:
+            result.append(text)
+    return result
+
+
+def _phase_boundary_score(attrs: dict[str, Any], policy: dict[str, Any]) -> int | None:
+    text = f"{_node_scope(attrs)};{_node_op_tag(attrs)};{attrs.get('comment', '')}".lower()
+    excludes = list(_NONLINEAR_PHASE_EXCLUDE_PATTERNS)
+    excludes.extend(_string_list_hint(policy.get("bootstrap_anchor_exclude_patterns")))
+    if any(pattern and pattern in text for pattern in excludes):
+        return None
+
+    includes = list(_NONLINEAR_PHASE_INCLUDE_PATTERNS)
+    includes.extend(
+        (pattern, 72)
+        for pattern in _string_list_hint(policy.get("bootstrap_anchor_include_patterns"))
+    )
+    best = max((weight for pattern, weight in includes if pattern in text), default=0)
+    nonlinear_kind = _node_nonlinear_kind(attrs)
+    if nonlinear_kind == "attention_softmax" and ("sum" in text or "rescale" in text):
+        best = max(best, 70)
+    if nonlinear_kind == "reciprocal" and ("seed" in text or "update" in text):
+        best = max(best, 68)
+    if nonlinear_kind == "norm" and ("avg" in text or "sigma" in text or "inv_sqrt" in text):
+        best = max(best, 66)
+    if "attention_value" in text and ("output" in text or "matmul" in text):
+        best = max(best, 64)
+    if ("bias_add" in text or "dense" in text) and ("output" in text or "pooler" in text):
+        best = max(best, 58)
+    return best or None
+
+
+def _nonlinear_phase_boundary_anchor_nodes(
+    tdag: Tdag,
+    count: int,
+    policy: dict[str, Any],
+) -> list[str]:
+    depths = _node_depths(tdag)
+
+    def rank(node: str) -> tuple[int, int, int, str]:
+        attrs = dict(tdag.nodes[node])
+        score = _phase_boundary_score(attrs, policy) or 0
+        fanout = int(tdag.out_degree(node))
+        return (-score, -fanout, -depths.get(str(node), 0), str(node))
+
+    candidates = [
+        str(node)
+        for node in tdag.nodes
+        if tdag.nodes[node].get("op") not in {"input", "constant"}
+        and _phase_boundary_score(dict(tdag.nodes[node]), policy) is not None
+    ]
+    return sorted(candidates, key=rank)[: max(0, min(count, 64))]
+
+
+def _reference_bootstrap_anchor_nodes(
+    tdag: Tdag,
+    count: int,
+    policy: dict[str, Any],
+) -> list[str]:
+    patterns = _string_list_hint(policy.get("bootstrap_anchor_include_patterns"), limit=64)
+    if not patterns:
+        return []
+    depths = _node_depths(tdag)
+
+    def pattern_score(attrs: dict[str, Any]) -> int | None:
+        text = f"{_node_location(attrs)};{_node_scope(attrs)};{_node_op_tag(attrs)};{attrs.get('comment', '')}".lower()
+        for idx, pattern in enumerate(patterns):
+            if pattern and pattern in text:
+                return 1000 - idx
+        return None
+
+    def rank(node: str) -> tuple[int, int, int, str]:
+        attrs = dict(tdag.nodes[node])
+        score = pattern_score(attrs) or 0
+        fanout = int(tdag.out_degree(node))
+        return (-score, -fanout, -depths.get(str(node), 0), str(node))
+
+    candidates = [
+        str(node)
+        for node in tdag.nodes
+        if tdag.nodes[node].get("op") not in {"input", "constant"}
+        and pattern_score(dict(tdag.nodes[node])) is not None
+    ]
+    return sorted(candidates, key=rank)[: max(0, min(count, 64))]
 
 
 def _policy_unit_bootstrap_targets(policy: dict[str, Any]) -> dict[str, int]:
@@ -8234,6 +9112,9 @@ def _apply_mcts_action_presets(
                     "boundary_state_cap",
                     "bootstrap_anchor_count",
                     "bootstrap_anchor_level",
+                    "bootstrap_anchor_selector",
+                    "bootstrap_anchor_include_patterns",
+                    "bootstrap_anchor_exclude_patterns",
                     "force_bootstrap_anchors",
                     "component_bootstrap_budgets",
                     "unit_bootstrap_budgets",
@@ -8291,7 +9172,7 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "level_drop_penalty": max(0.0, _float_hint(base.get("level_drop_penalty"), 0.0)),
             "scale_lattice": str(base.get("scale_lattice", "waterline_sf")),
             "boundary_scale_policy": str(base.get("boundary_scale_policy", "frontier")),
-            "boundary_state_cap": max(1, min(8, _int_hint(base.get("boundary_state_cap"), 3))),
+            "boundary_state_cap": max(1, min(16, _int_hint(base.get("boundary_state_cap"), 3))),
             "bootstrap_anchor_count": max(0, _int_hint(base.get("bootstrap_anchor_count"), 0)),
         }
     )
@@ -8382,6 +9263,45 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "selection_objective": "cost",
             },
             0.36,
+        ),
+        (
+            "dense_boundary_cost_beam",
+            {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 16,
+                "max_scale_candidates": 96,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "dense",
+                "bootstrap_penalty": 25_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+            0.40,
+        ),
+        (
+            "nonlinear_phase_boundary_beam",
+            {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                "bootstrap_anchor_count": 64,
+                "force_bootstrap_anchors": False,
+                "bootstrap_penalty": 35_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+            0.44,
         ),
         (
             "profile_waterline_repair",
@@ -8820,6 +9740,7 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
         policy["mcts_action_allowlist"] = [
             "budget_fulfillment_beam",
             "wide_boundary_cost_beam",
+            "waterline_cost_beam",
             "profile_waterline_repair",
             "tuneinsight_avgcase_cost_beam",
             "tuneinsight_deferred_bootstrap_beam",
@@ -8954,7 +9875,7 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
         "refresh_fanout_at_level_floor": _bool_hint(
             hints.get("refresh_fanout_at_level_floor"), False
         ),
-        "max_scale_candidates": max(3, min(64, _int_hint(hints.get("max_scale_candidates"), 32))),
+        "max_scale_candidates": max(3, min(128, _int_hint(hints.get("max_scale_candidates"), 32))),
         "bootstrap_penalty": max(0.0, _float_hint(hints.get("bootstrap_penalty"), 1_000_000_000.0)),
         "rescale_penalty": max(0.0, _float_hint(hints.get("rescale_penalty"), 0.0)),
         "level_drop_penalty": max(0.0, _float_hint(hints.get("level_drop_penalty"), 20_000_000.0)),
@@ -8970,8 +9891,8 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             0,
             min(params.Sf * max(1, params.lvl_ub), _int_hint(hints.get("min_decryptability_reserve"), 0)),
         ),
-        "beam_width": max(1, min(8, _int_hint(hints.get("beam_width"), 4))),
-        "state_cap_per_node": max(1, min(32, _int_hint(hints.get("state_cap_per_node"), 8))),
+        "beam_width": max(1, min(12, _int_hint(hints.get("beam_width"), 4))),
+        "state_cap_per_node": max(1, min(64, _int_hint(hints.get("state_cap_per_node"), 8))),
         "scale_lattice": str(hints.get("scale_lattice", "default")),
         "mcts_rollout_budget": max(1, min(256, _int_hint(hints.get("mcts_rollout_budget"), 48))),
         "mcts_exploration_weight": max(
@@ -9254,6 +10175,7 @@ def _scale_candidates(
     policy: dict[str, Any],
 ) -> list[int]:
     candidates = {int(lower_bound), int(upper_bound), int(params.Sw), int(params.Csw), int(params.Sf)}
+    lattice = str(policy.get("scale_lattice", "default"))
     for value in values:
         try:
             base = int(value)
@@ -9263,10 +10185,25 @@ def _scale_candidates(
             candidates.add(base + delta)
         candidates.add(math.ceil(base / 2))
         candidates.add(max(lower_bound, min(upper_bound, base)))
+    max_count = int(policy["max_scale_candidates"])
+    if lattice in {"dense", "dense_integer", "full"}:
+        span = int(upper_bound) - int(lower_bound)
+        if span <= max(0, max_count - len(candidates)):
+            candidates.update(range(int(lower_bound), int(upper_bound) + 1))
+        else:
+            slots = max(2, max_count - len(candidates))
+            step = max(1.0, span / max(1, slots - 1))
+            for idx in range(slots):
+                candidates.add(int(round(int(lower_bound) + idx * step)))
+            # CKKS rescale boundaries often sit just around Sf/Sw offsets, so
+            # include a small local neighborhood around each seed instead of
+            # relying only on exact multiples.
+            for seed in list(candidates):
+                for delta in (-2, -1, 1, 2):
+                    candidates.add(seed + delta)
     filtered = sorted({v for v in candidates if lower_bound <= v <= upper_bound})
     if not filtered:
         return [int(lower_bound)]
-    max_count = int(policy["max_scale_candidates"])
     if len(filtered) <= max_count:
         return filtered
     anchors = [v for v in values if isinstance(v, int)]
@@ -10103,6 +11040,7 @@ def _alphaevolve_guidance(params: Params, unit_bootstrap_budget: dict[str, Any])
             "Validity and CKKS safety are hard gates before latency minimization.",
             "Use evaluator trace artifacts as profiling feedback, especially selected_source_counts and candidate_invalid_reasons.",
             "Prefer implementation/scheduling choices over inventing new cryptographic semantics.",
+            "Candidate programs may return sparse policy overlays; omitted MCTS preset fields inherit the current best seed unless replace_mcts_action_presets=True is explicit.",
         ],
         "high_impact_knobs": [
             "mcts_actions[*].prior",
@@ -10253,6 +11191,10 @@ def _compact_profile_plan(context: dict[str, Any]) -> str:
 
 def _jsonable_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(attrs, default=str))
+
+
+def _jsonable_policy_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(hints, default=str))
 
 
 def _graph_summary(pdag: Tdag, params: Params) -> dict[str, Any]:
@@ -10815,6 +11757,49 @@ def _context_unit_bootstrap_targets(context: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _reference_bootstrap_patterns_from_context(context: dict[str, Any]) -> list[str]:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict):
+        return []
+    raw_locations = (
+        reference.get("bootstrap_locations")
+        or reference.get("bootstrap_locations_by_location")
+        or reference.get("maintenance_locations", {}).get("bootstrap")
+    )
+    if not isinstance(raw_locations, dict):
+        return []
+    weighted: list[tuple[int, str]] = []
+    for location, count in raw_locations.items():
+        text = str(location).strip().lower()
+        if not text:
+            continue
+        weight = max(1, _safe_int(count, 1))
+        weighted.append((weight, text))
+        fields = {}
+        for part in text.split(";"):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key.strip()] = value.strip()
+        op = fields.get("op")
+        if op:
+            weighted.append((weight, op))
+            for token in op.replace("-", "_").split("_"):
+                if len(token) >= 5:
+                    weighted.append((max(1, weight - 1), token))
+        layer = fields.get("layer")
+        if layer and op:
+            weighted.append((weight, f"layer={layer};op={op}"))
+    best: dict[str, int] = {}
+    for weight, pattern in weighted:
+        if not pattern or pattern in {"bootstrap", "rescale", "mul", "add"}:
+            continue
+        best[pattern] = max(best.get(pattern, 0), int(weight))
+    return [
+        pattern
+        for pattern, _weight in sorted(best.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
+    ][:32]
+
+
 def candidate_actions(
     context: dict[str, Any],
     *,
@@ -10996,6 +11981,63 @@ def candidate_actions(
             },
         },
         {
+            "name": "waterline_cost_beam",
+            "prior": 0.58,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 12,
+                "state_cap_per_node": 40,
+                "boundary_state_cap": 8,
+                "max_scale_candidates": 32,
+                "boundary_scale_policy": "waterline",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_penalty": 25_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        {
+            "name": "dense_boundary_cost_beam",
+            "prior": 0.40,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 16,
+                "max_scale_candidates": 96,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "dense",
+                "bootstrap_penalty": 25_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        {
+            "name": "nonlinear_phase_boundary_beam",
+            "prior": 0.44,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_anchor_selector": "nonlinear_phase_boundaries",
+                "bootstrap_anchor_count": 64,
+                "force_bootstrap_anchors": False,
+                "bootstrap_penalty": 35_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        },
+        {
             "name": "latency_mcts_repair",
             "prior": 0.19,
             "policy": {
@@ -11075,7 +12117,57 @@ def candidate_actions(
                 }
             )
         if relaxed_actions:
-            actions[6:6] = relaxed_actions
+            # Keep graph-derived phase-boundary actions inside small sampled
+            # action caps; relaxed floors are still available but should not
+            # push structural placement policies out of the candidate surface.
+            phase_actions = [
+                action
+                for action in actions
+                if str(action.get("name", "")) == "nonlinear_phase_boundary_beam"
+            ]
+            if phase_actions:
+                actions = [
+                    action
+                    for action in actions
+                    if str(action.get("name", "")) != "nonlinear_phase_boundary_beam"
+                ]
+                dense_index = next(
+                    (
+                        idx
+                        for idx, action in enumerate(actions)
+                        if str(action.get("name", "")) == "dense_boundary_cost_beam"
+                    ),
+                    len(actions),
+                )
+                actions[dense_index:dense_index] = phase_actions
+            insert_at = min(len(actions), 9)
+            actions[insert_at:insert_at] = relaxed_actions
+    reference_patterns = _reference_bootstrap_patterns_from_context(context)
+    if reference_patterns:
+        action = {
+            "name": "reference_boundary_cost_beam",
+            "prior": 0.50,
+            "policy": {
+                **_budget_fulfillment_beam_policy(),
+                "target_bootstrap_count": target,
+                "direct_budget_policy": True,
+                "beam_width": 10,
+                "state_cap_per_node": 48,
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                "bootstrap_anchor_include_patterns": reference_patterns,
+                "bootstrap_anchor_count": max(8, min(64, len(reference_patterns) * 2)),
+                "force_bootstrap_anchors": False,
+                "bootstrap_penalty": 30_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
+            },
+        }
+        insert_at = min(len(actions), 8)
+        actions[insert_at:insert_at] = [action]
     for idx, unit in enumerate(target_units(context, max(0, action_cap - len(actions)))):
         preferred_levels = {}
         preferred_scales = {}
@@ -12061,6 +13153,46 @@ def _load_candidate_hints(program_path: Path, context: dict[str, Any]) -> dict[s
     return _normalize_candidate_hints(hints, context)
 
 
+def _context_initial_policy_hints(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    harness = context.get("harness", {})
+    if not isinstance(harness, dict):
+        return {}
+    hints = harness.get("initial_policy_hints")
+    return deepcopy(hints) if isinstance(hints, dict) else {}
+
+
+def _merge_mcts_action_presets(
+    seed_presets: Any,
+    candidate_presets: Any,
+    *,
+    replace: bool = False,
+) -> dict[str, dict[str, Any]]:
+    merged = {} if replace else deepcopy(_mcts_action_preset_map(seed_presets))
+    for name, patch in _mcts_action_preset_map(candidate_presets).items():
+        base = {} if replace else deepcopy(merged.get(name, {}))
+        if _bool_hint(patch.get("replace"), False):
+            base = {}
+        base_policy = deepcopy(base.get("policy", {})) if isinstance(base.get("policy"), dict) else {}
+        patch_policy = patch.get("policy", patch)
+        if isinstance(patch_policy, dict):
+            base_policy.update(
+                {
+                    key: value
+                    for key, value in patch_policy.items()
+                    if key not in {"name", "prior", "enabled", "disabled", "replace", "policy"}
+                }
+            )
+        if base_policy:
+            base["policy"] = base_policy
+        for key in ("prior", "enabled", "disabled"):
+            if key in patch:
+                base[key] = patch[key]
+        merged[str(name)] = base
+    return merged
+
+
 def _validate_candidate_source(program_path: Path) -> None:
     source = program_path.read_text(encoding="utf-8")
     for token in BANNED_CANDIDATE_TOKENS:
@@ -12071,6 +13203,9 @@ def _validate_candidate_source(program_path: Path) -> None:
 def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    seed_hints = _context_initial_policy_hints(context)
+    inherit_initial = _bool_hint(value.get("inherit_initial_policy", True), True)
+    seed_base = _with_default_policy(seed_hints) if inherit_initial and seed_hints else {}
     structured_keys = {
         "policy",
         "global_policy",
@@ -12084,6 +13219,19 @@ def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None
         "mcts_action_blocklist",
     }
     if not any(key in value for key in structured_keys):
+        if seed_base:
+            merged = dict(seed_base)
+            merged.update(value)
+            if "mcts_action_presets" in value:
+                merged["mcts_action_presets"] = _merge_mcts_action_presets(
+                    seed_base.get("mcts_action_presets"),
+                    value.get("mcts_action_presets"),
+                    replace=_bool_hint(value.get("replace_mcts_action_presets"), False),
+                )
+            return _sanitize_candidate_hints(
+                _apply_patch_vocabulary(merged, value.get("patches", []), context),
+                context,
+            )
         return _sanitize_candidate_hints(
             _apply_patch_vocabulary(_with_default_policy(value), value.get("patches", []), context),
             context,
@@ -12097,11 +13245,16 @@ def _normalize_candidate_hints(value: Any, context: dict[str, Any] | None = None
         if any(key in value for key in _PATCHABLE_POLICY_KEYS | {"strategy"})
         else {}
     )
-    result = _with_default_policy(policy)
+    result = _with_default_policy(seed_base)
+    result.update(policy)
     if isinstance(value.get("mcts_actions"), list):
         result["mcts_actions"] = value["mcts_actions"]
     if isinstance(value.get("mcts_action_presets"), (dict, list)):
-        result["mcts_action_presets"] = value["mcts_action_presets"]
+        result["mcts_action_presets"] = _merge_mcts_action_presets(
+            seed_base.get("mcts_action_presets"),
+            value["mcts_action_presets"],
+            replace=_bool_hint(value.get("replace_mcts_action_presets"), False),
+        )
     if "mcts_action_cap" in value:
         result["mcts_action_cap"] = value["mcts_action_cap"]
     if "mcts_prior_order" in value:
@@ -12258,6 +13411,30 @@ def _sanitize_policy_values(
         policy["force_bootstrap_anchors"] = _bool_hint(
             policy.get("force_bootstrap_anchors"), False
         )
+    if "bootstrap_anchor_selector" in policy:
+        selector = str(policy.get("bootstrap_anchor_selector", "")).strip().lower()
+        allowed_selectors = {
+            "",
+            "default",
+            "component",
+            "nonlinear_phase_boundaries",
+            "nonlinear_phase_boundary",
+            "phase_boundaries",
+            "phase_boundary",
+            "reference_bootstrap_locations",
+            "reference_bootstrap_location",
+            "reference_locations",
+        }
+        if selector not in allowed_selectors:
+            repairs.append(f"{prefix}.bootstrap_anchor_selector reset to default")
+            selector = ""
+        policy["bootstrap_anchor_selector"] = selector
+    for list_key in ("bootstrap_anchor_include_patterns", "bootstrap_anchor_exclude_patterns"):
+        if list_key in policy:
+            normalized_patterns = _string_list_hint(policy.get(list_key), limit=16)
+            if not normalized_patterns and policy.get(list_key):
+                repairs.append(f"{prefix}.{list_key} reset to []")
+            policy[list_key] = normalized_patterns
     if "mcts_prior_order" in policy:
         policy["mcts_prior_order"] = _bool_hint(policy.get("mcts_prior_order"), True)
     for list_key in ("mcts_action_allowlist", "mcts_action_blocklist"):
@@ -12270,13 +13447,13 @@ def _sanitize_policy_values(
     if "force_bootstrap_nodes" in policy and not isinstance(policy.get("force_bootstrap_nodes"), list):
         repairs.append(f"{prefix}.force_bootstrap_nodes reset to []")
         policy["force_bootstrap_nodes"] = []
-    clamp_int("max_scale_candidates", 3, 64)
-    clamp_int("beam_width", 1, 8)
-    clamp_int("state_cap_per_node", 1, 32)
+    clamp_int("max_scale_candidates", 3, 128)
+    clamp_int("beam_width", 1, 12)
+    clamp_int("state_cap_per_node", 1, 64)
     clamp_int("mcts_rollout_budget", 1, 256)
     clamp_int("mcts_max_repair_bootstraps", 0, 1024)
     clamp_int("mcts_action_cap", 1, 64)
-    clamp_int("boundary_state_cap", 1, 12)
+    clamp_int("boundary_state_cap", 1, 16)
     clamp_int("bootstrap_anchor_count", 0, 64)
     clamp_int("bootstrap_anchor_level", int(ckks["lvl_lb"]), int(ckks["lvl_ub"]))
     if policy.get("min_internal_level") is not None:
@@ -12547,6 +13724,9 @@ _PATCHABLE_POLICY_KEYS = {
     "boundary_scale",
     "bootstrap_anchor_count",
     "bootstrap_anchor_level",
+    "bootstrap_anchor_selector",
+    "bootstrap_anchor_include_patterns",
+    "bootstrap_anchor_exclude_patterns",
     "bootstrap_anchors",
     "component_bootstrap_budgets",
     "unit_bootstrap_budgets",
@@ -12742,6 +13922,39 @@ def _boundary_group_unsolved_summary(summaries: list[dict[str, Any]]) -> dict[st
                 }
             )
     return {"reasons": dict(reasons), "examples": examples}
+
+
+def _boundary_group_top_cost_summary(
+    summaries: list[dict[str, Any]], limit: int = 8
+) -> list[dict[str, Any]]:
+    ranked = [
+        item
+        for item in summaries
+        if isinstance(item, dict) and int(item.get("solved_budgets", 0) or 0) > 0
+    ]
+    ranked.sort(
+        key=lambda item: (
+            _finite_float(item.get("min_cost_usec"), 0.0),
+            _finite_float(item.get("max_cost_usec"), 0.0),
+        ),
+        reverse=True,
+    )
+    result = []
+    for item in ranked[: max(0, int(limit))]:
+        result.append(
+            {
+                "group_key": item.get("group_key", {}),
+                "requested_output_levels": item.get("requested_output_levels", []),
+                "min_cost_usec": _finite_float(item.get("min_cost_usec"), 0.0),
+                "max_cost_usec": _finite_float(item.get("max_cost_usec"), 0.0),
+                "min_bootstrap": _finite_float(item.get("min_bootstrap"), 0.0),
+                "max_bootstrap": _finite_float(item.get("max_bootstrap"), 0.0),
+                "min_rescale": _finite_float(item.get("min_rescale"), 0.0),
+                "max_rescale": _finite_float(item.get("max_rescale"), 0.0),
+                "selected_source_counts": dict(item.get("selected_source_counts", {}) or {}),
+            }
+        )
+    return result
 
 
 def _maintenance_counts(assign: Assign) -> dict[str, int]:

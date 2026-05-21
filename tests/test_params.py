@@ -38,6 +38,7 @@ def test_params_toy_runtime(toy_cost_json: str):
     assert p.openevolve_llm_timeout_sec == 180
     assert p.openevolve_llm_retries == 1
     assert p.openevolve_llm_retry_delay_sec == 2
+    assert p.openevolve_llm_max_tokens == 50_000
     assert p.openevolve_evaluator_timeout_sec == 180
     assert p.openevolve_parallel_evaluations == 1
     assert p.openevolve_checkpoint_interval == 5

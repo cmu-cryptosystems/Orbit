@@ -9,37 +9,66 @@ from .qbp_manager import QBPManager
 
 import sys
 import time
+import os
 
 def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: LatencyEstimator, params: Params):
+    progress_start = time.time()
+    _openevolve_partition_progress(
+        params,
+        f"enter dag={dag.name} nodes={len(dag.nodes)} edges={len(dag.edges)} "
+        f"prev_states={_prev_cost_state_count(prev_cost)} part={params.part}",
+    )
     if not params.part:
         qbp_manager.add_qbp(dag, prev_cost)
         this_io_to_cost = qbp_manager.get_qbp_cost(dag.name)
         this_io_to_assign = qbp_manager.get_qbp_assign(dag)
+        _openevolve_partition_progress(
+            params,
+            f"exit no-part dag={dag.name} input_states={len(this_io_to_cost)} "
+            f"elapsed={time.time() - progress_start:.2f}s",
+        )
         return this_io_to_assign, this_io_to_cost
     
     # print(f"Enter solve_partition, PDAG #{dag.name}, prev_cost: {prev_cost}")
     
     is_whole_circ = (len(prev_cost) == 1 and -1 in prev_cost)
     pdags = rdag_siso_partition(dag, 100)
+    _openevolve_partition_progress(
+        params,
+        f"partitioned dag={dag.name} pdags={len(pdags)} "
+        f"elapsed={time.time() - progress_start:.2f}s",
+    )
     
     if len(pdags) == 1:
         start_time = time.time()
         main_pdag, bypass_pdag = handle_bypass(dag, params.bpsdepth)
         if bypass_pdag is None:
-            print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes")
+            print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes", flush=True)
+            _openevolve_partition_progress(params, f"add_qbp basic dag={dag.name}")
             qbp_manager.add_qbp(dag, prev_cost)
         else:
             # bypass handling
             main_pdag_parts = rdag_siso_partition(main_pdag, 100)
             if len(main_pdag_parts) == 1 and len(bypass_pdag.nodes) == 3:
-                print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes")
+                print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes", flush=True)
+                _openevolve_partition_progress(params, f"add_qbp basic-bypass-small dag={dag.name}")
                 qbp_manager.add_qbp(dag, prev_cost)
             else:
-                print(f"PDAG #{dag.name} with Bypass, Main PDAG size: {len(main_pdag.nodes)} nodes, Bypass PDAG size: {len(bypass_pdag.nodes)} nodes")
+                print(f"PDAG #{dag.name} with Bypass, Main PDAG size: {len(main_pdag.nodes)} nodes, Bypass PDAG size: {len(bypass_pdag.nodes)} nodes", flush=True)
+                _openevolve_partition_progress(
+                    params,
+                    f"bypass recurse dag={dag.name} main={main_pdag.name} "
+                    f"main_nodes={len(main_pdag.nodes)} bypass_nodes={len(bypass_pdag.nodes)}",
+                )
                 main_partition_result = solve_partition(main_pdag, qbp_manager, prev_cost, le, params)
                 _register_partition_result(qbp_manager, main_pdag, main_partition_result)
+                _openevolve_partition_progress(params, f"add_qbp_bypass dag={dag.name}")
                 qbp_manager.add_qbp_bypass(dag, main_pdag, bypass_pdag, prev_cost)
-        print(f"Partition solving time for PDAG #{dag.name}: {time.time() - start_time:.2f} seconds")
+        print(f"Partition solving time for PDAG #{dag.name}: {time.time() - start_time:.2f} seconds", flush=True)
+        _openevolve_partition_progress(
+            params,
+            f"exit single dag={dag.name} elapsed={time.time() - progress_start:.2f}s",
+        )
         # orbit_core unpacks this pair; a bare return here used to yield None and crash.
         this_io_to_cost = qbp_manager.get_qbp_cost(dag.name)
         this_io_to_assign = qbp_manager.get_qbp_assign(dag)
@@ -55,8 +84,20 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
     
     for i in range(len(pdags)):
         pdag = pdags[i]
+        step_start = time.time()
+        _openevolve_partition_progress(
+            params,
+            f"subpartition start dag={dag.name} index={i+1}/{len(pdags)} "
+            f"pdag={pdag.name} nodes={len(pdag.nodes)} prev_states={_prev_cost_state_count(this_prev_cost)}",
+        )
         solve_partition(pdag, qbp_manager, this_prev_cost, le, params)
         this_io_to_cost = qbp_manager.get_qbp_cost(pdag.name)
+        _openevolve_partition_progress(
+            params,
+            f"subpartition qbp done dag={dag.name} index={i+1}/{len(pdags)} "
+            f"pdag={pdag.name} input_states={len(this_io_to_cost)} "
+            f"elapsed={time.time() - step_start:.2f}s",
+        )
         
         # re-stating the initial prev_cost
         if len(this_prev_cost) == 1 and -1 in this_prev_cost:
@@ -81,6 +122,12 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
 
         in_budget_choices.append(in_budget_choice)
         this_prev_cost = cur_cost
+        _openevolve_partition_progress(
+            params,
+            f"subpartition dp done dag={dag.name} index={i+1}/{len(pdags)} "
+            f"cur_states={_prev_cost_state_count(this_prev_cost)} "
+            f"elapsed={time.time() - step_start:.2f}s",
+        )
         # iterative method pruning
         if i == len(pdags) - 1:
             # final partition: no pruning
@@ -100,6 +147,12 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
                         min_scl = out_scl
             new_prev_cost[out_lvl] = {min_scl: scl_to_cost[min_scl]}
         this_prev_cost = new_prev_cost
+        _openevolve_partition_progress(
+            params,
+            f"subpartition prune done dag={dag.name} index={i+1}/{len(pdags)} "
+            f"states={_prev_cost_state_count(this_prev_cost)} "
+            f"elapsed={time.time() - step_start:.2f}s",
+        )
         
         if len(this_prev_cost) == 0:
             break
@@ -114,6 +167,12 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
             prev_cost[l] = {params.Sw: 0}
     
     # merge results from all partitions
+    merge_start = time.time()
+    _openevolve_partition_progress(
+        params,
+        f"merge start dag={dag.name} pdags={len(pdags)} "
+        f"output_states={_prev_cost_state_count(this_prev_cost)}",
+    )
     path_candidates = []
     for out_lvl, out_scl_to_cost in this_prev_cost.items():
         for out_scl, final_cost in out_scl_to_cost.items():
@@ -205,8 +264,18 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
         qbp_manager.openevolve_selected_path_records.extend(path_candidates[:8])
     if not is_whole_circ:
         qbp_manager.add_qbp_existing(dag, dag_io_to_cost, dag_io_to_assign)
+        _openevolve_partition_progress(
+            params,
+            f"merge exit dag={dag.name} elapsed={time.time() - merge_start:.2f}s "
+            f"total={time.time() - progress_start:.2f}s",
+        )
     else:
         # for whole dag, no need to add to qbp_manager
+        _openevolve_partition_progress(
+            params,
+            f"merge exit whole dag={dag.name} elapsed={time.time() - merge_start:.2f}s "
+            f"total={time.time() - progress_start:.2f}s",
+        )
         return dag_io_to_assign, dag_io_to_cost
 
 
@@ -255,5 +324,26 @@ def _count_assign_bootstraps(assign: Assign, params: Params) -> int:
                 assign.e_scl_out[(pred, dst)],
             )
         ):
+            total += 1
+    return total
+
+
+def _openevolve_partition_progress(params: Params, message: str):
+    if getattr(params, "placement_backend", "") != "openevolve":
+        return
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PARTITION_PROGRESS", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return
+    if not raw and not getattr(params, "openevolve_collect_diagnostics", False):
+        return
+    print(f"[OpenEvolve partition] {message}", flush=True)
+
+
+def _prev_cost_state_count(prev_cost: dict) -> int:
+    total = 0
+    for value in prev_cost.values():
+        if isinstance(value, dict):
+            total += len(value)
+        else:
             total += 1
     return total

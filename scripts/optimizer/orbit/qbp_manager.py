@@ -7,6 +7,7 @@ from .qbp import QBP
 
 import os
 import sys
+import time
 
 class QBPManager:
     def __init__(self, params: Params, le: LatencyEstimator):
@@ -171,8 +172,9 @@ class QBPManager:
         return merged_io_to_assign, merged_io_to_cost
     
     def add_qbp(self, pdag: Tdag, in_budgets: dict[int, dict[int, float]]):
-        print(f"Adding QBP for PDAG #{pdag.name}")
-        print(f"  this_in_budgets: {sorted(in_budgets.items())}")
+        qbp_start = time.time()
+        print(f"Adding QBP for PDAG #{pdag.name}", flush=True)
+        print(f"  this_in_budgets: {sorted(in_budgets.items())}", flush=True)
         bj_qbp, bj_label = self._get_qbp_bj(pdag)
         io_budgets_list = []
         num_total_tasks = len(in_budgets) * self.params.lvl_ub
@@ -193,12 +195,20 @@ class QBPManager:
                                 'out_lvl': out_lvl
                             })
         num_remaining_tasks = len(io_budgets_list)
-        print(f"  QBP Manager: Reusing Ratio: {1-num_remaining_tasks/num_total_tasks:.3f}.\n    Need to solve {num_remaining_tasks} / {num_total_tasks} placement tasks for PDAG #{pdag.name}")
+        print(f"  QBP Manager: Reusing Ratio: {1-num_remaining_tasks/num_total_tasks:.3f}.\n    Need to solve {num_remaining_tasks} / {num_total_tasks} placement tasks for PDAG #{pdag.name}", flush=True)
         if len(io_budgets_list) == 0:
             return
         io_budgets_list = self._sample_openevolve_eval_budgets(pdag, io_budgets_list)
         self._record_openevolve_budget_task("normal", pdag, io_budgets_list)
+        self._openevolve_progress(
+            f"get_qbp start pdag={pdag.name} tasks={len(io_budgets_list)} "
+            f"nodes={len(pdag.nodes)} elapsed={time.time() - qbp_start:.2f}s"
+        )
         io_to_assign, io_to_cost = self.ilp_worker.get_qbp(pdag, io_budgets_list)
+        self._openevolve_progress(
+            f"get_qbp done pdag={pdag.name} input_states={len(io_to_cost)} "
+            f"elapsed={time.time() - qbp_start:.2f}s"
+        )
         if (
             getattr(self.params, "openevolve_evaluating_candidate", False)
             or getattr(self.params, "openevolve_collect_diagnostics", False)
@@ -212,8 +222,19 @@ class QBPManager:
         # for (in_level, in_scale), out_costs in sorted(this_qbp_cost.items()):
         #     print(f"   + Input Level {in_level}, Input Scale {in_scale} output costs: {sorted(out_costs.items())}")
 
+    def _openevolve_progress(self, message: str):
+        if getattr(self.params, "placement_backend", "") != "openevolve":
+            return
+        raw = os.environ.get("ORBIT_OPENEVOLVE_PARTITION_PROGRESS", "").strip().lower()
+        if raw in {"0", "false", "no", "off"}:
+            return
+        if not raw and not getattr(self.params, "openevolve_collect_diagnostics", False):
+            return
+        print(f"[OpenEvolve QBP] {message}", flush=True)
+
     
     def add_qbp_bypass(self, pdag: Tdag, main_pdag: Tdag, bypass_pdag: Tdag, in_budgets: dict[int, dict[int, float]]):
+        qbp_start = time.time()
         dag_qbp, dag_label = self._get_qbp_bj(pdag)
         assert main_pdag.name in self.pdag_name_to_qbp, f"Main PDAG #{main_pdag.name} QBP not found in manager. Please add it first."
         main_qbp = self.pdag_name_to_qbp[main_pdag.name][0]
@@ -243,14 +264,23 @@ class QBPManager:
                         })
         
         num_remain_tasks = len(io_budgets_list)
-        print(f"  Bypass QBP Manager: Need to solve {num_remain_tasks} bypass placement tasks for PDAG #{pdag.name}")
+        print(f"  Bypass QBP Manager: Need to solve {num_remain_tasks} bypass placement tasks for PDAG #{pdag.name}", flush=True)
         
         if len(io_budgets_list) == 0:
             return
         io_budgets_list = self._sample_openevolve_eval_budgets(bypass_pdag, io_budgets_list)
         self._record_openevolve_budget_task("bypass", bypass_pdag, io_budgets_list)
         
+        self._openevolve_progress(
+            f"get_qbp_bypass start pdag={pdag.name} bypass={bypass_pdag.name} "
+            f"tasks={len(io_budgets_list)} nodes={len(bypass_pdag.nodes)} "
+            f"elapsed={time.time() - qbp_start:.2f}s"
+        )
         bypass_io_to_assign, _ = self.ilp_worker.get_qbp(bypass_pdag, io_budgets_list)
+        self._openevolve_progress(
+            f"get_qbp_bypass done pdag={pdag.name} bypass={bypass_pdag.name} "
+            f"elapsed={time.time() - qbp_start:.2f}s"
+        )
         if (
             getattr(self.params, "openevolve_evaluating_candidate", False)
             or getattr(self.params, "openevolve_collect_diagnostics", False)
@@ -260,6 +290,10 @@ class QBPManager:
         dag_io_to_assign, dag_io_to_cost = self._merge_bypass_results(pdag, fork_v, maino_v, main_io_to_assign, bypass_io_to_assign)
         dag_qbp_io_to_assign = self._assign_biject(dag_io_to_assign, dag_qbp, dag_label)
         dag_qbp.append_io_results(dag_io_to_cost, dag_qbp_io_to_assign)
+        self._openevolve_progress(
+            f"add_qbp_bypass merged pdag={pdag.name} input_states={len(dag_io_to_cost)} "
+            f"elapsed={time.time() - qbp_start:.2f}s"
+        )
     
     def add_qbp_existing(self, pdag: Tdag, io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]], io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]]):
         bj_qbp, bj_label = self._get_qbp_bj(pdag)

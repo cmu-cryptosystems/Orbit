@@ -10516,6 +10516,25 @@ def _promotion_eval_timeout_sec(params: Params) -> int:
     return max(0, min(3_600, value))
 
 
+def _strategy_discovery_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _strategy_discovery_limit() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "").strip()
+    try:
+        value = int(raw) if raw else 8
+    except ValueError:
+        value = 8
+    return max(0, min(64, value))
+
+
+def _promotion_bounded_retry_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_BOUNDED_RETRY", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _promotion_probe_limit() -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", "").strip()
     try:
@@ -10665,6 +10684,204 @@ def _promotion_record_summary(
         "worker_exitcode": result.get("worker_exitcode") if result else None,
         "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
         "policy_summary": _compact_policy_summary(hints or {}),
+    }
+
+
+def _sampled_tasks_digest(tasks: list[dict[str, Any]]) -> str:
+    compact = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        compact.append(
+            {
+                "index": _safe_int(task.get("index"), -1),
+                "group_keys": task.get("group_keys", []),
+                "seed_metrics": task.get("seed_metrics", {}),
+            }
+        )
+    return _hint_digest(compact)
+
+
+def _source_counts_digest(counts: dict[str, Any]) -> str:
+    normalized = {
+        str(key): int(value or 0)
+        for key, value in dict(counts or {}).items()
+        if int(value or 0) != 0
+    }
+    return _hint_digest(normalized)
+
+
+def _selected_source_counts_from_result(result: dict[str, Any]) -> dict[str, int]:
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return {
+        str(key): int(value or 0)
+        for key, value in dict(diagnostics.get("selected_source_counts", {}) or {}).items()
+    }
+
+
+def _counter_delta(candidate: dict[str, int], reference: dict[str, int]) -> dict[str, Any]:
+    keys = sorted(set(candidate) | set(reference))
+    delta = {
+        key: int(candidate.get(key, 0)) - int(reference.get(key, 0))
+        for key in keys
+        if int(candidate.get(key, 0)) != int(reference.get(key, 0))
+    }
+    return {
+        "delta": delta,
+        "delta_nonzero": bool(delta),
+        "candidate_total": int(sum(int(value or 0) for value in candidate.values())),
+        "reference_total": int(sum(int(value or 0) for value in reference.values())),
+    }
+
+
+def _probe_seed_summary(
+    selected_probe_tasks: list[dict[str, Any]],
+    reference_latency_usec: float,
+) -> dict[str, Any]:
+    path_parts: list[str] = []
+    source_counts: Counter[str] = Counter()
+    group_keys: list[Any] = []
+    bootstrap = 0.0
+    rescale = 0.0
+    for task in selected_probe_tasks:
+        if not isinstance(task, dict):
+            continue
+        metric = task.get("seed_metrics")
+        if isinstance(metric, dict):
+            digest = str(metric.get("selected_path_digest", ""))
+            if digest:
+                path_parts.append(digest)
+            for key, value in dict(metric.get("selected_source_counts", {}) or {}).items():
+                source_counts[str(key)] += int(value or 0)
+            bootstrap += _finite_float(metric.get("bootstrap_count"), 0.0)
+            rescale += _finite_float(metric.get("rescale_count"), 0.0)
+        group_keys.extend(list(task.get("group_keys", []) or []))
+    selected_digest = (
+        path_parts[0]
+        if len(path_parts) == 1
+        else _hint_digest(path_parts) if path_parts else ""
+    )
+    return {
+        "selected_path_digest": selected_digest,
+        "selected_source_counts": dict(source_counts),
+        "latency_usec": float(reference_latency_usec),
+        "bootstrap_count": float(bootstrap),
+        "rescale_count": float(rescale),
+        "group_keys": group_keys[:16],
+        "task_digest": _sampled_tasks_digest(selected_probe_tasks),
+    }
+
+
+def _first_changed_boundary_group(
+    seed_summary: dict[str, Any],
+    result: dict[str, Any],
+) -> Any:
+    diagnostics = result.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        for item in diagnostics.get("boundary_group_summaries", []) or []:
+            if isinstance(item, dict):
+                return item.get("group_key") or item.get("key") or item
+    groups = seed_summary.get("group_keys", [])
+    if isinstance(groups, list) and groups:
+        return groups[0]
+    return None
+
+
+def _path_differential_summary(
+    seed_summary: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics = result.get("diagnostics", {}) if isinstance(result, dict) else {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    candidate_digest = str(result.get("sampled_selected_path_digest", ""))
+    seed_digest = str(seed_summary.get("selected_path_digest", ""))
+    candidate_sources = _selected_source_counts_from_result(result)
+    seed_sources = {
+        str(key): int(value or 0)
+        for key, value in dict(seed_summary.get("selected_source_counts", {}) or {}).items()
+    }
+    candidate_latency = _promotion_latency(result)
+    seed_latency = _finite_float(seed_summary.get("latency_usec"), float("inf"))
+    source_delta = _counter_delta(candidate_sources, seed_sources)
+    selected_path_changed = bool(candidate_digest and candidate_digest != seed_digest)
+    source_changed = bool(source_delta.get("delta_nonzero", False))
+    direct_valid = _promotion_result_direct_valid(result)
+    candidate_solved = int(diagnostics.get("candidate_solved_boundary_groups", 0) or 0)
+    reason = "unknown"
+    if bool(result.get("timed_out", False)):
+        reason = "timed_out_before_qbp"
+    elif not direct_valid and candidate_solved <= 0:
+        reason = "invalid_no_candidate_attempts"
+    elif not selected_path_changed:
+        reason = "same_action_order" if not source_changed else "same_boundary_states"
+    elif math.isfinite(candidate_latency) and math.isfinite(seed_latency):
+        if math.isclose(candidate_latency, seed_latency, rel_tol=1e-12, abs_tol=1e-9):
+            reason = "probe_tied_seed"
+        elif candidate_latency > seed_latency:
+            reason = "changed_but_slower"
+        else:
+            reason = "changed_and_faster"
+    elif selected_path_changed:
+        reason = "changed_path_unknown_cost"
+    return {
+        "collapse_reason": reason,
+        "seed_selected_path_digest": seed_digest,
+        "candidate_selected_path_digest": candidate_digest,
+        "selected_path_changed": bool(selected_path_changed),
+        "selected_source_counts_changed": bool(source_changed),
+        "seed_source_counts": seed_sources,
+        "candidate_source_counts": candidate_sources,
+        "source_count_delta": source_delta,
+        "seed_latency_usec": seed_latency,
+        "candidate_latency_usec": candidate_latency,
+        "latency_delta_usec": (
+            float(candidate_latency - seed_latency)
+            if math.isfinite(candidate_latency) and math.isfinite(seed_latency)
+            else None
+        ),
+        "seed_bootstrap_count": _finite_float(seed_summary.get("bootstrap_count"), 0.0),
+        "candidate_bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
+        "seed_rescale_count": _finite_float(seed_summary.get("rescale_count"), 0.0),
+        "candidate_rescale_count": _finite_float(result.get("rescale_count"), 0.0),
+        "first_changed_boundary_group": _first_changed_boundary_group(seed_summary, result),
+    }
+
+
+def _promotion_path_source_digest(result: dict[str, Any]) -> str:
+    return _hint_digest(
+        {
+            "selected_path_digest": str(result.get("sampled_selected_path_digest", "")),
+            "selected_source_counts": _selected_source_counts_from_result(result),
+        }
+    )
+
+
+def _promotion_timeout_context(
+    hints: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]],
+    *,
+    place_timeout_sec: int,
+    qbp_timeout_sec: int,
+    total_timeout_sec: int,
+    last_phase: str,
+) -> dict[str, Any]:
+    return {
+        "place_timeout_sec": int(place_timeout_sec),
+        "qbp_solve_timeout_sec": int(qbp_timeout_sec),
+        "total_probe_timeout_sec": int(total_timeout_sec),
+        "last_timing_phase": str(last_phase),
+        "action_allowlist": list(hints.get("mcts_action_allowlist", []) or [])[:8],
+        "action_presets": _promotion_probe_action_names(hints, limit=8),
+        "task_digest": _sampled_tasks_digest(selected_probe_tasks),
+        "boundary_group_keys": [
+            key
+            for task in selected_probe_tasks
+            if isinstance(task, dict)
+            for key in list(task.get("group_keys", []) or [])[:4]
+        ][:8],
     }
 
 
@@ -10934,6 +11151,484 @@ def _promotion_probe_hints(
     return probe
 
 
+def _strategy_discovery_base_hints(
+    initial_hints: dict[str, Any] | None,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(initial_hints, dict) and initial_hints:
+        return deepcopy(initial_hints)
+    seed = _context_initial_policy_hints(context)
+    if seed:
+        return deepcopy(seed)
+    return {"strategy": "bootstrap_mcts"}
+
+
+def _strategy_discovery_variants(
+    initial_hints: dict[str, Any] | None,
+    context: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    base = _strategy_discovery_base_hints(initial_hints, context)
+    variants: list[dict[str, Any]] = []
+    labels: set[str] = set()
+
+    def add(
+        label: str,
+        dimension: str,
+        patch: dict[str, Any],
+        *,
+        changed_keys: list[str] | None = None,
+    ) -> None:
+        if label in labels:
+            return
+        labels.add(label)
+        hints = deepcopy(base)
+        hints.update(patch)
+        variants.append(
+            {
+                "label": label,
+                "dimension": dimension,
+                "changed_keys": changed_keys or sorted(patch.keys()),
+                "hints": hints,
+            }
+        )
+
+    top_groups = (
+        context.get("harness", {}).get("top_costly_boundary_groups", [])
+        if isinstance(context.get("harness", {}), dict)
+        else []
+    )
+    if selected_probe_tasks:
+        matching_groups = []
+        for item in top_groups or []:
+            if not isinstance(item, dict):
+                continue
+            group_key = item.get("group_key", item)
+            if _boundary_group_selector_matches_sampled_tasks(group_key, selected_probe_tasks):
+                matching_groups.append(item)
+        top_groups = matching_groups or top_groups
+
+    # Ensure the default bounded discovery limit still covers every strategy
+    # dimension once before exploring additional values.
+    add(
+        "boundary_scale_policy_waterline",
+        "boundary_scale_policy",
+        {"boundary_scale_policy": "waterline"},
+    )
+    add("scale_lattice_dense", "scale_lattice", {"scale_lattice": "dense"})
+    add("boundary_state_cap_8", "boundary_state_cap", {"boundary_state_cap": 8})
+    add("beam_width_8", "beam_width", {"beam_width": 8})
+    add(
+        "bootstrap_penalty_25000000",
+        "bootstrap_penalty",
+        {"bootstrap_penalty": 25_000_000.0, "selection_bootstrap_penalty": 0.0},
+        changed_keys=["bootstrap_penalty", "selection_bootstrap_penalty"],
+    )
+    add(
+        "action_allowlist_dense_boundary_cost_beam",
+        "action_allowlist",
+        {"mcts_action_allowlist": ["dense_boundary_cost_beam"], "mcts_action_cap": 1},
+        changed_keys=["mcts_action_allowlist", "mcts_action_cap"],
+    )
+    for idx, item in enumerate([group for group in top_groups or [] if isinstance(group, dict)][:1]):
+        selector = item.get("group_key", item)
+        if isinstance(selector, dict):
+            add(
+                f"top_boundary_{idx}_frontier_8_48",
+                "per_top_boundary_override",
+                {
+                    "boundary_group_policies": [
+                        {
+                            "selector": selector,
+                            "policy": {
+                                "strategy": "latency_beam",
+                                "direct_budget_policy": True,
+                                "allow_bootstrap": True,
+                                "allow_seed_fallback": False,
+                                "boundary_scale_policy": "frontier",
+                                "boundary_state_cap": 8,
+                                "max_scale_candidates": 48,
+                                "beam_width": 6,
+                                "state_cap_per_node": 24,
+                                "bootstrap_penalty": 35_000_000.0,
+                                "selection_objective": "cost",
+                            },
+                        }
+                    ]
+                },
+                changed_keys=["boundary_group_policies"],
+            )
+
+    for value in ("waterline", "frontier", "sf", "low"):
+        add(
+            f"boundary_scale_policy_{value}",
+            "boundary_scale_policy",
+            {"boundary_scale_policy": value},
+        )
+    for value in ("waterline_sf", "dense"):
+        add(f"scale_lattice_{value}", "scale_lattice", {"scale_lattice": value})
+    for value in (4, 6, 8):
+        add(
+            f"boundary_state_cap_{value}",
+            "boundary_state_cap",
+            {"boundary_state_cap": value},
+        )
+    for value in (4, 6, 8):
+        add(f"beam_width_{value}", "beam_width", {"beam_width": value})
+    for value in (25_000_000.0, 125_000_000.0, 650_000_000.0):
+        add(
+            f"bootstrap_penalty_{int(value)}",
+            "bootstrap_penalty",
+            {"bootstrap_penalty": value, "selection_bootstrap_penalty": 0.0},
+            changed_keys=["bootstrap_penalty", "selection_bootstrap_penalty"],
+        )
+    for names in (
+        ["budget_fulfillment_beam"],
+        ["wide_boundary_cost_beam"],
+        ["dense_boundary_cost_beam"],
+        ["nonlinear_phase_boundary_beam"],
+        ["tuneinsight_avgcase_cost_beam"],
+    ):
+        add(
+            "action_allowlist_" + "_".join(names),
+            "action_allowlist",
+            {"mcts_action_allowlist": names, "mcts_action_cap": len(names)},
+            changed_keys=["mcts_action_allowlist", "mcts_action_cap"],
+        )
+
+    for idx, item in enumerate([group for group in top_groups or [] if isinstance(group, dict)][:2]):
+        selector = item.get("group_key", item)
+        if not isinstance(selector, dict):
+            continue
+        for boundary_policy, state_cap, scale_count in (
+            ("frontier", 8, 48),
+            ("waterline", 6, 32),
+            ("frontier", 8, 64),
+        ):
+            add(
+                f"top_boundary_{idx}_{boundary_policy}_{state_cap}_{scale_count}",
+                "per_top_boundary_override",
+                {
+                    "boundary_group_policies": [
+                        {
+                            "selector": selector,
+                            "policy": {
+                                "strategy": "latency_beam",
+                                "direct_budget_policy": True,
+                                "allow_bootstrap": True,
+                                "allow_seed_fallback": False,
+                                "boundary_scale_policy": boundary_policy,
+                                "boundary_state_cap": state_cap,
+                                "max_scale_candidates": scale_count,
+                                "beam_width": 6,
+                                "state_cap_per_node": 24,
+                                "bootstrap_penalty": 35_000_000.0,
+                                "selection_objective": "cost",
+                            },
+                        }
+                    ]
+                },
+                changed_keys=["boundary_group_policies"],
+            )
+    return variants[: _strategy_discovery_limit()]
+
+
+def _strategy_discovery_program_source(label: str, hints: dict[str, Any]) -> str:
+    return _program_source_from_hints(hints, f"Strategy discovery seed: {label}.")
+
+
+def _bounded_retry_probe_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    retry = deepcopy(hints)
+    tight = {
+        "max_scale_candidates": 24,
+        "state_cap_per_node": 16,
+        "beam_width": 4,
+        "boundary_state_cap": 4,
+        "mcts_rollout_budget": 3,
+        "mcts_action_cap": 2,
+        "mcts_max_repair_bootstraps": 6,
+    }
+
+    def clamp_policy(policy: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(policy)
+        for key, limit in tight.items():
+            if key in updated:
+                updated[key] = min(limit, _int_hint(updated.get(key), limit))
+        return updated
+
+    retry = clamp_policy(retry)
+    retry["mcts_action_allowlist"] = list(retry.get("mcts_action_allowlist", []) or [])[:2]
+    retry["mcts_action_cap"] = min(2, max(1, len(retry["mcts_action_allowlist"]) or 1))
+    if isinstance(retry.get("mcts_action_presets"), dict):
+        presets = {}
+        for name, preset in retry["mcts_action_presets"].items():
+            if not isinstance(preset, dict):
+                presets[name] = preset
+                continue
+            item = dict(preset)
+            if isinstance(item.get("policy"), dict):
+                item["policy"] = clamp_policy(item["policy"])
+            presets[name] = item
+        retry["mcts_action_presets"] = presets
+    retry["mcts_actions"] = _clamp_promotion_probe_items(retry.get("mcts_actions"))
+    if isinstance(retry.get("mcts_actions"), list):
+        retry["mcts_actions"] = retry["mcts_actions"][:2]
+    if isinstance(retry.get("boundary_group_policies"), list):
+        groups = []
+        for item in retry["boundary_group_policies"][:1]:
+            if not isinstance(item, dict):
+                continue
+            updated = dict(item)
+            if isinstance(updated.get("policy"), dict):
+                updated["policy"] = clamp_policy(updated["policy"])
+            groups.append(updated)
+        retry["boundary_group_policies"] = groups
+    return retry
+
+
+def _candidate_intent_survived_retry(original: dict[str, Any], retry: dict[str, Any]) -> bool:
+    original_actions = set(_promotion_probe_action_names(original, limit=8))
+    retry_actions = set(_promotion_probe_action_names(retry, limit=8))
+    if original_actions and retry_actions and not (original_actions & retry_actions):
+        return False
+    original_groups = len(original.get("boundary_group_policies", []) or [])
+    retry_groups = len(retry.get("boundary_group_policies", []) or [])
+    return retry_groups >= min(1, original_groups)
+
+
+def _strategy_discovery_examples(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    ranked = sorted(
+        records,
+        key=lambda item: (
+            not bool(item.get("path_differential", {}).get("selected_path_changed")),
+            not bool(item.get("latency_improved")),
+            _finite_float(item.get("latency_usec"), float("inf")),
+        ),
+    )
+    for item in ranked[:6]:
+        diff = item.get("path_differential", {})
+        examples.append(
+            {
+                "kind": "strategy_discovery_probe",
+                "label": item.get("label"),
+                "dimension": item.get("dimension"),
+                "direct_valid": bool(item.get("direct_valid")),
+                "latency_improved": bool(item.get("latency_improved")),
+                "collapse_reason": diff.get("collapse_reason"),
+                "selected_path_digest": item.get("selected_path_digest", ""),
+                "reference_latency_usec": item.get("reference_latency_usec"),
+                "latency_usec": item.get("latency_usec"),
+                "selected_source_counts": item.get("selected_source_counts", {}),
+                "changed_keys": item.get("changed_keys", []),
+            }
+        )
+    return examples
+
+
+def _run_strategy_discovery_prepass(
+    promotion_dir: Path,
+    context: dict[str, Any],
+    initial_hints: dict[str, Any] | None,
+    params: Params,
+    selected_probe_tasks: list[dict[str, Any]],
+    probe_reference_cost: float,
+    *,
+    eval_timeout_sec: int,
+    total_timeout_sec: int,
+    started_at: float,
+) -> dict[str, Any]:
+    discovery_dir = promotion_dir / "strategy_discovery"
+    discovery_dir.mkdir(parents=True, exist_ok=True)
+    seed_summary = _probe_seed_summary(selected_probe_tasks, probe_reference_cost)
+    has_seed_hints = bool(initial_hints)
+    variants = (
+        _strategy_discovery_variants(initial_hints, context, selected_probe_tasks)
+        if has_seed_hints
+        else []
+    )
+    records: list[dict[str, Any]] = []
+    path_rows: list[dict[str, Any]] = []
+    path_moving_codes: list[str] = []
+    skip_policy_digests: set[str] = set()
+    timed_out = False
+    if not _strategy_discovery_enabled() or not variants:
+        summary = {
+            "enabled": bool(_strategy_discovery_enabled()),
+            "variant_count": 0,
+            "records": [],
+            "path_moving_code_count": 0,
+            "skip_policy_digest_count": 0,
+        }
+        (discovery_dir / "strategy_table.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        (discovery_dir / "path_delta_table.json").write_text("[]\n", encoding="utf-8")
+        return {
+            "records": records,
+            "path_moving_codes": path_moving_codes,
+            "skip_policy_digests": skip_policy_digests,
+            "examples": [],
+            "summary": summary,
+        }
+
+    probe_context = deepcopy(context)
+    probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
+    probe_context.setdefault("harness", {})["experience_probe"] = True
+    probe_context.setdefault("harness", {})["strategy_discovery"] = True
+    place_timeout = _candidate_place_timeout_sec(context)
+    for index, variant in enumerate(variants):
+        if total_timeout_sec > 0 and time.monotonic() - started_at >= total_timeout_sec:
+            timed_out = True
+            records.append(
+                {
+                    "index": index,
+                    "label": variant.get("label"),
+                    "dimension": variant.get("dimension"),
+                    "reason": f"strategy discovery timeout after {total_timeout_sec}s",
+                }
+            )
+            break
+        hints = deepcopy(variant["hints"])
+        eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
+        probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
+        policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
+        complexity_reasons = _promotion_complexity_reasons(probe_hints)
+        if complexity_reasons:
+            record = {
+                "index": index,
+                "label": variant.get("label"),
+                "dimension": variant.get("dimension"),
+                "changed_keys": variant.get("changed_keys", []),
+                "reason": "strategy_policy_too_expensive:" + ",".join(complexity_reasons[:3]),
+                "probe_policy_digest": policy_digest,
+                "direct_valid": False,
+                "latency_improved": False,
+            }
+            records.append(record)
+            continue
+        result = _evaluate_sampled_budget_tasks_for_promotion(
+            probe_context,
+            probe_hints,
+            timeout_sec=eval_timeout_sec,
+        )
+        retry_summary: dict[str, Any] | None = None
+        active_hints = probe_hints
+        if bool(result.get("timed_out", False)) and _promotion_bounded_retry_enabled():
+            retry_hints = _bounded_retry_probe_hints(probe_hints)
+            retry_result = _evaluate_sampled_budget_tasks_for_promotion(
+                probe_context,
+                retry_hints,
+                timeout_sec=min(eval_timeout_sec, max(10, eval_timeout_sec // 2 if eval_timeout_sec else 0)),
+            )
+            retry_summary = {
+                "attempted": True,
+                "intent_survived": _candidate_intent_survived_retry(probe_hints, retry_hints),
+                "latency_usec": _promotion_latency(retry_result),
+                "direct_valid": _promotion_result_direct_valid(retry_result),
+                "timed_out": bool(retry_result.get("timed_out", False)),
+                "policy_digest": _hint_digest(_policy_effect_payload(retry_hints)),
+            }
+            if _promotion_result_direct_valid(retry_result):
+                result = retry_result
+                active_hints = retry_hints
+                policy_digest = retry_summary["policy_digest"]
+        diff = _path_differential_summary(seed_summary, result)
+        latency = _promotion_latency(result)
+        direct_valid = _promotion_result_direct_valid(result)
+        improved = bool(direct_valid and math.isfinite(latency) and latency < probe_reference_cost)
+        source_counts = _selected_source_counts_from_result(result)
+        record = {
+            "index": index,
+            "label": variant.get("label"),
+            "dimension": variant.get("dimension"),
+            "changed_keys": variant.get("changed_keys", []),
+            "direct_valid": bool(direct_valid),
+            "valid": bool(result.get("valid", False)),
+            "latency_usec": latency,
+            "reference_latency_usec": probe_reference_cost,
+            "latency_improved": improved,
+            "selected_path_digest": str(result.get("sampled_selected_path_digest", "")),
+            "selected_source_counts": source_counts,
+            "probe_policy_digest": policy_digest,
+            "probe_effective_digest": _promotion_effective_probe_digest(result),
+            "path_source_digest": _promotion_path_source_digest(result),
+            "path_differential": diff,
+            "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
+            "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
+            "timed_out": bool(result.get("timed_out", False)),
+            "timeout_context": _promotion_timeout_context(
+                active_hints,
+                selected_probe_tasks,
+                place_timeout_sec=place_timeout,
+                qbp_timeout_sec=eval_timeout_sec,
+                total_timeout_sec=total_timeout_sec,
+                last_phase=str(result.get("timeout_phase", "qbp_solve" if result.get("timed_out") else "done")),
+            ),
+            "bounded_retry": retry_summary,
+            "policy_summary": _compact_policy_summary(active_hints),
+        }
+        if not direct_valid:
+            record["reason"] = diff["collapse_reason"]
+        elif not improved:
+            record["reason"] = diff["collapse_reason"]
+        else:
+            record["reason"] = "latency_improved"
+        records.append(record)
+        path_rows.append(
+            {
+                "label": record["label"],
+                "dimension": record["dimension"],
+                "collapse_reason": diff["collapse_reason"],
+                "selected_path_changed": diff["selected_path_changed"],
+                "selected_source_counts_changed": diff["selected_source_counts_changed"],
+                "latency_delta_usec": diff["latency_delta_usec"],
+                "selected_path_digest": record["selected_path_digest"],
+                "path_source_digest": record["path_source_digest"],
+            }
+        )
+        if diff["collapse_reason"] in {"same_action_order", "same_boundary_states", "probe_tied_seed"}:
+            skip_policy_digests.add(policy_digest)
+        if bool(diff.get("selected_path_changed")):
+            path_moving_codes.append(
+                _strategy_discovery_program_source(str(variant.get("label", "strategy")), active_hints)
+            )
+    summary = {
+        "enabled": True,
+        "variant_count": len(variants),
+        "evaluated_count": len(records),
+        "path_moving_count": sum(
+            1 for item in records if item.get("path_differential", {}).get("selected_path_changed")
+        ),
+        "latency_improved_count": sum(1 for item in records if item.get("latency_improved")),
+        "skip_policy_digest_count": len(skip_policy_digests),
+        "path_moving_code_count": len(path_moving_codes),
+        "timed_out": timed_out,
+        "records": records,
+    }
+    (discovery_dir / "strategy_table.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (discovery_dir / "path_delta_table.json").write_text(
+        json.dumps(path_rows, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    examples = _strategy_discovery_examples(records)
+    (discovery_dir / "prompt_examples.json").write_text(
+        json.dumps(examples, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "records": records,
+        "path_moving_codes": path_moving_codes[:16],
+        "skip_policy_digests": skip_policy_digests,
+        "examples": examples,
+        "summary": summary,
+    }
+
+
 def _write_promotion_progress(
     promotion_dir: Path,
     *,
@@ -11049,6 +11744,8 @@ def _evaluate_sampled_budget_tasks_for_promotion(
             "valid": False,
             "timed_out": True,
             "timeout_sec": int(timeout_sec),
+            "timeout_phase": "qbp_solve",
+            "last_timing_phase": "qbp_solve",
             "error": f"promotion QBP evaluation timed out after {timeout_sec}s",
         }
     proc.join(5)
@@ -11087,17 +11784,40 @@ def _run_sampled_promotion_pass(
         return None
 
     full_reference_cost = _promotion_reference_latency(context)
+    discovery = _run_strategy_discovery_prepass(
+        promotion_dir,
+        context,
+        initial_hints,
+        params,
+        selected_probe_tasks,
+        probe_reference_cost,
+        eval_timeout_sec=eval_timeout_sec,
+        total_timeout_sec=timeout_sec,
+        started_at=started_at,
+    )
+    if discovery.get("examples"):
+        context.setdefault("harness", {})["candidate_examples"] = _merge_candidate_examples(
+            context.get("harness", {}).get("candidate_examples", []),
+            discovery.get("examples", []),
+        )
     discovery_limit = min(128, max(limit, limit * 4))
-    codes = _discover_finalist_codes(output_dir, best_code, discovery_limit)
+    codes = list(discovery.get("path_moving_codes", []) or []) + _discover_finalist_codes(
+        output_dir, best_code, discovery_limit
+    )
     records: list[dict[str, Any]] = []
     best: tuple[float, float, float, int, dict[str, Any], dict[str, Any], str] | None = None
     seen: set[str] = set()
     seen_policy_digests: set[str] = set()
     seen_effective_digests: set[str] = set()
+    seen_path_source_digests: set[str] = set()
+    discovery_skip_policy_digests = set(discovery.get("skip_policy_digests", set()) or set())
     duplicate_policy_count = 0
     duplicate_effective_count = 0
+    duplicate_path_source_count = 0
+    discovery_seed_equivalent_skip_count = 0
     probe_evaluated_count = 0
     timed_out = False
+    seed_probe_summary = _probe_seed_summary(selected_probe_tasks, probe_reference_cost)
 
     _write_promotion_progress(
         promotion_dir,
@@ -11212,6 +11932,28 @@ def _run_sampled_promotion_pass(
             )
             continue
         policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
+        if policy_digest in discovery_skip_policy_digests:
+            discovery_seed_equivalent_skip_count += 1
+            records.append(
+                _promotion_record_summary(
+                    index=index,
+                    stage="static",
+                    hints=probe_hints,
+                    reason="strategy_discovery_seed_equivalent_probe_skip",
+                    code_digest=code_digest,
+                )
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="static_rejected",
+                current_index=index,
+                total_candidates=min(limit, len(codes)),
+                records=records,
+                selected=best is not None,
+            )
+            continue
         if policy_digest in seen_policy_digests:
             duplicate_policy_count += 1
             records.append(
@@ -11259,11 +12001,38 @@ def _run_sampled_promotion_pass(
             probe_hints,
             timeout_sec=eval_timeout_sec,
         )
+        active_probe_hints = probe_hints
+        bounded_retry_summary: dict[str, Any] | None = None
+        if bool(probe_result.get("timed_out", False)) and _promotion_bounded_retry_enabled():
+            retry_hints = _bounded_retry_probe_hints(probe_hints)
+            retry_timeout = min(
+                eval_timeout_sec,
+                max(10, eval_timeout_sec // 2 if eval_timeout_sec else 0),
+            )
+            retry_result = _evaluate_sampled_budget_tasks_for_promotion(
+                probe_context,
+                retry_hints,
+                timeout_sec=retry_timeout,
+            )
+            bounded_retry_summary = {
+                "attempted": True,
+                "intent_survived": _candidate_intent_survived_retry(probe_hints, retry_hints),
+                "timeout_sec": retry_timeout,
+                "timed_out": bool(retry_result.get("timed_out", False)),
+                "direct_valid": _promotion_result_direct_valid(retry_result),
+                "latency_usec": _promotion_latency(retry_result),
+                "policy_digest": _hint_digest(_policy_effect_payload(retry_hints)),
+            }
+            if _promotion_result_direct_valid(retry_result):
+                probe_result = retry_result
+                active_probe_hints = retry_hints
+                policy_digest = str(bounded_retry_summary["policy_digest"])
         probe_latency = _promotion_latency(probe_result)
+        path_diff = _path_differential_summary(seed_probe_summary, probe_result)
         probe_record = _promotion_record_summary(
             index=index,
             stage="probe_qbp",
-            hints=probe_hints,
+            hints=active_probe_hints,
             result=probe_result,
             reason="",
             code_digest=code_digest,
@@ -11273,6 +12042,25 @@ def _run_sampled_promotion_pass(
         probe_record["probe_policy_digest"] = policy_digest
         effective_digest = _promotion_effective_probe_digest(probe_result)
         probe_record["probe_effective_digest"] = effective_digest
+        path_source_digest = _promotion_path_source_digest(probe_result)
+        probe_record["path_source_digest"] = path_source_digest
+        probe_record["path_differential"] = path_diff
+        probe_record["path_collapse_reason"] = path_diff.get("collapse_reason")
+        probe_record["timeout_context"] = _promotion_timeout_context(
+            active_probe_hints,
+            selected_probe_tasks,
+            place_timeout_sec=_candidate_place_timeout_sec(context),
+            qbp_timeout_sec=eval_timeout_sec,
+            total_timeout_sec=timeout_sec,
+            last_phase=str(
+                probe_result.get(
+                    "last_timing_phase",
+                    probe_result.get("timeout_phase", "done"),
+                )
+            ),
+        )
+        if bounded_retry_summary is not None:
+            probe_record["bounded_retry"] = bounded_retry_summary
         records.append(probe_record)
         _write_promotion_progress(
             promotion_dir,
@@ -11292,6 +12080,11 @@ def _run_sampled_promotion_pass(
             probe_record["reason"] = "duplicate_probe_effective_path"
             continue
         seen_effective_digests.add(effective_digest)
+        if path_source_digest in seen_path_source_digests:
+            duplicate_path_source_count += 1
+            probe_record["reason"] = "duplicate_probe_path_source"
+            continue
+        seen_path_source_digests.add(path_source_digest)
         if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
             probe_record["reason"] = "probe_not_latency_improved"
             continue
@@ -11323,20 +12116,24 @@ def _run_sampled_promotion_pass(
         )
         full_result = _evaluate_sampled_budget_tasks_for_promotion(
             context,
-            probe_hints,
+            active_probe_hints,
             timeout_sec=eval_timeout_sec,
         )
         full_latency = _promotion_latency(full_result)
         full_record = _promotion_record_summary(
             index=index,
             stage="sampled_qbp",
-            hints=probe_hints,
+            hints=active_probe_hints,
             result=full_result,
             reason="",
             code_digest=code_digest,
         )
         full_record["reference_latency_usec"] = full_reference_cost
         full_record["probe_latency_usec"] = probe_latency
+        full_record["path_differential"] = _path_differential_summary(
+            _probe_seed_summary(context.get("sampled_budget_tasks", []), full_reference_cost),
+            full_result,
+        )
         records.append(full_record)
         _write_promotion_progress(
             promotion_dir,
@@ -11359,7 +12156,7 @@ def _run_sampled_promotion_pass(
             _finite_float(full_result.get("bootstrap_count"), 0.0),
             _finite_float(full_result.get("rescale_count"), 0.0),
             index,
-            probe_hints,
+            active_probe_hints,
             full_record,
             code,
         )
@@ -11372,8 +12169,27 @@ def _run_sampled_promotion_pass(
         "probe_evaluated_count": probe_evaluated_count,
         "duplicate_policy_count": duplicate_policy_count,
         "duplicate_effective_path_count": duplicate_effective_count,
+        "duplicate_path_source_count": duplicate_path_source_count,
+        "strategy_discovery_seed_equivalent_skip_count": discovery_seed_equivalent_skip_count,
         "distinct_probe_policy_count": len(seen_policy_digests),
         "distinct_probe_effective_path_count": len(seen_effective_digests),
+        "distinct_probe_path_source_count": len(seen_path_source_digests),
+        "strategy_discovery": {
+            "enabled": bool(_strategy_discovery_enabled()),
+            "summary_path": str(promotion_dir / "strategy_discovery" / "strategy_table.json"),
+            "path_delta_path": str(promotion_dir / "strategy_discovery" / "path_delta_table.json"),
+            "path_moving_code_count": len(discovery.get("path_moving_codes", []) or []),
+            "latency_improved_count": int(
+                discovery.get("summary", {}).get("latency_improved_count", 0)
+                if isinstance(discovery.get("summary"), dict)
+                else 0
+            ),
+            "path_moving_count": int(
+                discovery.get("summary", {}).get("path_moving_count", 0)
+                if isinstance(discovery.get("summary"), dict)
+                else 0
+            ),
+        },
         "probe_task_count": len(selected_probe_tasks),
         "probe_reference_latency_usec": probe_reference_cost,
         "sampled_reference_latency_usec": full_reference_cost,

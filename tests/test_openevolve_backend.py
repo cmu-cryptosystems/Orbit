@@ -6626,6 +6626,262 @@ def test_sampled_promotion_clamps_before_complexity_reject(
     assert summary["records"][0]["reason"] == "probe_not_latency_improved"
 
 
+def test_strategy_discovery_variants_change_one_dimension(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {
+                "in_lvl": -1,
+                "in_scl": 40,
+                "maino_v": "",
+                "main_dag_size": 3,
+            },
+            "min_cost_usec": 100.0,
+        }
+    ]
+    tasks = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+
+    variants = oe_backend._strategy_discovery_variants(
+        {"strategy": "bootstrap_mcts", "boundary_scale_policy": "frontier"},
+        context,
+        tasks,
+    )
+
+    assert variants
+    dimensions = {item["dimension"] for item in variants}
+    assert {
+        "boundary_scale_policy",
+        "scale_lattice",
+        "boundary_state_cap",
+        "beam_width",
+        "bootstrap_penalty",
+        "action_allowlist",
+        "per_top_boundary_override",
+    }.issubset(dimensions)
+    assert all(item["changed_keys"] for item in variants)
+    assert all(isinstance(item["hints"], dict) for item in variants)
+
+
+def test_path_differential_reports_collapse_and_latency_reasons():
+    seed = {
+        "selected_path_digest": "seed",
+        "selected_source_counts": {"candidate:boundary_mcts:budget": 1},
+        "latency_usec": 100.0,
+        "bootstrap_count": 2.0,
+        "rescale_count": 5.0,
+    }
+    base = {
+        "valid": True,
+        "boundary_group_validity": 1.0,
+        "candidate_qbp_coverage": 1.0,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "diagnostics": {
+            "fallback_selected_boundary_groups": 0,
+            "invalid_boundary_groups": 0,
+            "candidate_solved_boundary_groups": 1,
+            "selected_source_counts": {"candidate:boundary_mcts:budget": 1},
+        },
+    }
+
+    same = oe_backend._path_differential_summary(
+        seed,
+        {**base, "sampled_selected_path_digest": "seed", "sampled_dp_latency_usec": 100.0},
+    )
+    tied = oe_backend._path_differential_summary(
+        seed,
+        {**base, "sampled_selected_path_digest": "changed", "sampled_dp_latency_usec": 100.0},
+    )
+    slower = oe_backend._path_differential_summary(
+        seed,
+        {**base, "sampled_selected_path_digest": "changed2", "sampled_dp_latency_usec": 110.0},
+    )
+    faster = oe_backend._path_differential_summary(
+        seed,
+        {**base, "sampled_selected_path_digest": "changed3", "sampled_dp_latency_usec": 90.0},
+    )
+    timeout = oe_backend._path_differential_summary(seed, {"timed_out": True})
+
+    assert same["collapse_reason"] == "same_action_order"
+    assert tied["collapse_reason"] == "probe_tied_seed"
+    assert slower["collapse_reason"] == "changed_but_slower"
+    assert faster["collapse_reason"] == "changed_and_faster"
+    assert timeout["collapse_reason"] == "timed_out_before_qbp"
+
+
+def test_sampled_promotion_skips_discovery_seed_equivalent_policy(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {"task_position": 0, "task_index": 0, "sampled_dp_latency_usec": 100.0}
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'clone'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    candidate_hints = {"marker": "clone", "mcts_action_presets": {"budget_fulfillment_beam": {"prior": 0.6}}}
+    monkeypatch.setattr(oe_backend, "_hints_from_code", lambda *_args: candidate_hints)
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    probe_hints = oe_backend._promotion_probe_hints(
+        oe_backend._compile_hints_for_eval_suite(candidate_hints, params.openevolve_eval_suite),
+        context["sampled_budget_tasks"],
+    )
+    skip_digest = oe_backend._hint_digest(oe_backend._policy_effect_payload(probe_hints))
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "skip_policy_digests": {skip_digest},
+            "examples": [],
+            "summary": {"latency_improved_count": 0, "path_moving_count": 0},
+        },
+    )
+
+    def fail_eval(*_args, **_kwargs):
+        raise AssertionError("discovery-proven seed-equivalent candidate should not run QBP")
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fail_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {"strategy": "bootstrap_mcts"},
+    )
+
+    assert selected is None
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["strategy_discovery_seed_equivalent_skip_count"] == 1
+    assert summary["records"][0]["reason"] == "strategy_discovery_seed_equivalent_probe_skip"
+
+
+def test_timed_out_promotion_probe_records_context_and_bounded_retry(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {
+            "task_position": 0,
+            "task_index": 0,
+            "sampled_dp_latency_usec": 100.0,
+            "selected_path_digest": "seed",
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'retry'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {
+            "marker": "retry",
+            "mcts_action_presets": {
+                "dense_boundary_cost_beam": {
+                    "prior": 0.9,
+                    "policy": {
+                        "beam_width": 64,
+                        "boundary_state_cap": 64,
+                        "max_scale_candidates": 256,
+                    },
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    calls = []
+
+    def fake_eval(sampled_context, hints, *, timeout_sec):
+        calls.append(hints)
+        if len(calls) == 1:
+            return {
+                "valid": False,
+                "timed_out": True,
+                "timeout_sec": timeout_sec,
+                "timeout_phase": "qbp_solve",
+                "error": "timeout",
+            }
+        latency = 90.0 if sampled_context.get("harness", {}).get("experience_probe") else 80.0
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": latency,
+            "objective_cost_usec": latency,
+            "bootstrap_count": 1,
+            "rescale_count": 2,
+            "sampled_selected_path_digest": "retry-path",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:boundary_mcts:dense": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert len(calls) == 3
+    assert calls[1]["mcts_action_presets"]["dense_boundary_cost_beam"]["policy"][
+        "max_scale_candidates"
+    ] == 24
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    probe_record = summary["records"][0]
+    assert probe_record["bounded_retry"]["attempted"] is True
+    assert probe_record["bounded_retry"]["intent_survived"] is True
+    assert probe_record["timeout_context"]["qbp_solve_timeout_sec"] >= 0
+    assert probe_record["path_differential"]["collapse_reason"] == "changed_and_faster"
+
+
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
     toy_cost_json: str,
 ):

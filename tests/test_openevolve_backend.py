@@ -2656,10 +2656,50 @@ def test_strategy_discovery_includes_reference_anchor_probe_variants(
     assert forced["max_scale_candidates"] == 6
 
 
+def test_seed_maintenance_overrides_shift_or_remove_seed_bootstrap(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    graph = Tdag(params, "seed_maintenance_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node("prev", op="add", weight=1, op_descr={}, comment="")
+    graph.add_node("boot", op="mul", weight=1, op_descr={"single": 1, "double": 0}, comment="")
+    graph.add_node("next", op="add", weight=1, op_descr={}, comment="")
+    graph.add_edges_from([("arg0", "prev"), ("prev", "boot"), ("boot", "next")])
+    graph.inputs = {"arg0"}
+    graph.outputs = {"next"}
+    seed_anchor = {
+        "valid": True,
+        "vertex_bootstrap_nodes": ["boot"],
+        "bootstrap_nodes": ["boot"],
+    }
+
+    remove = oe_backend._qbp_dp_seed_maintenance_overrides(
+        graph,
+        seed_anchor,
+        {"dp_seed_maintenance_mode": "remove_seed_bootstrap"},
+    )
+    shift_prev = oe_backend._qbp_dp_seed_maintenance_overrides(
+        graph,
+        seed_anchor,
+        {"dp_seed_maintenance_mode": "shift_prev"},
+    )
+    shift_next = oe_backend._qbp_dp_seed_maintenance_overrides(
+        graph,
+        seed_anchor,
+        {"dp_seed_maintenance_mode": "shift_next"},
+    )
+
+    assert remove["forbid_bootstrap_nodes"] == {"boot"}
+    assert remove["force_bootstrap_nodes"] == set()
+    assert shift_prev["forbid_bootstrap_nodes"] == {"boot"}
+    assert shift_prev["force_bootstrap_nodes"] == {"prev"}
+    assert shift_next["forbid_bootstrap_nodes"] == {"boot"}
+    assert shift_next["force_bootstrap_nodes"] == {"next"}
+
+
 def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     toy_cost_json: str, monkeypatch
 ):
-    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "12")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "16")
     params = _params(
         toy_cost_json,
         openevolve_search_mode="bootstrap-mcts",
@@ -2709,13 +2749,11 @@ def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     )
     labels = [str(item["label"]) for item in variants]
 
-    assert labels[:3] == [
-        "dp_output_splice_frontier",
-        "dp_output_splice_low",
-        "dp_output_splice_waterline",
-    ]
-    assert labels.index("reference_anchor_neighborhood_frontier") > labels.index(
-        "dp_output_splice_waterline"
+    assert labels[0].startswith("seed_bootstrap_")
+    assert "seed_bootstrap_remove_0" in labels
+    assert "seed_bootstrap_shift_prev_0" in labels
+    assert labels.index("dp_output_splice_frontier") > labels.index(
+        "seed_bootstrap_shift_prev_0"
     )
 
 
@@ -7005,7 +7043,8 @@ def test_strategy_discovery_micro_probe_keeps_slower_path_as_example(
     assert discovery["records"][0]["path_differential"]["selected_path_changed"] is True
     assert discovery["summary"]["path_moving_count"] == 1
     assert discovery["summary"]["latency_improved_count"] == 0
-    assert discovery["path_moving_codes"]
+    assert not discovery["path_moving_codes"]
+    assert discovery["summary"]["skip_policy_digest_count"] == 1
 
 
 def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):
@@ -7246,7 +7285,8 @@ def test_sampled_promotion_clamps_before_complexity_reject(
     assert summary["records"][0]["reason"] == "probe_not_latency_improved"
 
 
-def test_strategy_discovery_variants_change_one_dimension(toy_cost_json: str):
+def test_strategy_discovery_variants_change_one_dimension(toy_cost_json: str, monkeypatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "32")
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)
     context["harness"]["top_costly_boundary_groups"] = [
@@ -7286,6 +7326,7 @@ def test_strategy_discovery_variants_change_one_dimension(toy_cost_json: str):
         "bootstrap_penalty",
         "action_allowlist",
         "per_top_boundary_override",
+        "seed_maintenance_perturbation",
     }.issubset(dimensions)
     assert all(item["changed_keys"] for item in variants)
     assert all(isinstance(item["hints"], dict) for item in variants)

@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import time
 import traceback
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -8308,6 +8308,13 @@ _POLICY_EFFECT_KEYS = (
     "bootstrap_anchor_selector",
     "bootstrap_anchor_include_patterns",
     "bootstrap_anchor_exclude_patterns",
+    "forbid_bootstrap_nodes",
+    "dp_seed_maintenance_mode",
+    "dp_seed_maintenance_index",
+    "dp_seed_maintenance_count",
+    "dp_seed_maintenance_radius",
+    "dp_seed_maintenance_direction",
+    "dp_force_nodes_only",
     "selection_objective",
     "prefer_component_budget_fit",
     "force_bootstrap_anchors",
@@ -10740,9 +10747,9 @@ def _promotion_candidate_limit(params: Params) -> int:
 def _promotion_timeout_sec(params: Params) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else 300
+        value = int(raw) if raw else 600
     except ValueError:
-        value = 300
+        value = 600
     return max(0, min(86_400, value))
 
 
@@ -10772,18 +10779,18 @@ def _strategy_discovery_limit() -> int:
 def _strategy_discovery_timeout_sec(promotion_timeout_sec: int) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else min(120, max(30, promotion_timeout_sec // 3))
+        value = int(raw) if raw else min(300, max(90, promotion_timeout_sec // 2))
     except ValueError:
-        value = min(120, max(30, promotion_timeout_sec // 3))
+        value = min(300, max(90, promotion_timeout_sec // 2))
     return max(0, min(max(0, promotion_timeout_sec), value))
 
 
 def _strategy_discovery_eval_timeout_sec(promotion_eval_timeout_sec: int) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_EVAL_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else min(15, max(5, promotion_eval_timeout_sec // 3))
+        value = int(raw) if raw else min(45, max(15, promotion_eval_timeout_sec // 4))
     except ValueError:
-        value = min(15, max(5, promotion_eval_timeout_sec // 3))
+        value = min(45, max(15, promotion_eval_timeout_sec // 4))
     return max(0, min(max(0, promotion_eval_timeout_sec), value))
 
 
@@ -11985,6 +11992,61 @@ def _strategy_discovery_variants(
             "max_scale_candidates": 16,
         }
 
+    def seed_maintenance_patch(mode: str, index: int, *, boundary_policy: str = "frontier") -> dict[str, Any]:
+        return {
+            "dp_probe_mode": "seed_maintenance_shift",
+            "dp_seed_exact_only": False,
+            "dp_disable_seed_exact_candidate": False,
+            "dp_force_nodes_only": True,
+            "enable_seed_frontier_anchor": True,
+            "dp_seed_neighborhood_radius": 1,
+            "dp_seed_maintenance_mode": mode,
+            "dp_seed_maintenance_index": int(index),
+            "dp_seed_maintenance_count": 1,
+            "dp_seed_maintenance_radius": 1,
+            "dp_max_combos_per_node": 1,
+            "dp_max_incoming_options_per_combo": 3,
+            "dp_max_level_candidates": 2,
+            "dp_max_output_states_per_input": 4,
+            "boundary_scale_policy": boundary_policy,
+            "scale_lattice": "waterline_sf",
+            "frontier_cap": 5,
+            "state_cap_per_node": 5,
+            "boundary_state_cap": 4,
+            "max_scale_candidates": 10,
+            "bootstrap_penalty": 35_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+            "selection_objective": "cost",
+        }
+
+    for index in (0, 1):
+        for label_suffix, mode in (
+            ("remove", "remove_seed_bootstrap"),
+            ("shift_prev", "shift_prev"),
+            ("shift_next", "shift_next"),
+        ):
+            patch = seed_maintenance_patch(mode, index)
+            add(
+                f"seed_bootstrap_{label_suffix}_{index}",
+                "seed_maintenance_perturbation",
+                {
+                    "boundary_group_policies": [
+                        {
+                            "selector": output_splice_selectors[0],
+                            "policy": patch,
+                        }
+                    ]
+                }
+                if output_splice_selectors[0]
+                else patch,
+                changed_keys=[
+                    "boundary_group_policies",
+                    "dp_seed_maintenance_mode",
+                    "dp_seed_maintenance_index",
+                    "dp_probe_mode",
+                ],
+            )
+
     output_splice_specs = (
         ("dp_output_splice_frontier", "frontier", "waterline_sf"),
         ("dp_output_splice_waterline", "waterline", "waterline_sf"),
@@ -12221,9 +12283,10 @@ def _strategy_discovery_variants(
             )
     if reference_anchor_probe_selected:
         dimension_priority = {
-            "per_top_boundary_override": 0,
-            "dp_probe_mode": 1,
-            "multi_boundary_output_splice": 1,
+            "seed_maintenance_perturbation": 0,
+            "per_top_boundary_override": 1,
+            "dp_probe_mode": 2,
+            "multi_boundary_output_splice": 2,
             "reference_bootstrap_anchor_policy": 2,
             "boundary_scale_policy": 3,
             "scale_lattice": 3,
@@ -12241,6 +12304,8 @@ def _strategy_discovery_variants(
         def reference_anchor_priority(item: dict[str, Any]) -> tuple[int, str]:
             label = str(item.get("label", ""))
             dimension = str(item.get("dimension", ""))
+            if label.startswith("seed_bootstrap_"):
+                return (0, label)
             if label.startswith("reference_anchor_"):
                 return (2, f"{reference_label_priority.get(label, 99):02d}:{label}")
             if label.startswith("dp_output_splice"):
@@ -12354,6 +12419,12 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
         "output-splice",
         "terminal_splice",
         "terminal-splice",
+        "seed_maintenance",
+        "seed-maintenance",
+        "seed_maintenance_shift",
+        "seed-maintenance-shift",
+        "seed_bootstrap_shift",
+        "seed-bootstrap-shift",
         "broad",
     } or (
         "dp_seed_exact_only" in result
@@ -12522,6 +12593,16 @@ def _run_strategy_discovery_prepass(
     micro_probe_context: dict[str, Any] | None = None
     micro_seed_summary: dict[str, Any] | None = None
     micro_reference_cost = float("inf")
+    micro_timeout_sec = max(
+        1,
+        min(
+            discovery_eval_timeout_sec,
+            _int_hint(
+                os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_MICRO_TIMEOUT_SEC"),
+                25,
+            ),
+        ),
+    )
     if micro_probe_tasks:
         micro_probe_context = deepcopy(context)
         micro_probe_context["sampled_budget_tasks"] = deepcopy(micro_probe_tasks)
@@ -12541,7 +12622,7 @@ def _run_strategy_discovery_prepass(
             micro_probe_context,
             seed_probe_hints,
             micro_probe_tasks,
-            timeout_sec=max(1, min(discovery_eval_timeout_sec, 10)),
+            timeout_sec=micro_timeout_sec,
             materialize=False,
         )
         micro_reference_cost = _promotion_latency(seed_probe)
@@ -12601,7 +12682,7 @@ def _run_strategy_discovery_prepass(
                     micro_probe_context,
                     micro_hints,
                     micro_probe_tasks,
-                    timeout_sec=max(1, min(discovery_eval_timeout_sec, 10)),
+                    timeout_sec=micro_timeout_sec,
                     materialize=False,
                 )
                 micro_latency = _promotion_latency(micro_result)
@@ -12648,7 +12729,7 @@ def _run_strategy_discovery_prepass(
                         "changed_keys": variant.get("changed_keys", []),
                         "reason": reason,
                         "probe_policy_digest": policy_digest,
-                        "direct_valid": False,
+                        "direct_valid": bool(micro_direct_valid),
                         "valid": bool(micro_result.get("valid", False)),
                         "latency_usec": micro_latency,
                         "reference_latency_usec": micro_reference_cost,
@@ -12686,13 +12767,7 @@ def _run_strategy_discovery_prepass(
                             "micro_probe": True,
                         }
                     )
-                    if micro_path_changed:
-                        path_moving_codes.append(
-                            _strategy_discovery_program_source(
-                                str(variant.get("label", "strategy")),
-                                micro_hints,
-                            )
-                        )
+                    skip_policy_digests.add(policy_digest)
                     partial_summary = {
                         "enabled": True,
                         "variant_count": len(variants),
@@ -12837,14 +12912,16 @@ def _run_strategy_discovery_prepass(
                 str(variant.get("label", "strategy")),
                 active_hints,
             )
-            path_moving_codes.append(discovery_code)
             if improved:
+                path_moving_codes.append(discovery_code)
                 latency_improved_codes.append(
                     {
                         "code": discovery_code,
                         "record": deepcopy(record),
                     }
                 )
+            else:
+                skip_policy_digests.add(policy_digest)
         partial_summary = {
             "enabled": True,
             "variant_count": len(variants),
@@ -12888,6 +12965,7 @@ def _run_strategy_discovery_prepass(
         "stop_after_improved": stop_after_improved,
         "timeout_sec": discovery_timeout_sec,
         "eval_timeout_sec": discovery_eval_timeout_sec,
+        "micro_timeout_sec": micro_timeout_sec,
         "elapsed_sec": round(time.monotonic() - discovery_started_at, 6),
         "records": records,
     }
@@ -12987,6 +13065,9 @@ def _compact_seed_anchor_for_debug(seed_anchor: dict[str, Any] | None) -> dict[s
         "out_key": seed_anchor.get("out_key"),
         "bootstrap_count": seed_anchor.get("bootstrap_count"),
         "rescale_count": seed_anchor.get("rescale_count"),
+        "vertex_bootstrap_nodes": list(seed_anchor.get("vertex_bootstrap_nodes", []) or [])[:24],
+        "incoming_bootstrap_nodes": list(seed_anchor.get("incoming_bootstrap_nodes", []) or [])[:24],
+        "bootstrap_nodes": list(seed_anchor.get("bootstrap_nodes", []) or [])[:24],
         "node_output_count": len(node_outputs) if isinstance(node_outputs, dict) else 0,
         "node_input_count": len(node_inputs) if isinstance(node_inputs, dict) else 0,
         "edge_dst_count": len(edge_outputs) if isinstance(edge_outputs, dict) else 0,
@@ -16766,11 +16847,29 @@ def _qbp_dp_seed_anchor_data(
     node_inputs: dict[str, tuple[int, int]] = {}
     edge_outputs_by_dst: dict[str, dict[str, tuple[int, int]]] = {}
     edge_scales_by_dst: dict[str, dict[str, int]] = {}
+    vertex_bootstrap_nodes: list[str] = []
+    incoming_bootstrap_nodes: list[str] = []
     for node in pdag.nodes:
         if node in assign.v_lvl_out and node in assign.v_scl_out:
             node_outputs[str(node)] = (int(assign.v_lvl_out[node]), int(assign.v_scl_out[node]))
         if node in assign.v_lvl_in and node in assign.v_scl_in:
             node_inputs[str(node)] = (int(assign.v_lvl_in[node]), int(assign.v_scl_in[node]))
+        if (
+            node in assign.v_lvl_in
+            and node in assign.v_scl_in
+            and node in assign.v_lvl_out
+            and node in assign.v_scl_out
+            and pdag.nodes[node].get("op") != "constant"
+        ):
+            delta = _transition_count_values(
+                params,
+                int(assign.v_lvl_in[node]),
+                int(assign.v_scl_in[node]),
+                int(assign.v_lvl_out[node]),
+                int(assign.v_scl_out[node]),
+            )
+            if int(delta.get("bootstrap", 0) or 0) > 0:
+                vertex_bootstrap_nodes.append(str(node))
     for edge, level in assign.e_lvl_out.items():
         if edge not in assign.e_scl_out:
             continue
@@ -16780,6 +16879,31 @@ def _qbp_dp_seed_anchor_data(
             int(assign.e_scl_out[edge]),
         )
         edge_scales_by_dst.setdefault(str(dst), {})[str(pred)] = int(assign.e_scl_out[edge])
+        if pdag.nodes[pred].get("op") != "constant":
+            delta = _transition_count_values(
+                params,
+                int(assign.v_lvl_out[pred]),
+                int(assign.v_scl_out[pred]),
+                int(level),
+                int(assign.e_scl_out[edge]),
+            )
+            if int(delta.get("bootstrap", 0) or 0) > 0:
+                incoming_bootstrap_nodes.append(str(dst))
+    topo_order = {str(node): idx for idx, node in enumerate(nx.topological_sort(pdag))}
+
+    def ordered_unique(nodes: list[str]) -> list[str]:
+        seen_nodes: set[str] = set()
+        result_nodes: list[str] = []
+        for node in sorted(nodes, key=lambda item: (topo_order.get(str(item), 10**9), str(item))):
+            if node in seen_nodes:
+                continue
+            seen_nodes.add(node)
+            result_nodes.append(node)
+        return result_nodes
+
+    vertex_bootstrap_nodes = ordered_unique(vertex_bootstrap_nodes)
+    incoming_bootstrap_nodes = ordered_unique(incoming_bootstrap_nodes)
+    bootstrap_nodes = ordered_unique(vertex_bootstrap_nodes + incoming_bootstrap_nodes)
     cache[key] = {
         "valid": True,
         "winner_selectable": False,
@@ -16791,6 +16915,9 @@ def _qbp_dp_seed_anchor_data(
         "node_inputs": node_inputs,
         "edge_outputs_by_dst": edge_outputs_by_dst,
         "edge_scales_by_dst": edge_scales_by_dst,
+        "vertex_bootstrap_nodes": vertex_bootstrap_nodes,
+        "incoming_bootstrap_nodes": incoming_bootstrap_nodes,
+        "bootstrap_nodes": bootstrap_nodes,
         "bootstrap_count": float(_aggregate_counts([assign])["bootstrap"]),
         "rescale_count": float(_aggregate_counts([assign])["rescale"]),
         "attempts": attempts,
@@ -16838,6 +16965,151 @@ def _qbp_dp_seed_candidate_state(
         "candidate_seed_exact",
         0.0,
     )
+
+
+def _qbp_dp_ordered_seed_bootstrap_nodes(
+    tdag: Tdag,
+    seed_anchor: dict[str, Any] | None,
+    *,
+    include_incoming: bool = False,
+) -> list[str]:
+    if not isinstance(seed_anchor, dict) or not seed_anchor.get("valid"):
+        return []
+    raw_nodes = seed_anchor.get(
+        "bootstrap_nodes" if include_incoming else "vertex_bootstrap_nodes",
+        [],
+    )
+    if not isinstance(raw_nodes, list):
+        raw_nodes = []
+    if not raw_nodes and not include_incoming:
+        raw_nodes = seed_anchor.get("bootstrap_nodes", [])
+    topo_order = {str(node): idx for idx, node in enumerate(nx.topological_sort(tdag))}
+    result: list[str] = []
+    seen: set[str] = set()
+    for node in sorted((str(item) for item in raw_nodes), key=lambda item: (topo_order.get(item, 10**9), item)):
+        if node in seen or node not in tdag.nodes:
+            continue
+        if tdag.nodes[node].get("op") in {"input", "constant"}:
+            continue
+        seen.add(node)
+        result.append(node)
+    return result
+
+
+def _qbp_dp_neighbor_nodes_for_shift(
+    tdag: Tdag,
+    node: str,
+    direction: str,
+    *,
+    radius: int,
+    limit: int,
+) -> list[str]:
+    direction = str(direction).strip().lower()
+    if direction in {"prev", "previous", "predecessor", "predecessors", "upstream"}:
+        next_nodes = lambda item: list(tdag.predecessors(item))
+    elif direction in {"next", "successor", "successors", "downstream"}:
+        next_nodes = lambda item: list(tdag.successors(item))
+    else:
+        return []
+    topo_order = {str(item): idx for idx, item in enumerate(nx.topological_sort(tdag))}
+    queue: deque[tuple[str, int]] = deque([(str(node), 0)])
+    visited = {str(node)}
+    found: list[str] = []
+    while queue and len(found) < max(1, int(limit)):
+        current, depth = queue.popleft()
+        if depth >= max(1, int(radius)):
+            continue
+        neighbors = sorted(
+            (str(item) for item in next_nodes(current)),
+            key=lambda item: (abs(topo_order.get(item, 0) - topo_order.get(str(node), 0)), topo_order.get(item, 10**9), item),
+        )
+        for neighbor in neighbors:
+            if neighbor in visited:
+                continue
+            visited.add(neighbor)
+            if neighbor not in tdag.nodes:
+                continue
+            if tdag.nodes[neighbor].get("op") not in {"input", "constant"}:
+                found.append(neighbor)
+                if len(found) >= max(1, int(limit)):
+                    break
+            queue.append((neighbor, depth + 1))
+    return found
+
+
+def _qbp_dp_seed_maintenance_overrides(
+    tdag: Tdag,
+    seed_anchor: dict[str, Any] | None,
+    hints: dict[str, Any],
+) -> dict[str, Any]:
+    mode = str(hints.get("dp_seed_maintenance_mode", "")).strip().lower()
+    if not mode:
+        return {
+            "focus_nodes": [],
+            "forbid_bootstrap_nodes": set(),
+            "force_bootstrap_nodes": set(),
+        }
+    seed_nodes = _qbp_dp_ordered_seed_bootstrap_nodes(
+        tdag,
+        seed_anchor,
+        include_incoming=_bool_hint(hints.get("dp_seed_maintenance_include_incoming"), False),
+    )
+    if not seed_nodes:
+        return {
+            "focus_nodes": [],
+            "forbid_bootstrap_nodes": set(),
+            "force_bootstrap_nodes": set(),
+        }
+    start = max(0, _int_hint(hints.get("dp_seed_maintenance_index"), 0))
+    count = max(1, min(4, _int_hint(hints.get("dp_seed_maintenance_count"), 1)))
+    focus_nodes = seed_nodes[start : start + count]
+    if not focus_nodes:
+        return {
+            "focus_nodes": [],
+            "forbid_bootstrap_nodes": set(),
+            "force_bootstrap_nodes": set(),
+        }
+    radius = max(1, min(4, _int_hint(hints.get("dp_seed_maintenance_radius"), 1)))
+    force_nodes: set[str] = set()
+    forbid_nodes: set[str] = set()
+    if mode in {
+        "remove",
+        "remove_bootstrap",
+        "remove_seed_bootstrap",
+        "shift_prev",
+        "shift_previous",
+        "shift_next",
+        "shift_successor",
+        "shift_both",
+        "move",
+    }:
+        forbid_nodes.update(focus_nodes)
+    directions: list[str] = []
+    explicit_direction = str(hints.get("dp_seed_maintenance_direction", "")).strip().lower()
+    if mode in {"shift_prev", "shift_previous"} or explicit_direction in {"prev", "previous", "predecessor"}:
+        directions = ["prev"]
+    elif mode in {"shift_next", "shift_successor"} or explicit_direction in {"next", "successor"}:
+        directions = ["next"]
+    elif mode in {"shift_both", "move"} or explicit_direction in {"both", "around"}:
+        directions = ["prev", "next"]
+    for focus in focus_nodes:
+        for direction in directions:
+            force_nodes.update(
+                _qbp_dp_neighbor_nodes_for_shift(
+                    tdag,
+                    focus,
+                    direction,
+                    radius=radius,
+                    limit=1,
+                )
+            )
+    return {
+        "focus_nodes": focus_nodes,
+        "forbid_bootstrap_nodes": forbid_nodes,
+        "force_bootstrap_nodes": force_nodes,
+        "seed_bootstrap_nodes": seed_nodes,
+        "mode": mode,
+    }
 
 
 def _qbp_dp_seed_tuple(raw: Any) -> tuple[int, int] | None:
@@ -17224,10 +17496,16 @@ def _qbp_dp_node_states(
     seed_edge_targets: dict[str, int] = {
         str(k): int(v) for k, v in dict(seed_edge_scales).items()
     }
+    maintenance_overrides = _qbp_dp_seed_maintenance_overrides(tdag, seed_anchor, hints)
+    force_bootstrap_nodes = set(policy.get("force_bootstrap_nodes", set()))
+    force_bootstrap_nodes.update(maintenance_overrides.get("force_bootstrap_nodes", set()))
+    forbid_bootstrap_nodes = set(policy.get("forbid_bootstrap_nodes", set()))
+    forbid_bootstrap_nodes.update(maintenance_overrides.get("forbid_bootstrap_nodes", set()))
     force_bootstrap_node = (
-        str(node) in policy.get("force_bootstrap_nodes", set())
+        str(node) in force_bootstrap_nodes
         and not policy.get("forbid_bootstrap", False)
     )
+    forbid_bootstrap_node = str(node) in forbid_bootstrap_nodes
     force_nodes_only = _bool_hint(hints.get("dp_force_nodes_only"), False)
     online_prune_limit = max(state_cap * 8, 64)
     if isinstance(trace, dict):
@@ -17272,6 +17550,21 @@ def _qbp_dp_node_states(
         ):
             seed_exact_state = None
             rejection_counts["forced_anchor_seed_exact_no_bootstrap"] += 1
+    if forbid_bootstrap_node and seed_exact_state is not None:
+        seed_input_tuple = _qbp_dp_seed_tuple(seed_node_inputs.get(str(node)))
+        seed_output_tuple_for_check = _qbp_dp_seed_tuple(seed_node_outputs.get(str(node)))
+        if (
+            seed_input_tuple is not None
+            and seed_output_tuple_for_check is not None
+            and not params.check_res(
+                int(seed_input_tuple[0]),
+                int(seed_input_tuple[1]),
+                int(seed_output_tuple_for_check[0]),
+                int(seed_output_tuple_for_check[1]),
+            )
+        ):
+            seed_exact_state = None
+            rejection_counts["forbidden_anchor_seed_exact_bootstrap"] += 1
     seed_exact_disabled_requested = _bool_hint(hints.get("dp_disable_seed_exact_candidate"), False)
     if force_nodes_only:
         seed_exact_disabled_requested = bool(force_bootstrap_node)
@@ -17598,6 +17891,9 @@ def _qbp_dp_node_states(
                         rejection_counts["forced_anchor_no_bootstrap_transition"] += 1
                         continue
                     vertex_cost, vertex_bootstrap, vertex_rescale = metrics
+                    if forbid_bootstrap_node and float(vertex_bootstrap) > 0.0:
+                        rejection_counts["forbidden_anchor_bootstrap_transition"] += 1
+                        continue
                     op_cost = _qbp_dp_op_cost(tdag, node, input_level, le)
                     total_cost = (
                         sum(state.cost for state in combo)
@@ -19053,6 +19349,7 @@ def _apply_boundary_group_policy_overlays(
                 "bootstrap_anchor_selector",
                 "bootstrap_anchor_include_patterns",
                 "bootstrap_anchor_exclude_patterns",
+                "forbid_bootstrap_nodes",
                 "force_bootstrap_anchors",
                 "selection_objective",
                 "prefer_component_budget_fit",
@@ -19066,11 +19363,17 @@ def _apply_boundary_group_policy_overlays(
                 "dp_seed_exact_only",
                 "dp_disable_seed_exact_candidate",
                 "dp_seed_splice_output_only",
+                "dp_force_nodes_only",
                 "dp_seed_neighborhood_radius",
                 "dp_max_combos_per_node",
                 "dp_max_incoming_options_per_combo",
                 "dp_max_level_candidates",
                 "dp_max_output_states_per_input",
+                "dp_seed_maintenance_mode",
+                "dp_seed_maintenance_index",
+                "dp_seed_maintenance_count",
+                "dp_seed_maintenance_radius",
+                "dp_seed_maintenance_direction",
                 "frontier_cap",
             }:
                 merged[key] = value
@@ -19099,11 +19402,17 @@ def _boundary_group_action_patch(patch: dict[str, Any]) -> dict[str, Any]:
             "dp_seed_exact_only",
             "dp_disable_seed_exact_candidate",
             "dp_seed_splice_output_only",
+            "dp_force_nodes_only",
             "dp_seed_neighborhood_radius",
             "dp_max_combos_per_node",
             "dp_max_incoming_options_per_combo",
             "dp_max_level_candidates",
             "dp_max_output_states_per_input",
+            "dp_seed_maintenance_mode",
+            "dp_seed_maintenance_index",
+            "dp_seed_maintenance_count",
+            "dp_seed_maintenance_radius",
+            "dp_seed_maintenance_direction",
             "frontier_cap",
         }:
             continue
@@ -21036,6 +21345,11 @@ def _policy_options(hints: dict[str, Any], params: Params) -> dict[str, Any]:
             str(node) for node in hints.get("force_bootstrap_nodes", []) or []
         }
         if isinstance(hints.get("force_bootstrap_nodes", []), (list, tuple, set))
+        else set(),
+        "forbid_bootstrap_nodes": {
+            str(node) for node in hints.get("forbid_bootstrap_nodes", []) or []
+        }
+        if isinstance(hints.get("forbid_bootstrap_nodes", []), (list, tuple, set))
         else set(),
         "max_scale": _max_scale(params),
     }
@@ -24639,6 +24953,8 @@ def _sanitize_policy_values(
         policy["force_bootstrap_anchors"] = _bool_hint(
             policy.get("force_bootstrap_anchors"), False
         )
+    if "dp_force_nodes_only" in policy:
+        policy["dp_force_nodes_only"] = _bool_hint(policy.get("dp_force_nodes_only"), False)
     if "bootstrap_anchor_selector" in policy:
         selector = str(policy.get("bootstrap_anchor_selector", "")).strip().lower()
         allowed_selectors = {
@@ -24672,9 +24988,37 @@ def _sanitize_policy_values(
             else:
                 repairs.append(f"{prefix}.{list_key} reset to []")
                 policy[list_key] = []
-    if "force_bootstrap_nodes" in policy and not isinstance(policy.get("force_bootstrap_nodes"), list):
-        repairs.append(f"{prefix}.force_bootstrap_nodes reset to []")
-        policy["force_bootstrap_nodes"] = []
+    for list_key in ("force_bootstrap_nodes", "forbid_bootstrap_nodes"):
+        if list_key in policy:
+            if isinstance(policy.get(list_key), (list, tuple, set)):
+                policy[list_key] = [str(item) for item in list(policy.get(list_key) or [])[:32]]
+            else:
+                repairs.append(f"{prefix}.{list_key} reset to []")
+                policy[list_key] = []
+    if "dp_seed_maintenance_mode" in policy:
+        mode = str(policy.get("dp_seed_maintenance_mode", "")).strip().lower()
+        allowed_modes = {
+            "",
+            "remove",
+            "remove_bootstrap",
+            "remove_seed_bootstrap",
+            "shift_prev",
+            "shift_previous",
+            "shift_next",
+            "shift_successor",
+            "shift_both",
+            "move",
+        }
+        if mode not in allowed_modes:
+            repairs.append(f"{prefix}.dp_seed_maintenance_mode reset to ''")
+            mode = ""
+        policy["dp_seed_maintenance_mode"] = mode
+    if "dp_seed_maintenance_direction" in policy:
+        direction = str(policy.get("dp_seed_maintenance_direction", "")).strip().lower()
+        if direction not in {"", "prev", "previous", "predecessor", "next", "successor", "both", "around"}:
+            repairs.append(f"{prefix}.dp_seed_maintenance_direction reset to ''")
+            direction = ""
+        policy["dp_seed_maintenance_direction"] = direction
     clamp_int("max_scale_candidates", 3, 128)
     clamp_int("beam_width", 1, 12)
     clamp_int("state_cap_per_node", 1, 64)
@@ -24684,6 +25028,9 @@ def _sanitize_policy_values(
     clamp_int("boundary_state_cap", 1, 16)
     clamp_int("bootstrap_anchor_count", 0, 64)
     clamp_int("bootstrap_anchor_level", int(ckks["lvl_lb"]), int(ckks["lvl_ub"]))
+    clamp_int("dp_seed_maintenance_index", 0, 128)
+    clamp_int("dp_seed_maintenance_count", 1, 4)
+    clamp_int("dp_seed_maintenance_radius", 1, 4)
     if policy.get("min_internal_level") is not None:
         original = policy["min_internal_level"]
         value = max(int(ckks["lvl_lb"]), min(int(ckks["lvl_ub"]), _int_hint(original, int(ckks["lvl_lb"]))))
@@ -25031,6 +25378,13 @@ _PATCHABLE_POLICY_KEYS = {
             "prefer_component_budget_fit",
             "force_bootstrap_anchors",
             "force_bootstrap_nodes",
+            "forbid_bootstrap_nodes",
+            "dp_force_nodes_only",
+            "dp_seed_maintenance_mode",
+            "dp_seed_maintenance_index",
+            "dp_seed_maintenance_count",
+            "dp_seed_maintenance_radius",
+            "dp_seed_maintenance_direction",
             "noise_slack_model",
             "boundary_scale_policy",
     "boundary_state_cap",

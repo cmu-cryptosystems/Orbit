@@ -6546,6 +6546,86 @@ def test_sampled_promotion_dedupes_path_equivalent_candidates(
     assert "duplicate_probe_effective_path" in reasons
 
 
+def test_sampled_promotion_clamps_before_complexity_reject(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {"task_position": 0, "task_index": 0, "sampled_dp_latency_usec": 100.0}
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'wide'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {
+            "marker": "wide",
+            "mcts_action_presets": {
+                "dense_boundary_cost_beam": {
+                    "prior": 0.9,
+                    "policy": {
+                        "beam_width": 64,
+                        "boundary_state_cap": 64,
+                        "max_scale_candidates": 256,
+                        "state_cap_per_node": 128,
+                    },
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    evaluated = []
+
+    def fake_eval(_context, hints, *, timeout_sec):
+        evaluated.append(hints)
+        assert hints["mcts_action_presets"]["dense_boundary_cost_beam"]["policy"][
+            "max_scale_candidates"
+        ] == 48
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 120.0,
+            "objective_cost_usec": 120.0,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {},
+    )
+
+    assert selected is None
+    assert len(evaluated) == 1
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["records"][0]["reason"] == "probe_not_latency_improved"
+
+
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(
     toy_cost_json: str,
 ):

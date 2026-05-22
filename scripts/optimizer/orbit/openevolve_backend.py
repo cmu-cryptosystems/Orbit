@@ -11187,13 +11187,14 @@ def _run_sampled_promotion_pass(
             )
             continue
         eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
-        complexity_reasons = _promotion_complexity_reasons(eval_hints)
+        probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
+        complexity_reasons = _promotion_complexity_reasons(probe_hints)
         if complexity_reasons:
             records.append(
                 _promotion_record_summary(
                     index=index,
                     stage="static",
-                    hints=eval_hints,
+                    hints=probe_hints,
                     reason="promotion_policy_too_expensive:"
                     + ",".join(complexity_reasons[:3]),
                     code_digest=code_digest,
@@ -11210,7 +11211,6 @@ def _run_sampled_promotion_pass(
                 selected=best is not None,
             )
             continue
-        probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
         policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
         if policy_digest in seen_policy_digests:
             duplicate_policy_count += 1
@@ -11323,14 +11323,14 @@ def _run_sampled_promotion_pass(
         )
         full_result = _evaluate_sampled_budget_tasks_for_promotion(
             context,
-            eval_hints,
+            probe_hints,
             timeout_sec=eval_timeout_sec,
         )
         full_latency = _promotion_latency(full_result)
         full_record = _promotion_record_summary(
             index=index,
             stage="sampled_qbp",
-            hints=eval_hints,
+            hints=probe_hints,
             result=full_result,
             reason="",
             code_digest=code_digest,
@@ -11359,7 +11359,7 @@ def _run_sampled_promotion_pass(
             _finite_float(full_result.get("bootstrap_count"), 0.0),
             _finite_float(full_result.get("rescale_count"), 0.0),
             index,
-            eval_hints,
+            probe_hints,
             full_record,
             code,
         )

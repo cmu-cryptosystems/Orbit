@@ -7153,12 +7153,12 @@ def test_qbp_dp_promotion_probe_uses_lightweight_frontier():
 
     clamped = oe_backend._dp_probe_lightweight_hints(hints)
 
-    assert clamped["max_scale_candidates"] == 8
-    assert clamped["state_cap_per_node"] == 8
+    assert clamped["max_scale_candidates"] == 6
+    assert clamped["state_cap_per_node"] == 4
     assert clamped["beam_width"] == 4
-    assert clamped["boundary_state_cap"] == 4
-    assert clamped["boundary_group_policies"][0]["policy"]["max_scale_candidates"] == 8
-    assert clamped["boundary_group_policies"][0]["policy"]["state_cap_per_node"] == 8
+    assert clamped["boundary_state_cap"] == 3
+    assert clamped["boundary_group_policies"][0]["policy"]["max_scale_candidates"] == 6
+    assert clamped["boundary_group_policies"][0]["policy"]["state_cap_per_node"] == 4
 
 
 def test_qbp_manager_dp_sampling_keeps_all_outputs_in_selected_group(

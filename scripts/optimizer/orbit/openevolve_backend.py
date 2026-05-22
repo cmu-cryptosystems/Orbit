@@ -11543,11 +11543,11 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
     """Clamp DP table probes to a cheap frontier before promotion materialization."""
 
     limits = {
-        "max_scale_candidates": 8,
-        "state_cap_per_node": 8,
+        "max_scale_candidates": 6,
+        "state_cap_per_node": 4,
         "beam_width": 4,
-        "boundary_state_cap": 4,
-        "frontier_cap": 8,
+        "boundary_state_cap": 3,
+        "frontier_cap": 4,
     }
 
     def clamp_policy(policy: dict[str, Any]) -> dict[str, Any]:
@@ -14464,7 +14464,7 @@ def _qbp_dp_prune_states(
         return unique
 
     bucket_cap = max(1, min(4, cap))
-    global_cap = max(cap, min(len(unique), cap * 8))
+    global_cap = max(cap, min(len(unique), cap * 4))
     buckets: dict[tuple[int, int, int, int, int], list[_QBPDPState]] = {}
     max_scale = max(int(state.scale) for state in unique)
     max_level = max(int(state.level) for state in unique)
@@ -14787,6 +14787,8 @@ def _qbp_dp_node_states(
     node_scale_hints = _int_map(hints.get("preferred_node_scales", {}))
     edge_scale_hints = _int_map(hints.get("preferred_edge_scales", {}))
     state_cap = max(1, min(64, _int_hint(policy.get("state_cap_per_node"), 16)))
+    if "frontier_cap" in policy:
+        state_cap = min(state_cap, max(1, _int_hint(policy.get("frontier_cap"), state_cap)))
     candidate_states: list[_QBPDPState] = []
     preds = list(tdag.predecessors(node))
     rejection_counts: Counter[str] = Counter()

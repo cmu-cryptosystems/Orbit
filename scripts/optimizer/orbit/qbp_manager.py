@@ -230,7 +230,7 @@ class QBPManager:
             return
         if not raw and not getattr(self.params, "openevolve_collect_diagnostics", False):
             return
-        print(f"[OpenEvolve QBP] {message}", flush=True)
+        print(f"[OpenEvolve QBP] {message}", file=sys.__stderr__, flush=True)
 
     
     def add_qbp_bypass(self, pdag: Tdag, main_pdag: Tdag, bypass_pdag: Tdag, in_budgets: dict[int, dict[int, float]]):

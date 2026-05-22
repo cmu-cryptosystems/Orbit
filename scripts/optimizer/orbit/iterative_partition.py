@@ -336,7 +336,7 @@ def _openevolve_partition_progress(params: Params, message: str):
         return
     if not raw and not getattr(params, "openevolve_collect_diagnostics", False):
         return
-    print(f"[OpenEvolve partition] {message}", flush=True)
+    print(f"[OpenEvolve partition] {message}", file=sys.__stderr__, flush=True)
 
 
 def _prev_cost_state_count(prev_cost: dict) -> int:

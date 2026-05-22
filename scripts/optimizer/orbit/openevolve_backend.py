@@ -5389,12 +5389,37 @@ def _metric_selected_probe_task(
         if isinstance(item, dict) and isinstance(item.get("group_key"), dict)
     ]
     if use_reference_task_groups:
-        group_keys = (
-            _sampled_task_group_key_dicts(task)
-            or list(metric.get("group_keys", []) or [])
+        cap = max(
+            1,
+            min(
+                8,
+                _int_hint(
+                    os.environ.get("ORBIT_OPENEVOLVE_REFERENCE_PROBE_GROUP_CAP"),
+                    2,
+                ),
+            ),
         )
+        group_keys = [
+            deepcopy(item["group_key"])
+            for item in metric_groups[:cap]
+            if isinstance(item.get("group_key"), dict)
+        ]
+        if group_keys:
+            group_cost = sum(
+                _finite_float(item.get("min_cost_usec"), 0.0)
+                for item in metric_groups[:cap]
+                if isinstance(item.get("group_key"), dict)
+            )
+            if group_cost <= 0:
+                group_cost = task_latency
+        else:
+            group_keys = (
+                _sampled_task_group_key_dicts(task)[:cap]
+                or list(metric.get("group_keys", []) or [])[:cap]
+            )
         if group_keys:
             selected_task["group_keys"] = deepcopy(group_keys)
+            selected_task["reference_anchor_probe_group_cap"] = cap
             return selected_task, group_cost
     if metric_groups:
         group = metric_groups[0]
@@ -11697,6 +11722,10 @@ def _strategy_discovery_variants(
     base = _strategy_discovery_base_hints(initial_hints, context)
     variants: list[dict[str, Any]] = []
     labels: set[str] = set()
+    reference_anchor_probe_selected = any(
+        isinstance(task, dict) and bool(task.get("reference_anchor_probe"))
+        for task in selected_probe_tasks or []
+    )
 
     def add(
         label: str,
@@ -11820,23 +11849,29 @@ def _strategy_discovery_variants(
         force: bool,
         radius: int,
     ) -> dict[str, Any]:
+        # Reference-anchor discovery is meant to probe small, component-local
+        # moves around the known-valid seed route. Keep the seed route in the
+        # frontier so discovery completes quickly; otherwise forced-anchor
+        # variants can spend the whole timeout rebuilding a route that the seed
+        # already proves reachable.
+        tight_radius = max(0, min(int(radius), 1))
         patch = {
             "dp_probe_mode": "force_node_splice" if force else "seed_neighborhood",
             "dp_seed_exact_only": False,
             "dp_force_nodes_only": bool(force),
-            "dp_disable_seed_exact_candidate": bool(force),
+            "dp_disable_seed_exact_candidate": False,
             "enable_seed_frontier_anchor": True,
-            "dp_seed_neighborhood_radius": int(radius),
-            "dp_max_combos_per_node": 1 if force else 2,
-            "dp_max_incoming_options_per_combo": 2 if force else 4,
-            "dp_max_level_candidates": 3,
-            "dp_max_output_states_per_input": 4 if force else 5,
+            "dp_seed_neighborhood_radius": tight_radius,
+            "dp_max_combos_per_node": 1,
+            "dp_max_incoming_options_per_combo": 2 if force else 3,
+            "dp_max_level_candidates": 2,
+            "dp_max_output_states_per_input": 3 if force else 4,
             "boundary_scale_policy": boundary_policy,
             "scale_lattice": scale_lattice,
-            "frontier_cap": 4 if force else 8,
-            "state_cap_per_node": 4 if force else 8,
-            "boundary_state_cap": 4 if force else 6,
-            "max_scale_candidates": 12 if force else 24,
+            "frontier_cap": 3 if force else 4,
+            "state_cap_per_node": 3 if force else 4,
+            "boundary_state_cap": 3 if force else 4,
+            "max_scale_candidates": 6 if force else 8,
             "bootstrap_penalty": 35_000_000.0,
             "selection_bootstrap_penalty": 0.0,
             "selection_objective": "cost",
@@ -12102,6 +12137,36 @@ def _strategy_discovery_variants(
                 },
                 changed_keys=["boundary_group_policies"],
             )
+    if reference_anchor_probe_selected:
+        dimension_priority = {
+            "reference_bootstrap_anchor_policy": 0,
+            "per_top_boundary_override": 1,
+            "boundary_scale_policy": 2,
+            "scale_lattice": 2,
+            "boundary_state_cap": 2,
+            "beam_width": 2,
+            "bootstrap_penalty": 2,
+            "action_allowlist": 2,
+            "dp_probe_mode": 4,
+            "multi_boundary_output_splice": 4,
+        }
+        reference_label_priority = {
+            "reference_anchor_neighborhood_frontier": 0,
+            "reference_anchor_neighborhood_dense": 1,
+            "reference_anchor_forced_sparse": 2,
+        }
+
+        def reference_anchor_priority(item: dict[str, Any]) -> tuple[int, str]:
+            label = str(item.get("label", ""))
+            dimension = str(item.get("dimension", ""))
+            if label.startswith("reference_anchor_"):
+                return (0, f"{reference_label_priority.get(label, 99):02d}:{label}")
+            if label.startswith("dp_output_splice"):
+                return (4, label)
+            return (dimension_priority.get(dimension, 3), label)
+
+        variants.sort(key=reference_anchor_priority)
+
     return variants[: _strategy_discovery_limit()]
 
 

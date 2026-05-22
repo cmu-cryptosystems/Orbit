@@ -2651,6 +2651,70 @@ def test_strategy_discovery_includes_reference_anchor_probe_variants(
     assert forced["dp_probe_mode"] == "force_node_splice"
     assert forced["dp_force_nodes_only"] is True
     assert forced["dp_seed_exact_only"] is False
+    assert forced["dp_disable_seed_exact_candidate"] is False
+    assert forced["boundary_state_cap"] == 3
+    assert forced["max_scale_candidates"] == 6
+
+
+def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
+    toy_cost_json: str, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "4")
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = Tdag(params, "reference_probe_priority_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "seed",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    graph.add_edge("arg0", "seed")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"seed"}
+    task_context = build_context(
+        graph,
+        [{"in_lvl": params.lvl_ub, "in_scl": params.Sw, "out_lvl": params.lvl_ub}],
+        params,
+    )
+    context = build_compile_context(graph, params)
+    context.setdefault("harness", {})["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+    selected_tasks = [
+        {
+            "index": 0,
+            "reference_anchor_probe": True,
+            "group_keys": [
+                {
+                    "in_lvl": params.lvl_ub,
+                    "in_scl": params.Sw,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": task_context,
+        }
+    ]
+
+    variants = oe_backend._strategy_discovery_variants(
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        context,
+        selected_tasks,
+    )
+    labels = [str(item["label"]) for item in variants]
+
+    assert labels[:3] == [
+        "reference_anchor_neighborhood_frontier",
+        "reference_anchor_neighborhood_dense",
+        "reference_anchor_forced_sparse",
+    ]
+    assert all(not label.startswith("dp_output_splice") for label in labels[:3])
 
 
 def test_strategy_discovery_examples_mark_promotable_status():
@@ -6649,7 +6713,57 @@ def test_promotion_probe_prefers_reference_anchor_task_over_plain_top_cost(
     assert selected[0]["index"] == 1
     assert selected[0]["reference_anchor_probe"] is True
     assert selected[0]["reference_anchor_summary"]["reference_anchor_nodes"] == ["seed"]
-    assert selected[0]["group_keys"] == reference_groups
+    assert selected[0]["reference_anchor_probe_group_cap"] == 2
+    assert selected[0]["group_keys"] == [reference_groups[0]]
+
+
+def test_reference_anchor_probe_reconstructs_group_keys_when_metrics_lack_groups(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", "1")
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    graph = Tdag(params, "reference_probe_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "seed",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    graph.add_edge("arg0", "seed")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"seed"}
+    context = build_compile_context(graph, params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 1,
+            "context": build_context(
+                graph,
+                [
+                    {"in_lvl": -1, "in_scl": 41, "out_lvl": params.lvl_ub},
+                    {"in_lvl": 8, "in_scl": 120, "out_lvl": params.lvl_ub},
+                ],
+                params,
+            ),
+        }
+    ]
+    context["harness"]["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {"task_position": 0, "task_index": 1, "sampled_dp_latency_usec": 100.0}
+    ]
+
+    selected, reference_cost = oe_backend._promotion_probe_tasks(context)
+
+    assert reference_cost == 100.0
+    assert selected[0]["reference_anchor_probe"] is True
+    assert selected[0]["group_keys"] == [
+        {"in_lvl": -1, "in_scl": 41, "maino_v": "", "main_dag_size": 0},
+        {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0},
+    ]
 
 
 def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):

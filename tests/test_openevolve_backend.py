@@ -9,6 +9,7 @@ import sys
 import time
 import types
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -7153,7 +7154,7 @@ def test_qbp_dp_promotion_probe_honors_timeout(
         openevolve_qbp_engine="dp",
     )
 
-    def slow_dp_probe(_context, _hints, *, selected_tasks=None):
+    def slow_dp_probe(_context, _hints, *, selected_tasks=None, materialize=False):
         trace_path = Path(_hints["dp_trace_path"])
         trace_path.write_text(
             json.dumps(
@@ -7961,6 +7962,157 @@ def test_dp_promotion_selects_materialized_latency_improvement(
     assert summary["selected"] is True
 
 
+def test_dp_promotion_rejects_fast_probe_when_materialization_fails(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    task_context = build_context(
+        _toy_pdag(params),
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    task_context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": task_context,
+            "seed_metrics": {
+                "selected_path_digest": "seed",
+                "sampled_dp_latency_usec": 100.0,
+                "bootstrap_count": 0.0,
+                "rescale_count": 0.0,
+            },
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "qbp_engine": "dp",
+        "boundary_group_policies": [
+            {
+                "selector": {
+                    "task_index": 0,
+                    "in_lvl": 16,
+                    "in_scl": 40,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                },
+                "policy": {"dp_probe_mode": "output_splice"},
+            }
+        ],
+    }
+    code = "def place(context):\n    return {'strategy': 'bootstrap_mcts', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(oe_backend, "_hints_from_code", lambda *_args: deepcopy(hints))
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda context, initial_hints, params, selected, reference, timeout_sec=0: (
+            selected,
+            reference,
+            {"valid": True, "sampled_dp_latency_usec": reference},
+        ),
+    )
+    monkeypatch.setattr(oe_backend, "_run_single_boundary_dp_debug", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "skip_policy_digests": set(),
+            "examples": [],
+            "summary": {"latency_improved_count": 0, "path_moving_count": 0},
+        },
+    )
+    calls = []
+
+    def fake_dp_probe(*_args, **kwargs):
+        calls.append(bool(kwargs.get("materialize", False)))
+        if kwargs.get("materialize", False):
+            return {
+                "valid": False,
+                "dp_table_probe": True,
+                "dp_materialized_probe": True,
+                "boundary_group_validity": 0.0,
+                "candidate_qbp_coverage": 0.0,
+                "fallback_selected_budgets": 0,
+                "fallback_selected_groups": 0,
+                "invalid_boundary_groups": 1,
+                "sampled_dp_latency_usec": float("inf"),
+                "objective_cost_usec": float("inf"),
+                "diagnostics": {"invalid_boundary_groups": 1},
+            }
+        return {
+            "valid": True,
+            "dp_table_probe": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 90.0,
+            "objective_cost_usec": 90.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": "probe-fast",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+                "sampled_task_metrics": [
+                    {
+                        "selected_path_digest": "probe-fast",
+                        "sampled_dp_latency_usec": 90.0,
+                        "bootstrap_count": 0.0,
+                        "rescale_count": 0.0,
+                        "boundary_group_count": 1,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
+    monkeypatch.setattr(
+        oe_backend,
+        "_sampled_delta_replay_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unmaterialized fast probe must not be composed")
+        ),
+    )
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        hints,
+    )
+
+    assert selected is None
+    assert calls == [False, True]
+    summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
+    assert summary["selected"] is False
+    assert summary["records"][0]["stage"] == "dp_table_probe"
+    assert summary["records"][0]["reason"] == "dp_changed_faster"
+    assert summary["records"][1]["stage"] == "sampled_dp_materialize_probe"
+    assert summary["records"][1]["reason"] == "materialized_probe_not_direct_valid"
+    assert summary["records"][1]["dp_materialized_probe"] is True
+
+
 def test_dp_promotion_reuses_latency_improved_discovery_probe(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):
@@ -8038,9 +8190,11 @@ def test_dp_promotion_reuses_latency_improved_discovery_probe(
     dp_calls = []
 
     def fake_dp_probe(*_args, **_kwargs):
+        materialized = bool(_kwargs.get("materialize", False))
         dp_calls.append("sampled")
         return {
             "valid": True,
+            "dp_materialized_probe": materialized,
             "boundary_group_validity": 1.0,
             "candidate_qbp_coverage": 1.0,
             "fallback_selected_budgets": 0,
@@ -8071,12 +8225,16 @@ def test_dp_promotion_reuses_latency_improved_discovery_probe(
     )
 
     assert selected is not None
-    assert dp_calls == ["sampled"]
+    assert dp_calls == ["sampled", "sampled"]
     summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
     assert summary["records"][0]["stage"] == "dp_table_probe"
     assert summary["records"][0]["reason"] == "dp_changed_faster"
     assert summary["records"][0]["latency_usec"] == 90.0
-    assert summary["records"][1]["stage"] == "sampled_qbp"
+    assert summary["records"][1]["stage"] == "sampled_dp_materialize_probe"
+    assert summary["records"][1]["dp_materialized_probe"] is True
+    assert summary["records"][2]["stage"] == "sampled_qbp"
+    assert summary["records"][2]["dp_materialized_probe"] is True
+    assert summary["records"][2]["sampled_delta_replay"] is False
     assert summary["selected"] is True
 
 

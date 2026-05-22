@@ -10812,6 +10812,17 @@ def _promotion_record_summary(
         "sampled_task_cache_misses": int(result.get("sampled_task_cache_misses", 0) or 0)
         if result
         else 0,
+        "dp_materialized_probe": bool(result.get("dp_materialized_probe", False))
+        if result
+        else False,
+        "sampled_delta_replay": bool(result.get("sampled_delta_replay", False))
+        if result
+        else False,
+        "sampled_delta_materialized_probe": bool(
+            result.get("sampled_delta_materialized_probe", False)
+        )
+        if result
+        else False,
         "timed_out": bool(result.get("timed_out", False)) if result else False,
         "timeout_sec": result.get("timeout_sec") if result else None,
         "error": str(result.get("error", ""))[:500] if result else "",
@@ -10961,6 +10972,7 @@ def _sampled_delta_replay_result(
     return {
         "valid": True,
         "sampled_delta_replay": True,
+        "sampled_delta_materialized_probe": bool(probe_result.get("dp_materialized_probe", False)),
         "boundary_group_validity": 1.0,
         "candidate_qbp_coverage": 1.0,
         "fallback_selected_budgets": 0,
@@ -10982,6 +10994,7 @@ def _sampled_delta_replay_result(
                 "full_reference_cost_usec": full_reference_cost,
                 "probe_reference_cost_usec": probe_reference_cost,
                 "probe_candidate_cost_usec": probe_latency,
+                "probe_materialized": bool(probe_result.get("dp_materialized_probe", False)),
                 "latency_delta_usec": probe_latency - probe_reference_cost,
             },
         },
@@ -12572,6 +12585,7 @@ def _promotion_dp_probe_worker(
     probe_context: dict[str, Any],
     hints: dict[str, Any],
     selected_tasks: list[dict[str, Any]],
+    materialize: bool = False,
 ) -> None:
     if hasattr(os, "setsid"):
         try:
@@ -12586,6 +12600,7 @@ def _promotion_dp_probe_worker(
             context,
             hints,
             selected_tasks=context["sampled_budget_tasks"],
+            materialize=materialize,
         )
         result_queue.put({"ok": True, "result": result})
     except BaseException as exc:
@@ -12606,8 +12621,14 @@ def _evaluate_sampled_budget_tasks_dp_probe(
     hints: dict[str, Any],
     *,
     selected_tasks: list[dict[str, Any]] | None = None,
+    materialize: bool = False,
 ) -> dict[str, Any]:
-    """Fast no-materialization QBP-DP probe used before promotion replay."""
+    """QBP-DP probe used before promotion replay.
+
+    The default mode is intentionally no-materialization for cheap exploration.
+    Promotion re-runs promising probes with materialization before composing any
+    sampled-delta result, so fast table probes cannot win on unvalidated costs.
+    """
 
     start = time.time()
     eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
@@ -12672,6 +12693,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
         "sampled_qbp_group_eval": True,
         "qbp_engine": "dp",
         "dp_table_probe": True,
+        "dp_materialized_probe": bool(materialize),
     }
     for task_position, task in enumerate(tasks or []):
         task_context = task.get("context") if isinstance(task, dict) else None
@@ -12715,7 +12737,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                     budget,
                     task_le,
                     group_eval_hints,
-                    materialize=False,
+                    materialize=materialize,
                 )
                 if result.valid and result.out_key is not None:
                     selected_results.append(result)
@@ -12885,6 +12907,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
         "candidate_qbp_coverage": float(min(1.0, candidate_groups / scored_groups)),
         "sampled_progress_only": True,
         "dp_table_probe": True,
+        "dp_materialized_probe": bool(materialize),
         "final_latency_usec": float(sum(total["costs"]) / len(total["costs"])) if total["costs"] else 0.0,
         "aggregated_partition_cost_usec": float(sum(total["costs"])) if total["costs"] else 0.0,
         "objective_cost_usec": float(sampled_path_proxy["sampled_dp_latency_usec"]),
@@ -13040,6 +13063,7 @@ def _evaluate_dp_probe_for_promotion(
     selected_probe_tasks: list[dict[str, Any]],
     *,
     timeout_sec: int,
+    materialize: bool = False,
 ) -> dict[str, Any]:
     probe_context = deepcopy(context)
     probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
@@ -13052,6 +13076,7 @@ def _evaluate_dp_probe_for_promotion(
             {
                 "policy": _policy_effect_payload(probe_hints),
                 "tasks": _sampled_tasks_digest(selected_probe_tasks),
+                "materialize": bool(materialize),
                 "time_ns": time.time_ns(),
             }
         )[:16]
@@ -13065,6 +13090,7 @@ def _evaluate_dp_probe_for_promotion(
             probe_context,
             probe_hints,
             selected_tasks=probe_context["sampled_budget_tasks"],
+            materialize=materialize,
         )
         if trace_path is not None and "dp_progress_trace_path" not in result:
             result["dp_progress_trace_path"] = str(trace_path)
@@ -13074,7 +13100,7 @@ def _evaluate_dp_probe_for_promotion(
     result_queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
         target=_promotion_dp_probe_worker,
-        args=(result_queue, probe_context, probe_hints, selected_probe_tasks),
+        args=(result_queue, probe_context, probe_hints, selected_probe_tasks, bool(materialize)),
     )
     proc.start()
     deadline = time.time() + float(timeout_sec)
@@ -13116,6 +13142,7 @@ def _evaluate_dp_probe_for_promotion(
                 retry_hints,
                 selected_probe_tasks,
                 timeout_sec=retry_timeout,
+                materialize=materialize,
             )
             if isinstance(bounded_retry, dict):
                 bounded_retry["bounded_retry_from_timeout"] = True
@@ -13658,10 +13685,59 @@ def _run_sampled_promotion_pass(
             selected=best is not None,
         )
         if _use_qbp_dp_engine(params, active_probe_hints):
+            print(
+                "OpenEvolve compile harness: sampled promotion "
+                f"candidate {len(seen)}/{len(codes)} materialized DP probe "
+                f"timeout={eval_timeout_sec}s.",
+                flush=True,
+            )
+            materialized_probe_result = _evaluate_dp_probe_for_promotion(
+                context,
+                active_probe_hints,
+                selected_probe_tasks,
+                timeout_sec=eval_timeout_sec,
+                materialize=True,
+            )
+            materialized_probe_latency = _promotion_latency(materialized_probe_result)
+            materialized_probe_record = _promotion_record_summary(
+                index=index,
+                stage="sampled_dp_materialize_probe",
+                hints=active_probe_hints,
+                result=materialized_probe_result,
+                reason="",
+                code_digest=code_digest,
+            )
+            materialized_probe_record["reference_latency_usec"] = probe_reference_cost
+            materialized_probe_record["probe_latency_usec"] = probe_latency
+            materialized_probe_record["path_differential"] = _path_differential_summary(
+                seed_probe_summary,
+                materialized_probe_result,
+            )
+            records.append(materialized_probe_record)
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="sampled_dp_materialize_probe_done",
+                current_index=index,
+                total_candidates=min(limit, len(codes)),
+                records=records,
+                selected=best is not None,
+            )
+            if not _promotion_result_direct_valid(materialized_probe_result):
+                materialized_probe_record["reason"] = "materialized_probe_not_direct_valid"
+                continue
+            if not (
+                math.isfinite(materialized_probe_latency)
+                and materialized_probe_latency < probe_reference_cost
+            ):
+                materialized_probe_record["reason"] = "materialized_probe_not_latency_improved"
+                continue
+            materialized_probe_record["reason"] = "materialized_probe_latency_improved"
             full_result = _sampled_delta_replay_result(
                 context,
                 active_probe_hints,
-                probe_result,
+                materialized_probe_result,
                 probe_reference_cost=probe_reference_cost,
                 full_reference_cost=full_reference_cost,
             )
@@ -13676,6 +13752,7 @@ def _run_sampled_promotion_pass(
                     _dp_probe_lightweight_hints(active_probe_hints),
                     sampled_tasks,
                     timeout_sec=eval_timeout_sec,
+                    materialize=True,
                 )
                 full_result["sampled_dp_replay"] = True
         else:
@@ -13832,6 +13909,9 @@ def _run_sampled_promotion_pass(
                                 "probe_policy_digest",
                                 "probe_effective_digest",
                                 "path_source_digest",
+                                "dp_materialized_probe",
+                                "sampled_delta_replay",
+                                "sampled_delta_materialized_probe",
                                 "dp_failure_trace_paths",
                                 "dp_failure_summaries",
                                 "dp_progress_trace_path",

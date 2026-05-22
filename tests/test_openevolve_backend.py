@@ -1497,7 +1497,7 @@ def test_bootstrap_mcts_final_compile_fail_opens_to_seed(
     toy_cost_json: str,
     monkeypatch,
 ):
-    params = _params(toy_cost_json, openevolve_iterations=1)
+    params = _params(toy_cost_json, openevolve_iterations=1, openevolve_qbp_engine="mcts")
     graph = _toy_pdag(params)
     le = LatencyEstimator(params)
     budgets = [{"in_lvl": -1, "in_scl": 40, "out_lvl": 1}]
@@ -6880,6 +6880,327 @@ def test_timed_out_promotion_probe_records_context_and_bounded_retry(
     assert probe_record["bounded_retry"]["intent_survived"] is True
     assert probe_record["timeout_context"]["qbp_solve_timeout_sec"] >= 0
     assert probe_record["path_differential"]["collapse_reason"] == "changed_and_faster"
+
+
+def test_qbp_dp_materialized_assignments_validate_and_match_latency(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _branch_merge_pdag(params)
+    le = LatencyEstimator(params)
+    hints = oe_backend._bootstrap_mcts_seed_policy(params)
+    hints["qbp_engine"] = "dp"
+
+    result = oe_backend._qbp_dp_solve_budget(
+        graph,
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        le,
+        hints,
+        materialize=True,
+    )
+
+    assert result.valid
+    assert result.assign is not None
+    assert result.assign.check_assign()
+    assert result.out_key == (
+        result.assign.v_lvl_out[next(iter(graph.outputs))],
+        result.assign.v_scl_out[next(iter(graph.outputs))],
+    )
+    assert result.cost == pytest.approx(oe_backend.estimate_assign(result.assign, le))
+
+
+def test_qbp_dp_probe_preserves_complete_boundary_group(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    budgets = [
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": out_lvl}
+        for out_lvl in (14, 15, 16)
+    ]
+    context = build_context(graph, budgets, params)
+    context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": context,
+        }
+    ]
+    hints = oe_backend._bootstrap_mcts_seed_policy(params)
+    hints["qbp_engine"] = "dp"
+
+    result = oe_backend._evaluate_sampled_budget_tasks_dp_probe(context, hints)
+
+    assert result["valid"]
+    assert result["boundary_group_validity"] == 1.0
+    assert result["candidate_qbp_coverage"] == 1.0
+    summary = result["diagnostics"]["boundary_group_summaries"][0]
+    assert summary["requested_output_levels"] == [14, 15, 16]
+    assert summary["candidate_complete"] is True
+    assert summary["selected_source_counts"] == {"candidate:qbp_dp": 3}
+
+
+def test_qbp_manager_dp_sampling_keeps_all_outputs_in_selected_group(
+    toy_cost_json: str,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+        openevolve_max_unit_samples=1,
+    )
+    params.openevolve_evaluating_candidate = True
+    manager = QBPManager(params, LatencyEstimator(params))
+    budgets = [
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": out_lvl}
+        for out_lvl in range(1, 6)
+    ]
+
+    sampled = manager._sample_openevolve_eval_budgets(None, budgets)
+
+    assert [item["out_lvl"] for item in sampled] == [1, 2, 3, 4, 5]
+
+
+def test_dp_promotion_rejects_seed_equivalent_without_materialization(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    task_context = build_context(
+        _toy_pdag(params),
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    task_context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": task_context,
+            "seed_metrics": {
+                "selected_path_digest": "seed",
+                "sampled_dp_latency_usec": 100.0,
+                "bootstrap_count": 0.0,
+                "rescale_count": 0.0,
+            },
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'strategy': 'bootstrap_mcts', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "skip_policy_digests": set(),
+            "examples": [],
+            "summary": {"latency_improved_count": 0, "path_moving_count": 0},
+        },
+    )
+    calls = []
+
+    def fake_dp_probe(*_args, **_kwargs):
+        calls.append("dp")
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 100.0,
+            "objective_cost_usec": 100.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": "seed",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+                "sampled_task_metrics": [
+                    {
+                        "selected_path_digest": "seed",
+                        "sampled_dp_latency_usec": 100.0,
+                        "bootstrap_count": 0.0,
+                        "rescale_count": 0.0,
+                        "boundary_group_count": 1,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", fake_dp_probe)
+
+    def fail_materialize(*_args, **_kwargs):
+        raise AssertionError("seed-equivalent DP probe should not materialize")
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fail_materialize)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+
+    assert selected is None
+    assert len(calls) >= 2
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["qbp_engine"] == "dp"
+    assert summary["records"][0]["reason"] == "dp_seed_equivalent"
+    assert (tmp_path / "sampled_promotion" / "dp_probe_summary.json").is_file()
+
+
+def test_dp_promotion_selects_materialized_latency_improvement(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    task_context = build_context(
+        _toy_pdag(params),
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    task_context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": task_context,
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'strategy': 'bootstrap_mcts', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "skip_policy_digests": set(),
+            "examples": [],
+            "summary": {"latency_improved_count": 0, "path_moving_count": 0},
+        },
+    )
+    dp_calls = []
+
+    def fake_dp_probe(*_args, **_kwargs):
+        dp_calls.append("dp")
+        latency = 100.0 if len(dp_calls) == 1 else 90.0
+        digest = "seed" if len(dp_calls) == 1 else "better"
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": latency,
+            "objective_cost_usec": latency,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": digest,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+                "sampled_task_metrics": [
+                    {
+                        "selected_path_digest": digest,
+                        "sampled_dp_latency_usec": latency,
+                        "bootstrap_count": 0.0,
+                        "rescale_count": 0.0,
+                        "boundary_group_count": 1,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", fake_dp_probe)
+
+    def fake_materialize(*_args, **_kwargs):
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 80.0,
+            "objective_cost_usec": 80.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": "better-full",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_materialize)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+
+    assert selected is not None
+    assert selected["openevolve_promotion_stage"] == "sampled_qbp"
+    assert selected["openevolve_promotion_latency_usec"] == 80.0
+    summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
+    assert summary["selected"] is True
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

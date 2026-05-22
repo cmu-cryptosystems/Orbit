@@ -34,6 +34,7 @@ if __name__ == "__main__":
     parser.add_argument('--openevolve-secondary-weight', type=float, default=0.25)
     parser.add_argument('--openevolve-harness', choices=['compile', 'partition'], default='compile')
     parser.add_argument('--openevolve-search-mode', choices=['legacy', 'beam', 'bootstrap-mcts'], default='bootstrap-mcts')
+    parser.add_argument('--openevolve-qbp-engine', choices=['mcts', 'dp'], default=None)
     parser.add_argument('--openevolve-granularity', choices=['compile', 'layer-nonlinear'], default='layer-nonlinear')
     parser.add_argument('--openevolve-leniency', choices=['repair', 'strict'], default='repair')
     parser.add_argument('--openevolve-max-unit-samples', type=int, default=64)
@@ -130,6 +131,8 @@ if __name__ == "__main__":
         cmds += ["--openevolve-secondary-weight", str(args.openevolve_secondary_weight)]
         cmds += ["--openevolve-harness", args.openevolve_harness]
         cmds += ["--openevolve-search-mode", args.openevolve_search_mode]
+        if args.openevolve_qbp_engine:
+            cmds += ["--openevolve-qbp-engine", args.openevolve_qbp_engine]
         cmds += ["--openevolve-granularity", args.openevolve_granularity]
         cmds += ["--openevolve-leniency", args.openevolve_leniency]
         cmds += ["--openevolve-max-unit-samples", str(args.openevolve_max_unit_samples)]

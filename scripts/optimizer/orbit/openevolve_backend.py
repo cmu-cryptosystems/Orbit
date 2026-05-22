@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import concurrent.futures
 import io
+import itertools
 import json
 import math
 import multiprocessing
@@ -72,6 +73,28 @@ class _BudgetAttempt:
     out_key: tuple[int, int]
     actual_cost: float | None = None
     policy: dict[str, Any] | None = None
+
+
+@dataclass
+class _QBPDPState:
+    level: int
+    scale: int
+    cost: float
+    bootstrap_count: float = 0.0
+    rescale_count: float = 0.0
+    assign_data: dict[str, Any] | None = None
+
+
+@dataclass
+class _QBPDPBudgetResult:
+    valid: bool
+    in_key: tuple[int, int]
+    out_key: tuple[int, int] | None
+    cost: float
+    bootstrap_count: float
+    rescale_count: float
+    assign: Assign | None = None
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1978,6 +2001,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
             "openevolve_seed": params.openevolve_seed,
             "openevolve_eval_suite": params.openevolve_eval_suite,
             "openevolve_search_mode": getattr(params, "openevolve_search_mode", "bootstrap-mcts"),
+            "openevolve_qbp_engine": getattr(params, "openevolve_qbp_engine", "mcts"),
             "openevolve_granularity": params.openevolve_granularity,
             "openevolve_leniency": params.openevolve_leniency,
             "openevolve_max_unit_samples": params.openevolve_max_unit_samples,
@@ -2067,6 +2091,7 @@ def tdag_from_context(context: dict[str, Any]) -> Tdag:
         resilience_constraint_policy=pdata.get("resilience_constraint_policy", "relax-only"),
         openevolve_eval_suite=pdata.get("openevolve_eval_suite", "polybert-sampled"),
         openevolve_search_mode=pdata.get("openevolve_search_mode", "bootstrap-mcts"),
+        openevolve_qbp_engine=pdata.get("openevolve_qbp_engine", "mcts"),
         openevolve_granularity=pdata.get("openevolve_granularity", "layer-nonlinear"),
         openevolve_leniency=pdata.get("openevolve_leniency", "repair"),
         openevolve_max_unit_samples=pdata.get("openevolve_max_unit_samples", 64),
@@ -2116,6 +2141,7 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
         "scope": "compile",
         "eval_suite": params.openevolve_eval_suite,
         "search_mode": getattr(params, "openevolve_search_mode", "bootstrap-mcts"),
+        "qbp_engine": getattr(params, "openevolve_qbp_engine", "mcts"),
         "granularity": params.openevolve_granularity,
         "leniency": params.openevolve_leniency,
         "max_unit_samples": params.openevolve_max_unit_samples,
@@ -10627,6 +10653,19 @@ def _promotion_result_direct_valid(result: dict[str, Any]) -> bool:
     return True
 
 
+def _openevolve_qbp_engine(params: Params, hints: dict[str, Any] | None = None) -> str:
+    if isinstance(hints, dict) and hints.get("qbp_engine") in {"mcts", "dp"}:
+        return str(hints["qbp_engine"])
+    return str(getattr(params, "openevolve_qbp_engine", "mcts"))
+
+
+def _use_qbp_dp_engine(params: Params, hints: dict[str, Any] | None = None) -> bool:
+    return (
+        getattr(params, "openevolve_search_mode", "bootstrap-mcts") == "bootstrap-mcts"
+        and _openevolve_qbp_engine(params, hints) == "dp"
+    )
+
+
 def _promotion_latency(result: dict[str, Any]) -> float:
     for key in ("sampled_dp_latency_usec", "objective_cost_usec", "final_latency_usec"):
         value = _finite_float(result.get(key), float("inf"))
@@ -10875,6 +10914,19 @@ def _promotion_path_source_digest(result: dict[str, Any]) -> str:
             "selected_source_counts": _selected_source_counts_from_result(result),
         }
     )
+
+
+def _dp_probe_reason(diff: dict[str, Any], direct_valid: bool, improved: bool) -> str:
+    if not direct_valid:
+        return "dp_incomplete"
+    if improved:
+        return "dp_changed_faster"
+    reason = str(diff.get("collapse_reason", ""))
+    if reason in {"same_action_order", "same_boundary_states", "probe_tied_seed"}:
+        return "dp_seed_equivalent"
+    if reason == "changed_but_slower":
+        return "dp_changed_slower"
+    return reason or "dp_not_latency_improved"
 
 
 def _promotion_timeout_context(
@@ -11564,18 +11616,26 @@ def _run_strategy_discovery_prepass(
             }
             records.append(record)
             continue
-        result = _evaluate_sampled_budget_tasks_for_promotion(
+        result = _evaluate_promotion_probe(
             probe_context,
             probe_hints,
+            params,
+            selected_probe_tasks,
             timeout_sec=discovery_eval_timeout_sec,
         )
         retry_summary: dict[str, Any] | None = None
         active_hints = probe_hints
-        if bool(result.get("timed_out", False)) and _promotion_bounded_retry_enabled():
+        if (
+            bool(result.get("timed_out", False))
+            and _promotion_bounded_retry_enabled()
+            and not _use_qbp_dp_engine(params, probe_hints)
+        ):
             retry_hints = _bounded_retry_probe_hints(probe_hints)
-            retry_result = _evaluate_sampled_budget_tasks_for_promotion(
+            retry_result = _evaluate_promotion_probe(
                 probe_context,
                 retry_hints,
+                params,
+                selected_probe_tasks,
                 timeout_sec=min(
                     discovery_eval_timeout_sec,
                     max(5, discovery_eval_timeout_sec // 2 if discovery_eval_timeout_sec else 0),
@@ -11628,7 +11688,9 @@ def _run_strategy_discovery_prepass(
             "bounded_retry": retry_summary,
             "policy_summary": _compact_policy_summary(active_hints),
         }
-        if not direct_valid:
+        if _use_qbp_dp_engine(params, active_hints):
+            record["reason"] = _dp_probe_reason(diff, direct_valid, improved)
+        elif not direct_valid:
             record["reason"] = diff["collapse_reason"]
         elif not improved:
             record["reason"] = diff["collapse_reason"]
@@ -11701,6 +11763,67 @@ def _run_strategy_discovery_prepass(
     }
 
 
+def _evaluate_promotion_probe(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    params: Params,
+    selected_probe_tasks: list[dict[str, Any]],
+    *,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    if _use_qbp_dp_engine(params, hints):
+        probe_context = deepcopy(context)
+        probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
+        probe_context.setdefault("harness", {})["dp_table_probe"] = True
+        return _evaluate_sampled_budget_tasks_dp_probe(
+            probe_context,
+            hints,
+            selected_tasks=probe_context["sampled_budget_tasks"],
+        )
+    return _evaluate_sampled_budget_tasks_for_promotion(
+        context,
+        hints,
+        timeout_sec=timeout_sec,
+    )
+
+
+def _apply_dp_probe_seed_reference(
+    context: dict[str, Any],
+    initial_hints: dict[str, Any] | None,
+    params: Params,
+    selected_probe_tasks: list[dict[str, Any]],
+    fallback_reference_cost: float,
+) -> tuple[list[dict[str, Any]], float, dict[str, Any] | None]:
+    if not initial_hints or not _use_qbp_dp_engine(params, initial_hints):
+        return selected_probe_tasks, fallback_reference_cost, None
+    probe_context = deepcopy(context)
+    probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
+    result = _evaluate_sampled_budget_tasks_dp_probe(
+        probe_context,
+        initial_hints,
+        selected_tasks=probe_context["sampled_budget_tasks"],
+    )
+    latency = _promotion_latency(result)
+    if not (math.isfinite(latency) and latency > 0):
+        return selected_probe_tasks, fallback_reference_cost, result
+    updated_tasks = deepcopy(selected_probe_tasks)
+    metrics = list(result.get("diagnostics", {}).get("sampled_task_metrics", []) or [])
+    for idx, task in enumerate(updated_tasks):
+        if not isinstance(task, dict):
+            continue
+        metric = metrics[min(idx, len(metrics) - 1)] if metrics else {}
+        if isinstance(metric, dict):
+            task["seed_metrics"] = {
+                "selected_path_digest": metric.get("selected_path_digest", ""),
+                "selected_source_counts": {"candidate:qbp_dp": int(metric.get("boundary_group_count", 0) or 0)},
+                "sampled_dp_latency_usec": metric.get("sampled_dp_latency_usec", latency),
+                "objective_cost_usec": metric.get("sampled_dp_latency_usec", latency),
+                "bootstrap_count": metric.get("bootstrap_count", result.get("bootstrap_count", 0.0)),
+                "rescale_count": metric.get("rescale_count", result.get("rescale_count", 0.0)),
+            }
+    return updated_tasks, latency, result
+
+
 def _write_promotion_progress(
     promotion_dir: Path,
     *,
@@ -11758,6 +11881,227 @@ def _promotion_sampled_eval_worker(
                 },
             }
         )
+
+
+def _evaluate_sampled_budget_tasks_dp_probe(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    *,
+    selected_tasks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Fast no-materialization QBP-DP probe used before promotion replay."""
+
+    start = time.time()
+    eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
+    eval_hints = _compile_hints_for_eval_suite(hints, eval_suite)
+    tasks = selected_tasks
+    if tasks is None:
+        tasks = [
+            task
+            for task in context.get("sampled_budget_tasks", [])
+            if isinstance(task, dict) and isinstance(task.get("context"), dict)
+        ]
+    total: dict[str, Any] = {
+        "requested_budgets": 0,
+        "solved_budgets": 0,
+        "candidate_solved_budgets": 0,
+        "fallback_solved_budgets": 0,
+        "fallback_selected_budgets": 0,
+        "requested_boundary_groups": 0,
+        "solved_boundary_groups": 0,
+        "partial_boundary_groups": 0,
+        "candidate_solved_boundary_groups": 0,
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+        "candidate_improved_budgets": 0,
+        "candidate_invalid_reasons": {},
+        "invalid_reasons": {},
+        "candidate_costs": [],
+        "costs": [],
+        "selected_source_counts": {},
+        "boundary_group_summaries": [],
+        "sampled_task_metrics": [],
+        "sampled_task_count": 0,
+        "sampled_direct_budget_eval": False,
+        "sampled_qbp_group_eval": True,
+        "qbp_engine": "dp",
+        "dp_table_probe": True,
+    }
+    for task_position, task in enumerate(tasks or []):
+        task_context = task.get("context") if isinstance(task, dict) else None
+        if not isinstance(task_context, dict):
+            continue
+        task_tdag = tdag_from_context(task_context)
+        task_params = task_tdag.params
+        task_params.openevolve_iterations = 0
+        task_params.openevolve_harness = "compile"
+        task_params.openevolve_compile_hints = eval_hints
+        task_params.openevolve_evaluating_candidate = True
+        task_params.openevolve_eval_suite = eval_suite
+        task_params.openevolve_qbp_engine = "dp"
+        _apply_active_scale_floor_from_hints(task_params, eval_hints)
+        task_le = LatencyEstimator(task_params)
+        budgets = [
+            _io_budget_from_json(item)
+            for item in task_context.get("io_budgets", [])
+            if isinstance(item, dict)
+        ]
+        task_group_summaries: list[dict[str, Any]] = []
+        total["sampled_task_count"] += 1
+        for group_key, group_budgets in _budget_boundary_groups(budgets).items():
+            selected_results: list[_QBPDPBudgetResult] = []
+            reachable = 0
+            for budget in group_budgets:
+                total["requested_budgets"] += 1
+                result = _qbp_dp_solve_budget(
+                    task_tdag,
+                    task_params,
+                    budget,
+                    task_le,
+                    eval_hints,
+                    materialize=False,
+                )
+                if result.valid and result.out_key is not None:
+                    selected_results.append(result)
+                    reachable += 1
+                    total["solved_budgets"] += 1
+                    total["candidate_solved_budgets"] += 1
+                    total["candidate_costs"].append(float(result.cost))
+                    total["costs"].append(float(result.cost))
+                elif _boundary_budget_output_cannot_refresh(task_params, group_key, budget):
+                    continue
+                else:
+                    reachable += 1
+                    reason = result.reason or "qbp-dp found no feasible state"
+                    total["candidate_invalid_reasons"][reason] = (
+                        total["candidate_invalid_reasons"].get(reason, 0) + 1
+                    )
+            total["requested_boundary_groups"] += 1
+            requested = len(group_budgets)
+            solved = len(selected_results)
+            if requested > 0 and reachable > 0 and solved >= reachable:
+                total["solved_boundary_groups"] += 1
+                total["candidate_solved_boundary_groups"] += 1
+                reason = "complete_candidate"
+            elif solved > 0:
+                total["partial_boundary_groups"] += 1
+                reason = "partial_output_levels"
+            elif reachable <= 0 or _boundary_group_input_cannot_refresh(task_params, group_key):
+                total["unreachable_boundary_groups"] += 1
+                reason = "unreachable_input_cannot_refresh"
+            else:
+                total["invalid_boundary_groups"] += 1
+                reason = "no_feasible_attempt"
+            costs = [float(item.cost) for item in selected_results]
+            bootstraps = [float(item.bootstrap_count) for item in selected_results]
+            rescales = [float(item.rescale_count) for item in selected_results]
+            selected_source_counts = {"candidate:qbp_dp": solved} if solved else {}
+            summary = {
+                "group_key": {
+                    "in_lvl": int(group_key[0]),
+                    "in_scl": int(group_key[1]),
+                    "maino_v": str(group_key[2]),
+                    "main_dag_size": int(group_key[3]),
+                },
+                "requested_output_levels": sorted(
+                    {
+                        int(budget.get("out_lvl", -1))
+                        for budget in group_budgets
+                        if int(budget.get("out_lvl", -1)) >= 0
+                    }
+                ),
+                "requested_budgets": requested,
+                "reachable_budgets": int(reachable),
+                "unreachable_budgets": int(max(0, requested - reachable)),
+                "solved_budgets": solved,
+                "candidate_solved_budgets": solved,
+                "fallback_selected_budgets": 0,
+                "complete": bool(requested > 0 and reachable > 0 and solved >= reachable),
+                "candidate_complete": bool(requested > 0 and reachable > 0 and solved >= reachable),
+                "selected_source_counts": selected_source_counts,
+                "unsolved_reason": reason,
+                "unreachable_input": bool(reachable <= 0),
+                "avg_bootstrap": float(sum(bootstraps) / len(bootstraps)) if bootstraps else 0.0,
+                "min_bootstrap": float(min(bootstraps)) if bootstraps else 0.0,
+                "max_bootstrap": float(max(bootstraps)) if bootstraps else 0.0,
+                "avg_rescale": float(sum(rescales) / len(rescales)) if rescales else 0.0,
+                "min_rescale": float(min(rescales)) if rescales else 0.0,
+                "max_rescale": float(max(rescales)) if rescales else 0.0,
+                "avg_cost_usec": float(sum(costs) / len(costs)) if costs else 0.0,
+                "min_cost_usec": float(min(costs)) if costs else 0.0,
+                "max_cost_usec": float(max(costs)) if costs else 0.0,
+            }
+            task_group_summaries.append(summary)
+            if len(total["boundary_group_summaries"]) < 512:
+                total["boundary_group_summaries"].append(summary)
+            for source, count in selected_source_counts.items():
+                total["selected_source_counts"][source] = (
+                    total["selected_source_counts"].get(source, 0) + int(count)
+                )
+        task_proxy = _sampled_path_proxy_from_boundary_groups(task_group_summaries)
+        total["sampled_task_metrics"].append(
+            {
+                "task_position": task_position,
+                "task_index": task.get("index") if isinstance(task, dict) else task_position,
+                "group_keys": task.get("group_keys", []) if isinstance(task, dict) else [],
+                "selected_path_digest": task_proxy["sampled_selected_path_digest"],
+                "sampled_dp_latency_usec": task_proxy["sampled_dp_latency_usec"],
+                "bootstrap_count": task_proxy["sampled_selected_path_bootstraps"],
+                "rescale_count": task_proxy["sampled_selected_path_rescales"],
+                "boundary_group_count": len(task_group_summaries),
+            }
+        )
+    group_summary = _boundary_group_count_summary(
+        list(total.get("boundary_group_summaries", []))
+    )
+    sampled_path_proxy = _sampled_path_proxy_from_boundary_groups(
+        list(total.get("boundary_group_summaries", [])),
+        list(total.get("costs", [])),
+    )
+    requested = max(1, int(total.get("requested_budgets", 0) or 1))
+    solved = int(total.get("solved_budgets", 0) or 0)
+    scored_groups = _scored_boundary_group_count(total)
+    solved_groups = int(total.get("solved_boundary_groups", 0) or 0)
+    candidate_groups = int(total.get("candidate_solved_boundary_groups", 0) or 0)
+    params = tdag_from_context(context).params
+    scale_floor_bits = _apply_active_scale_floor_from_hints(params, eval_hints)
+    return {
+        "valid": bool(solved),
+        "validity": float(solved / requested),
+        "boundary_group_validity": float(min(1.0, solved_groups / scored_groups)),
+        "candidate_qbp_coverage": float(min(1.0, candidate_groups / scored_groups)),
+        "sampled_progress_only": True,
+        "dp_table_probe": True,
+        "final_latency_usec": float(sum(total["costs"]) / len(total["costs"])) if total["costs"] else 0.0,
+        "aggregated_partition_cost_usec": float(sum(total["costs"])) if total["costs"] else 0.0,
+        "objective_cost_usec": float(sampled_path_proxy["sampled_dp_latency_usec"]),
+        "total_frontier_cost_usec": float(group_summary["frontier_total_cost_usec"]),
+        "scale_floor_bits": int(scale_floor_bits),
+        "scale_floor_delta_bits": int(params.Sw) - int(scale_floor_bits),
+        **sampled_path_proxy,
+        "bootstrap_count": float(group_summary["frontier_total_bootstrap"]),
+        "rescale_count": float(group_summary["frontier_total_rescale"]),
+        "sampled_frontier_total_bootstrap_count": float(group_summary["frontier_total_bootstrap"]),
+        "sampled_frontier_total_rescale_count": float(group_summary["frontier_total_rescale"]),
+        "boundary_quality": 0.0,
+        "profile_risk": 0.0 if solved else 1.0,
+        "placement_runtime_sec": time.time() - start,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
+        "unreachable_boundary_groups": int(total.get("unreachable_boundary_groups", 0)),
+        "selected_output_state": {},
+        "reserve_summary": {},
+        "assignment": {},
+        "bootstrap_locations": {},
+        "rescale_locations": {},
+        "bottleneck_summary": [],
+        "diagnostics": total,
+        "sampled_task_seed_metrics": list(total.get("sampled_task_metrics", [])),
+        "sampled_budget_tasks": [],
+        "log_tail": "",
+    }
 
 
 def _evaluate_sampled_budget_tasks_for_promotion(
@@ -11854,6 +12198,13 @@ def _run_sampled_promotion_pass(
     selected_probe_tasks, probe_reference_cost = _promotion_probe_tasks(context)
     if not selected_probe_tasks or not math.isfinite(probe_reference_cost):
         return None
+    selected_probe_tasks, probe_reference_cost, dp_seed_probe = _apply_dp_probe_seed_reference(
+        context,
+        initial_hints,
+        params,
+        selected_probe_tasks,
+        probe_reference_cost,
+    )
 
     full_reference_cost = _promotion_reference_latency(context)
     discovery = _run_strategy_discovery_prepass(
@@ -12059,37 +12410,59 @@ def _run_sampled_promotion_pass(
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True
+        if _use_qbp_dp_engine(params, probe_hints):
+            (promotion_dir / f"dp_probe_hints_{index}.json").write_text(
+                json.dumps(
+                    _jsonable_policy_hints(probe_hints),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        probe_stage_name = (
+            "dp_table_probe" if _use_qbp_dp_engine(params, probe_hints) else "probe_qbp"
+        )
         print(
             "OpenEvolve compile harness: sampled promotion "
-            f"candidate {len(seen)}/{len(codes)} probe_qbp timeout={eval_timeout_sec}s.",
+            f"candidate {len(seen)}/{len(codes)} {probe_stage_name} timeout={eval_timeout_sec}s.",
             flush=True,
         )
         _write_promotion_progress(
             promotion_dir,
             started_at=started_at,
             timeout_sec=timeout_sec,
-            current_stage="probe_qbp",
+            current_stage=probe_stage_name,
             current_index=index,
             total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
-        probe_result = _evaluate_sampled_budget_tasks_for_promotion(
+        probe_result = _evaluate_promotion_probe(
             probe_context,
             probe_hints,
+            params,
+            selected_probe_tasks,
             timeout_sec=eval_timeout_sec,
         )
         active_probe_hints = probe_hints
         bounded_retry_summary: dict[str, Any] | None = None
-        if bool(probe_result.get("timed_out", False)) and _promotion_bounded_retry_enabled():
+        if (
+            bool(probe_result.get("timed_out", False))
+            and _promotion_bounded_retry_enabled()
+            and not _use_qbp_dp_engine(params, probe_hints)
+        ):
             retry_hints = _bounded_retry_probe_hints(probe_hints)
             retry_timeout = min(
                 eval_timeout_sec,
                 max(10, eval_timeout_sec // 2 if eval_timeout_sec else 0),
             )
-            retry_result = _evaluate_sampled_budget_tasks_for_promotion(
+            retry_result = _evaluate_promotion_probe(
                 probe_context,
                 retry_hints,
+                params,
+                selected_probe_tasks,
                 timeout_sec=retry_timeout,
             )
             bounded_retry_summary = {
@@ -12109,7 +12482,7 @@ def _run_sampled_promotion_pass(
         path_diff = _path_differential_summary(seed_probe_summary, probe_result)
         probe_record = _promotion_record_summary(
             index=index,
-            stage="probe_qbp",
+            stage=probe_stage_name,
             hints=active_probe_hints,
             result=probe_result,
             reason="",
@@ -12151,7 +12524,11 @@ def _run_sampled_promotion_pass(
             selected=best is not None,
         )
         if not _promotion_result_direct_valid(probe_result):
-            probe_record["reason"] = "probe_not_direct_valid"
+            probe_record["reason"] = (
+                "dp_incomplete"
+                if _use_qbp_dp_engine(params, active_probe_hints)
+                else "probe_not_direct_valid"
+            )
             continue
         if effective_digest in seen_effective_digests:
             duplicate_effective_count += 1
@@ -12164,7 +12541,11 @@ def _run_sampled_promotion_pass(
             continue
         seen_path_source_digests.add(path_source_digest)
         if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
-            probe_record["reason"] = "probe_not_latency_improved"
+            probe_record["reason"] = (
+                _dp_probe_reason(path_diff, True, False)
+                if _use_qbp_dp_engine(params, active_probe_hints)
+                else "probe_not_latency_improved"
+            )
             continue
 
         if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
@@ -12271,6 +12652,16 @@ def _run_sampled_promotion_pass(
         "probe_task_count": len(selected_probe_tasks),
         "probe_reference_latency_usec": probe_reference_cost,
         "sampled_reference_latency_usec": full_reference_cost,
+        "qbp_engine": getattr(params, "openevolve_qbp_engine", "mcts"),
+        "dp_seed_probe": {
+            "valid": bool(dp_seed_probe.get("valid", False)),
+            "latency_usec": _promotion_latency(dp_seed_probe),
+            "selected_path_digest": str(dp_seed_probe.get("sampled_selected_path_digest", "")),
+            "candidate_qbp_coverage": _finite_float(dp_seed_probe.get("candidate_qbp_coverage"), 0.0),
+            "boundary_group_validity": _finite_float(dp_seed_probe.get("boundary_group_validity"), 0.0),
+        }
+        if isinstance(dp_seed_probe, dict)
+        else None,
         "selected": best is not None,
         "selected_index": None if best is None else best[3],
         "selected_latency_usec": None if best is None else best[0],
@@ -12285,6 +12676,45 @@ def _run_sampled_promotion_pass(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
+    if getattr(params, "openevolve_qbp_engine", "mcts") == "dp":
+        (promotion_dir / "dp_probe_summary.json").write_text(
+            json.dumps(
+                {
+                    "qbp_engine": "dp",
+                    "probe_task_count": len(selected_probe_tasks),
+                    "probe_reference_latency_usec": probe_reference_cost,
+                    "selected": best is not None,
+                    "selected_latency_usec": None if best is None else best[0],
+                    "distinct_probe_policy_count": len(seen_policy_digests),
+                    "distinct_probe_effective_path_count": len(seen_effective_digests),
+                    "distinct_probe_path_source_count": len(seen_path_source_digests),
+                    "records": [
+                        {
+                            key: record.get(key)
+                            for key in (
+                                "index",
+                                "stage",
+                                "reason",
+                                "direct_valid",
+                                "latency_usec",
+                                "reference_latency_usec",
+                                "selected_path_digest",
+                                "path_collapse_reason",
+                                "probe_policy_digest",
+                                "probe_effective_digest",
+                                "path_source_digest",
+                            )
+                        }
+                        for record in records
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     _write_promotion_progress(
         promotion_dir,
         started_at=started_at,
@@ -13536,6 +13966,665 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         }
 
 
+def _qbp_dp_state_key(state: _QBPDPState) -> tuple[int, int]:
+    return (int(state.level), int(state.scale))
+
+
+def _qbp_dp_assign_data() -> dict[str, Any]:
+    return {
+        "v_lvl_out": {},
+        "v_scl_out": {},
+        "v_lvl_in": {},
+        "v_scl_in": {},
+        "e_lvl_out": {},
+        "e_scl_out": {},
+    }
+
+
+def _qbp_dp_copy_assign_data(data: dict[str, Any] | None) -> dict[str, Any]:
+    result = _qbp_dp_assign_data()
+    if not isinstance(data, dict):
+        return result
+    for key in result:
+        value = data.get(key, {})
+        result[key] = dict(value) if isinstance(value, dict) else {}
+    return result
+
+
+def _qbp_dp_set_assign_value(
+    data: dict[str, Any],
+    table: str,
+    key: Any,
+    value: int,
+    *,
+    allow_overwrite: bool = False,
+) -> bool:
+    target = data.setdefault(table, {})
+    if key in target and int(target[key]) != int(value) and not allow_overwrite:
+        return False
+    target[key] = int(value)
+    return True
+
+
+def _qbp_dp_merge_assign_data(
+    states: list[_QBPDPState],
+    *,
+    materialize: bool,
+) -> dict[str, Any] | None:
+    if not materialize:
+        return None
+    merged = _qbp_dp_assign_data()
+    for state in states:
+        data = state.assign_data
+        if not isinstance(data, dict):
+            continue
+        for table in merged:
+            for key, value in dict(data.get(table, {}) or {}).items():
+                if not _qbp_dp_set_assign_value(merged, table, key, int(value)):
+                    return None
+    return merged
+
+
+def _qbp_dp_transition_metrics(
+    params: Params,
+    le: LatencyEstimator,
+    in_lvl: int,
+    in_scl: int,
+    out_lvl: int,
+    out_scl: int,
+) -> tuple[float, float, float] | None:
+    if not params.check_resbts(in_lvl, in_scl, out_lvl, out_scl):
+        return None
+    try:
+        cost = float(le.resbts_cost(in_lvl, in_scl, out_lvl, out_scl))
+    except Exception:
+        return None
+    uses_bootstrap = not params.check_res(in_lvl, in_scl, out_lvl, out_scl)
+    if uses_bootstrap:
+        before = max(0, int(in_lvl) - int(params.bts_lb))
+        after = max(0, int(out_lvl) - int(params.bts_lb))
+        rescale_count = float(before + after)
+    else:
+        rescale_count = float(max(0, int(in_lvl) - int(out_lvl)))
+    return cost, 1.0 if uses_bootstrap else 0.0, rescale_count
+
+
+def _qbp_dp_op_cost(
+    tdag: Tdag,
+    node: str,
+    input_level: int,
+    le: LatencyEstimator,
+) -> float:
+    op = tdag.nodes[node].get("op")
+    if op in {"input", "output", "dummy", "constant"}:
+        return 0.0
+    single_cnt, double_cnt = tdag.get_v_weights(node)
+    cost = 0.0
+    if single_cnt > 0:
+        cost += float(le.op_lmaps[f"{op}_single"][input_level]) * single_cnt
+    if double_cnt > 0:
+        cost += float(le.op_lmaps[f"{op}_double"][input_level]) * double_cnt
+    return cost
+
+
+def _qbp_dp_state_sort_key(state: _QBPDPState) -> tuple[float, float, float, int, int]:
+    return (
+        float(state.cost),
+        float(state.bootstrap_count),
+        float(state.rescale_count),
+        int(state.level),
+        int(state.scale),
+    )
+
+
+def _qbp_dp_prune_states(
+    states: list[_QBPDPState],
+    cap: int,
+) -> list[_QBPDPState]:
+    best_by_key: dict[tuple[int, int], _QBPDPState] = {}
+    for state in states:
+        key = _qbp_dp_state_key(state)
+        prev = best_by_key.get(key)
+        if prev is None or _qbp_dp_state_sort_key(state) < _qbp_dp_state_sort_key(prev):
+            best_by_key[key] = state
+    ranked = sorted(best_by_key.values(), key=_qbp_dp_state_sort_key)
+    return ranked[: max(1, int(cap))]
+
+
+def _qbp_dp_main_qbp_choices(io_budget: dict[str, Any]) -> list[tuple[tuple[int, int] | None, float]]:
+    raw = io_budget.get("main_qbp_cost")
+    if not isinstance(raw, dict) or not raw:
+        return [(None, 0.0)]
+    choices: list[tuple[tuple[int, int], float]] = []
+    for key, value in raw.items():
+        try:
+            if isinstance(key, tuple):
+                lvl, scl = int(key[0]), int(key[1])
+            elif isinstance(key, list):
+                lvl, scl = int(key[0]), int(key[1])
+            else:
+                text = str(key).strip().strip("()[]")
+                parts = [part.strip() for part in text.split(",") if part.strip()]
+                lvl, scl = int(parts[0]), int(parts[1])
+            choices.append(((lvl, scl), float(value)))
+        except Exception:
+            continue
+    choices.sort(key=lambda item: item[1])
+    return choices or [(None, 0.0)]
+
+
+def _qbp_dp_input_state(
+    tdag: Tdag,
+    node: str,
+    params: Params,
+    io_budget: dict[str, Any],
+    fixed_inputs: dict[str, tuple[int, int]],
+    *,
+    materialize: bool,
+) -> _QBPDPState:
+    if node in fixed_inputs:
+        level, scale = fixed_inputs[node]
+    else:
+        scale = int(io_budget.get("in_scl", params.scale_lower_bound(node, tdag.nodes[node], "in")))
+        if scale < 0:
+            scale = params.scale_lower_bound(node, tdag.nodes[node], "in")
+        scale = max(scale, params.scale_lower_bound(node, tdag.nodes[node], "in"))
+        level = int(io_budget.get("in_lvl", -1))
+        if level < 0:
+            level = _highest_decryptable_level(params, scale)
+    _assert_decryptable(params, level, scale)
+    assign_data = _qbp_dp_assign_data() if materialize else None
+    if assign_data is not None:
+        assign_data["v_lvl_in"][node] = int(level)
+        assign_data["v_scl_in"][node] = int(scale)
+        assign_data["v_lvl_out"][node] = int(level)
+        assign_data["v_scl_out"][node] = int(scale)
+    return _QBPDPState(int(level), int(scale), 0.0, 0.0, 0.0, assign_data)
+
+
+def _qbp_dp_constant_state(
+    tdag: Tdag,
+    node: str,
+    params: Params,
+    *,
+    materialize: bool,
+) -> _QBPDPState:
+    assign_data = _qbp_dp_assign_data() if materialize else None
+    if assign_data is not None:
+        assign_data["v_lvl_out"][node] = int(params.lvl_ub)
+        assign_data["v_scl_out"][node] = int(params.Csw)
+    return _QBPDPState(int(params.lvl_ub), int(params.Csw), 0.0, 0.0, 0.0, assign_data)
+
+
+def _qbp_dp_level_candidates(
+    params: Params,
+    preferred: int | None,
+    policy: dict[str, Any],
+) -> list[int]:
+    values = {params.lvl_lb, params.lvl_ub, params.bts_lb, params.bts_lb + 1}
+    if preferred is not None:
+        values.add(int(preferred))
+    min_level = _effective_min_internal_level(policy, params)
+    return [
+        level
+        for level in sorted(v for v in values | set(range(params.lvl_lb, params.lvl_ub + 1)) if params.lvl_lb <= v <= params.lvl_ub)
+        if level >= min_level
+    ] or list(range(params.lvl_lb, params.lvl_ub + 1))
+
+
+def _qbp_dp_scale_candidates(
+    values: list[Any],
+    lower: int,
+    upper: int,
+    params: Params,
+    policy: dict[str, Any],
+    cap: int | None = None,
+) -> list[int]:
+    local_policy = dict(policy)
+    if cap is not None:
+        local_policy["max_scale_candidates"] = min(
+            _int_hint(local_policy.get("max_scale_candidates"), 32),
+            int(cap),
+        )
+    return _scale_candidates(values, int(lower), int(upper), params, local_policy)
+
+
+def _qbp_dp_output_states(
+    tdag: Tdag,
+    node: str,
+    params: Params,
+    io_budget: dict[str, Any],
+    policy: dict[str, Any],
+    input_level: int,
+    input_scale: int,
+    node_level_hint: int | None,
+    node_scale_hint: int | None,
+) -> list[tuple[int, int]]:
+    is_output = node in tdag.outputs
+    if is_output and int(io_budget.get("out_lvl", -1)) >= 0:
+        levels = [int(io_budget["out_lvl"])]
+    else:
+        levels = _qbp_dp_level_candidates(params, node_level_hint, policy)
+    lower = params.scale_lower_bound(node, tdag.nodes[node], "out")
+    values = [lower, input_scale, params.Sw, params.Csw, params.Sf, node_scale_hint]
+    results: list[tuple[int, int]] = []
+    for level in levels:
+        upper = min(int(policy.get("max_scale", _max_scale(params))), params.decryptable_scale_bound(level))
+        if is_output:
+            upper = min(upper, params.boundary_output_scale_bound(level))
+        if upper < lower:
+            continue
+        for scale in _qbp_dp_scale_candidates(values, lower, upper, params, policy):
+            if params.is_decryptable_state(level, scale):
+                results.append((int(level), int(scale)))
+    return results
+
+
+def _qbp_dp_incoming_options(
+    tdag: Tdag,
+    node: str,
+    pred_states: list[tuple[str, _QBPDPState]],
+    params: Params,
+    policy: dict[str, Any],
+    node_scale_hint: int | None,
+    edge_scale_hints: dict[str, int],
+) -> list[tuple[int, dict[str, int], int]]:
+    preds = [pred for pred, _state in pred_states]
+    lower = max(
+        params.scale_lower_bound(node, tdag.nodes[node], "in"),
+        int(node_scale_hint or 0),
+    )
+    max_scale = int(policy.get("max_scale", _max_scale(params)))
+    if max_scale < lower:
+        return []
+    op = tdag.nodes[node].get("op")
+    options: list[tuple[int, dict[str, int], int]] = []
+    if op != "mul":
+        values: list[Any] = [lower, params.Sw, params.Csw, params.Sf, node_scale_hint]
+        for pred, state in pred_states:
+            values.extend([state.scale, edge_scale_hints.get(_edge_key(pred, node))])
+            if tdag.nodes[pred].get("op") == "constant":
+                values.append(params.Csw)
+        for scale in _qbp_dp_scale_candidates(values, lower, max_scale, params, policy):
+            options.append((int(scale), {pred: int(scale) for pred in preds}, int(scale)))
+        return options
+
+    per_pred: list[tuple[str, list[int]]] = []
+    for pred, state in pred_states:
+        if tdag.nodes[pred].get("op") == "constant":
+            per_pred.append((pred, [int(params.Csw)]))
+            continue
+        edge_lower = _edge_scale_lb(tdag, pred, node, params)
+        edge_upper = max(edge_lower, max_scale // 2 if len(preds) == 1 else max_scale)
+        values = [
+            edge_lower,
+            edge_scale_hints.get(_edge_key(pred, node)),
+            state.scale,
+            math.ceil(state.scale / 2),
+            params.Sw,
+            params.Csw,
+            params.Sf,
+        ]
+        per_pred.append(
+            (
+                pred,
+                _qbp_dp_scale_candidates(values, edge_lower, edge_upper, params, policy),
+            )
+        )
+    if len(per_pred) == 1:
+        pred, scales = per_pred[0]
+        for scale in scales:
+            node_scale = 2 * int(scale)
+            if lower <= node_scale <= max_scale:
+                options.append((node_scale, {pred: int(scale)}, node_scale))
+        return options
+    if len(per_pred) > 2:
+        return []
+    (p0, s0s), (p1, s1s) = per_pred
+    for s0 in s0s:
+        for s1 in s1s:
+            node_scale = int(s0) + int(s1)
+            if lower <= node_scale <= max_scale:
+                options.append((node_scale, {p0: int(s0), p1: int(s1)}, node_scale))
+    return options
+
+
+def _qbp_dp_add_assignment_for_transition(
+    data: dict[str, Any],
+    tdag: Tdag,
+    node: str,
+    pred_states: list[tuple[str, _QBPDPState]],
+    edge_levels: dict[str, int],
+    edge_scales: dict[str, int],
+    input_level: int,
+    input_scale: int,
+    output_level: int,
+    output_scale: int,
+    params: Params,
+) -> bool:
+    for pred, _state in pred_states:
+        if tdag.nodes[pred].get("op") == "constant":
+            const_scale = params.Csw if tdag.nodes[node].get("op") == "mul" else edge_scales[pred]
+            if not _qbp_dp_set_assign_value(data, "v_lvl_out", pred, input_level, allow_overwrite=True):
+                return False
+            if not _qbp_dp_set_assign_value(data, "v_scl_out", pred, const_scale, allow_overwrite=True):
+                return False
+            continue
+        edge = (pred, node)
+        if not _qbp_dp_set_assign_value(data, "e_lvl_out", edge, edge_levels[pred]):
+            return False
+        if not _qbp_dp_set_assign_value(data, "e_scl_out", edge, edge_scales[pred]):
+            return False
+    for table, value in (
+        ("v_lvl_in", input_level),
+        ("v_scl_in", input_scale),
+        ("v_lvl_out", output_level),
+        ("v_scl_out", output_scale),
+    ):
+        if not _qbp_dp_set_assign_value(data, table, node, value):
+            return False
+    return True
+
+
+def _qbp_dp_node_states(
+    tdag: Tdag,
+    node: str,
+    pred_state_lists: list[list[_QBPDPState]],
+    params: Params,
+    le: LatencyEstimator,
+    io_budget: dict[str, Any],
+    hints: dict[str, Any],
+    *,
+    materialize: bool,
+) -> list[_QBPDPState]:
+    node_hints = _policy_hints_for_node(hints, list(hints.get("unit_policies", []) or []), str(node), dict(tdag.nodes[node]))
+    policy = _policy_options(node_hints, params)
+    node_level_hints = _int_map(hints.get("preferred_node_levels", {}))
+    node_scale_hints = _int_map(hints.get("preferred_node_scales", {}))
+    edge_scale_hints = _int_map(hints.get("preferred_edge_scales", {}))
+    state_cap = max(1, min(64, _int_hint(policy.get("state_cap_per_node"), 16)))
+    candidate_states: list[_QBPDPState] = []
+    preds = list(tdag.predecessors(node))
+    for combo in itertools.product(*[states[:state_cap] for states in pred_state_lists]):
+        pred_states = list(zip(preds, combo))
+        for input_scale, edge_scales, node_scale in _qbp_dp_incoming_options(
+            tdag,
+            node,
+            pred_states,
+            params,
+            policy,
+            node_scale_hints.get(node),
+            edge_scale_hints,
+        ):
+            for input_level in _qbp_dp_level_candidates(params, node_level_hints.get(node), policy):
+                edge_cost = 0.0
+                edge_bootstrap = 0.0
+                edge_rescale = 0.0
+                edge_levels: dict[str, int] = {}
+                feasible = True
+                for pred, state in pred_states:
+                    if tdag.nodes[pred].get("op") == "constant":
+                        edge_levels[pred] = int(input_level)
+                        continue
+                    metrics = _qbp_dp_transition_metrics(
+                        params,
+                        le,
+                        state.level,
+                        state.scale,
+                        input_level,
+                        edge_scales[pred],
+                    )
+                    if metrics is None:
+                        feasible = False
+                        break
+                    cost, bootstraps, rescales = metrics
+                    edge_cost += float(tdag.edges[pred, node].get("weight", 1)) * cost
+                    edge_bootstrap += bootstraps
+                    edge_rescale += rescales
+                    edge_levels[pred] = int(input_level)
+                if not feasible or not params.is_decryptable_state(input_level, node_scale):
+                    continue
+                for output_level, output_scale in _qbp_dp_output_states(
+                    tdag,
+                    node,
+                    params,
+                    io_budget,
+                    policy,
+                    input_level,
+                    node_scale,
+                    node_level_hints.get(node),
+                    node_scale_hints.get(node),
+                ):
+                    metrics = _qbp_dp_transition_metrics(
+                        params,
+                        le,
+                        input_level,
+                        node_scale,
+                        output_level,
+                        output_scale,
+                    )
+                    if metrics is None:
+                        continue
+                    vertex_cost, vertex_bootstrap, vertex_rescale = metrics
+                    op_cost = _qbp_dp_op_cost(tdag, node, input_level, le)
+                    total_cost = (
+                        sum(state.cost for state in combo)
+                        + edge_cost
+                        + op_cost
+                        + float(tdag.nodes[node].get("weight", 1)) * vertex_cost
+                    )
+                    assign_data = _qbp_dp_merge_assign_data(list(combo), materialize=materialize)
+                    if materialize:
+                        if assign_data is None:
+                            continue
+                        if not _qbp_dp_add_assignment_for_transition(
+                            assign_data,
+                            tdag,
+                            node,
+                            pred_states,
+                            edge_levels,
+                            edge_scales,
+                            input_level,
+                            node_scale,
+                            output_level,
+                            output_scale,
+                            params,
+                        ):
+                            continue
+                    candidate_states.append(
+                        _QBPDPState(
+                            int(output_level),
+                            int(output_scale),
+                            float(total_cost),
+                            float(sum(state.bootstrap_count for state in combo) + edge_bootstrap + vertex_bootstrap),
+                            float(sum(state.rescale_count for state in combo) + edge_rescale + vertex_rescale),
+                            assign_data,
+                        )
+                    )
+    return _qbp_dp_prune_states(candidate_states, state_cap)
+
+
+def _qbp_dp_solve_budget(
+    tdag: Tdag,
+    params: Params,
+    io_budget: dict[str, Any],
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+    *,
+    materialize: bool,
+) -> _QBPDPBudgetResult:
+    hints = _with_default_policy(hints)
+    main_choices = _qbp_dp_main_qbp_choices(io_budget)
+    best: _QBPDPBudgetResult | None = None
+    input_node = list(tdag.inputs)[0]
+    output_node = list(tdag.outputs)[0]
+    for fixed_main, main_cost in main_choices:
+        fixed_inputs = {}
+        if fixed_main is not None and io_budget.get("maino_v"):
+            fixed_inputs[str(io_budget["maino_v"])] = fixed_main
+        states_by_node: dict[str, list[_QBPDPState]] = {}
+        try:
+            for node in nx.topological_sort(tdag):
+                op = tdag.nodes[node].get("op")
+                if op == "constant":
+                    states_by_node[node] = [_qbp_dp_constant_state(tdag, node, params, materialize=materialize)]
+                    continue
+                if node in tdag.inputs or tdag.in_degree(node) == 0:
+                    states_by_node[node] = [
+                        _qbp_dp_input_state(
+                            tdag,
+                            node,
+                            params,
+                            io_budget,
+                            fixed_inputs,
+                            materialize=materialize,
+                        )
+                    ]
+                    continue
+                pred_lists = [states_by_node.get(pred, []) for pred in tdag.predecessors(node)]
+                if any(not states for states in pred_lists):
+                    states_by_node[node] = []
+                    continue
+                states_by_node[node] = _qbp_dp_node_states(
+                    tdag,
+                    node,
+                    pred_lists,
+                    params,
+                    le,
+                    io_budget,
+                    hints,
+                    materialize=materialize,
+                )
+            output_states = states_by_node.get(output_node, [])
+        except Exception as exc:
+            return _QBPDPBudgetResult(False, (-1, -1), None, float("inf"), 0.0, 0.0, reason=str(exc)[:240])
+        for state in output_states:
+            if int(io_budget.get("out_lvl", -1)) >= 0 and state.level != int(io_budget["out_lvl"]):
+                continue
+            input_state = states_by_node[input_node][0]
+            in_key = (int(input_state.level), int(input_state.scale))
+            out_key = (int(state.level), int(state.scale))
+            assign = None
+            actual_cost = float(state.cost + main_cost)
+            if materialize:
+                if state.assign_data is None:
+                    continue
+                try:
+                    assign = Assign.from_dict(tdag, state.assign_data)
+                    assign.check_assign()
+                    actual_cost = float(estimate_assign(assign, le) + main_cost)
+                except Exception as exc:
+                    continue
+            item = _QBPDPBudgetResult(
+                True,
+                in_key,
+                out_key,
+                actual_cost,
+                float(state.bootstrap_count),
+                float(state.rescale_count),
+                assign,
+            )
+            if best is None or (item.cost, item.bootstrap_count, item.rescale_count) < (
+                best.cost,
+                best.bootstrap_count,
+                best.rescale_count,
+            ):
+                best = item
+    return best or _QBPDPBudgetResult(False, (-1, -1), None, float("inf"), 0.0, 0.0, reason="qbp-dp found no feasible boundary state")
+
+
+def _solve_budget_batch_qbp_dp(
+    pdag: Tdag,
+    io_budgets_list: list[dict],
+    le: LatencyEstimator,
+    params: Params,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> tuple[
+    dict[tuple[int, int], dict[tuple[int, int], Assign]],
+    dict[tuple[int, int], dict[tuple[int, int], float]],
+]:
+    io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
+    io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
+    for group_key, budgets in _budget_boundary_groups(io_budgets_list).items():
+        selected_attempts: list[_BudgetAttempt] = []
+        candidate_solved_count = 0
+        fallback_selected_count = 0
+        reachable_budget_indices: set[int] = set()
+        for budget_idx, io_budget in enumerate(budgets):
+            result = _qbp_dp_solve_budget(
+                pdag,
+                params,
+                io_budget,
+                le,
+                hints,
+                materialize=True,
+            )
+            attempts: list[_BudgetAttempt] = []
+            if result.valid and result.assign is not None and result.out_key is not None:
+                attempts.append(
+                    _BudgetAttempt(
+                        "candidate:qbp_dp",
+                        result.assign,
+                        result.cost,
+                        result.in_key,
+                        result.out_key,
+                        result.cost,
+                        dict(hints),
+                    )
+                )
+                candidate_solved_count += 1
+            elif diagnostics is not None:
+                _record_invalid_reason(
+                    diagnostics,
+                    "candidate_invalid_reasons",
+                    PlacementError(result.reason or "qbp-dp found no feasible assignment"),
+                )
+            if not attempts and _should_use_seed_fallback(hints):
+                for source, policy_hints in _seed_fallback_attempts(params):
+                    try:
+                        attempts.append(_solve_one_budget_attempt(pdag, params, io_budget, le, source, policy_hints))
+                    except Exception as exc:
+                        if diagnostics is not None:
+                            _record_invalid_reason(diagnostics, "invalid_reasons", exc)
+            if not attempts:
+                if (
+                    not _boundary_budget_output_cannot_refresh(params, group_key, io_budget)
+                    and _probe_boundary_budget_reachable(pdag, params, io_budget, le)
+                ):
+                    reachable_budget_indices.add(budget_idx)
+                continue
+            reachable_budget_indices.add(budget_idx)
+            best_attempt = _best_attempt(attempts)
+            if best_attempt is None:
+                continue
+            if best_attempt.source.startswith("seed_fallback"):
+                fallback_selected_count += 1
+            selected_attempts.append(best_attempt)
+            if diagnostics is not None:
+                candidate_attempt = _best_candidate_attempt(attempts, params, hints)
+                fallback_attempt = _best_attempt(
+                    attempt for attempt in attempts if attempt.source.startswith("seed_fallback")
+                )
+                _record_selected_attempt(diagnostics, best_attempt, candidate_attempt, fallback_attempt)
+            current = io_to_cost.get(best_attempt.in_key, {}).get(best_attempt.out_key)
+            if current is None or best_attempt.cost < current:
+                io_to_cost.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.cost
+                io_to_assign.setdefault(best_attempt.in_key, {})[best_attempt.out_key] = best_attempt.assign
+        if diagnostics is not None:
+            _record_boundary_group_result(
+                diagnostics,
+                params,
+                group_key,
+                budgets,
+                selected_attempts,
+                candidate_solved_count,
+                fallback_selected_count,
+                len(reachable_budget_indices),
+            )
+    return io_to_assign, io_to_cost
+
+
 def solve_budget_batch(
     pdag: Tdag,
     io_budgets_list: list[dict],
@@ -13553,6 +14642,15 @@ def solve_budget_batch(
     if diagnostics is not None:
         _init_budget_diagnostics(diagnostics, len(io_budgets_list))
     if str(hints.get("strategy")) == "bootstrap_mcts":
+        if _use_qbp_dp_engine(params, hints):
+            return _solve_budget_batch_qbp_dp(
+                pdag,
+                io_budgets_list,
+                le,
+                params,
+                hints,
+                diagnostics,
+            )
         if (
             not getattr(params, "openevolve_evaluating_candidate", False)
             and int(getattr(params, "openevolve_iterations", 0) or 0) == 0

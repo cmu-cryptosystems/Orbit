@@ -450,12 +450,18 @@ class QBPManager:
             groups.setdefault(key, []).append(budget)
         for budgets in groups.values():
             budgets.sort(key=lambda item: int(item.get("out_lvl", -1)))
+        preserve_group_outputs = (
+            getattr(self.params, "openevolve_search_mode", "") == "bootstrap-mcts"
+            and getattr(self.params, "openevolve_qbp_engine", "mcts") == "dp"
+        )
         per_group_output_cap = max(
             1,
             min(4, int(getattr(self.params, "openevolve_max_unit_samples", 64))),
         )
 
         def sample_group_outputs(budgets: list[dict]) -> list[dict]:
+            if preserve_group_outputs:
+                return budgets
             if len(budgets) <= per_group_output_cap:
                 return budgets
             by_level = {int(item.get("out_lvl", -1)): item for item in budgets}

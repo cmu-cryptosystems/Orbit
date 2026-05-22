@@ -74,6 +74,7 @@ class Params:
         openevolve_secondary_weight=None,
         openevolve_harness="compile",
         openevolve_search_mode=None,
+        openevolve_qbp_engine=None,
         openevolve_granularity=None,
         openevolve_leniency=None,
         openevolve_max_unit_samples=None,
@@ -263,6 +264,25 @@ class Params:
             raise ValueError(
                 "openevolve_search_mode must be 'legacy', 'beam', or 'bootstrap-mcts', "
                 f"got {self.openevolve_search_mode!r}"
+            )
+        default_qbp_engine = (
+            "dp"
+            if (
+                self.placement_backend == "openevolve"
+                and self.openevolve_search_mode == "bootstrap-mcts"
+                and self.openevolve_iterations > 0
+            )
+            else "mcts"
+        )
+        self.openevolve_qbp_engine = (
+            openevolve_qbp_engine
+            if openevolve_qbp_engine is not None
+            else json_parsed.get("openevolve_qbp_engine", default_qbp_engine)
+        )
+        if self.openevolve_qbp_engine not in ("mcts", "dp"):
+            raise ValueError(
+                "openevolve_qbp_engine must be 'mcts' or 'dp', "
+                f"got {self.openevolve_qbp_engine!r}"
             )
         self.openevolve_granularity = (
             openevolve_granularity

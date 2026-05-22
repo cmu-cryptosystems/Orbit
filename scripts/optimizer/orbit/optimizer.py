@@ -249,6 +249,9 @@ def main():
     parser.add_argument('--openevolve-search-mode', type=str, default='bootstrap-mcts',
                         choices=['legacy', 'beam', 'bootstrap-mcts'],
                         help='OpenEvolve placement search mode for positive iterations')
+    parser.add_argument('--openevolve-qbp-engine', type=str, default=None,
+                        choices=['mcts', 'dp'],
+                        help='QBP evaluator used by bootstrap-mcts: dp uses no-solver boundary-state DP')
     parser.add_argument('--openevolve-granularity', type=str, default='layer-nonlinear',
                         choices=['compile', 'layer-nonlinear'],
                         help='OpenEvolve placement context granularity for positive iterations')
@@ -437,6 +440,7 @@ def main():
                     openevolve_secondary_weight=args.openevolve_secondary_weight,
                     openevolve_harness=args.openevolve_harness,
                     openevolve_search_mode=args.openevolve_search_mode,
+                    openevolve_qbp_engine=args.openevolve_qbp_engine,
                     openevolve_granularity=args.openevolve_granularity,
                     openevolve_leniency=args.openevolve_leniency,
                     openevolve_max_unit_samples=args.openevolve_max_unit_samples,

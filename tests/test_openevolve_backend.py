@@ -7080,6 +7080,59 @@ def test_qbp_dp_progress_trace_file_is_written(toy_cost_json: str, tmp_path: Pat
     assert payload["last_stage"] in {"budget_done", "budget_output_states", "node_complete"}
 
 
+def test_qbp_dp_transition_and_output_state_caches(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    hints = {"strategy": "bootstrap_mcts", "qbp_engine": "dp"}
+    policy = oe_backend._policy_options(hints, params)
+
+    first = oe_backend._qbp_dp_transition_metrics_cached(
+        params, le, hints, 16, 40, 16, 40
+    )
+    second = oe_backend._qbp_dp_transition_metrics_cached(
+        params, le, hints, 16, 40, 16, 40
+    )
+    assert first == second
+
+    states_first = oe_backend._qbp_dp_output_states_cached(
+        graph,
+        "0",
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        policy,
+        16,
+        40,
+        None,
+        None,
+        hints,
+        [40],
+    )
+    states_second = oe_backend._qbp_dp_output_states_cached(
+        graph,
+        "0",
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        policy,
+        16,
+        40,
+        None,
+        None,
+        hints,
+        [40],
+    )
+
+    assert states_first == states_second
+    stats = oe_backend._qbp_dp_cache_stats(hints)
+    assert stats["transition_hits"] >= 1
+    assert stats["output_state_hits"] >= 1
+
+
 def test_qbp_dp_bucketed_prune_preserves_high_boundary_state(toy_cost_json: str):
     params = _params(toy_cost_json)
     low_cost = oe_backend._QBPDPState(4, 40, 1.0, 0.0, 0.0)
@@ -7098,6 +7151,35 @@ def test_qbp_dp_bucketed_prune_preserves_high_boundary_state(toy_cost_json: str)
     assert (4, 80, 120.0) in keys
     assert (4, 40, 0.5) in keys
     assert (4, 40, 1.0) not in keys
+
+
+def test_qbp_dp_prune_preserves_seed_bridge_but_prefers_direct_state(
+    toy_cost_json: str,
+):
+    params = _params(toy_cost_json)
+    seed_only = oe_backend._QBPDPState(
+        12,
+        52,
+        0.0,
+        0.0,
+        0.0,
+        None,
+        "reference_seed_bridge",
+        1.0,
+    )
+    direct_same_key = oe_backend._QBPDPState(12, 52, 100.0, 0.0, 0.0)
+    direct_low = oe_backend._QBPDPState(4, 40, 1.0, 0.0, 0.0)
+
+    pruned = oe_backend._qbp_dp_prune_states(
+        [seed_only, direct_same_key, direct_low],
+        1,
+        params,
+    )
+
+    by_key = {(state.level, state.scale): state for state in pruned}
+    assert (12, 52) in by_key
+    assert by_key[(12, 52)].seed_bridge_count == 0.0
+    assert by_key[(12, 52)].cost == 100.0
 
 
 def test_qbp_dp_probe_records_failure_trace_and_seed_bridge(
@@ -7169,6 +7251,46 @@ def test_qbp_dp_probe_records_failure_trace_and_seed_bridge(
     assert first["reference_seed_bridge"]["winner_selectable"] is False
 
 
+def test_qbp_dp_seed_bridge_probe_is_not_direct_valid(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}], params)
+    context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": context,
+        }
+    ]
+    monkeypatch.setattr(oe_backend, "_qbp_dp_prune_states", lambda *_args, **_kwargs: [])
+
+    result = oe_backend._evaluate_sampled_budget_tasks_dp_probe(
+        context,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "enable_seed_frontier_anchor": True,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["fallback_selected_budgets"] == 1
+    assert result["candidate_qbp_coverage"] == 0.0
+    assert oe_backend._promotion_result_direct_valid(result) is False
+    summary = result["diagnostics"]["boundary_group_summaries"][0]
+    assert summary["selected_source_counts"] == {"reference_seed_bridge:qbp_dp": 1}
+
+
 def test_qbp_dp_seed_guided_replay_matches_valid_seed(toy_cost_json: str):
     params = _params(
         toy_cost_json,
@@ -7236,6 +7358,50 @@ def test_qbp_dp_seed_guided_replay_reports_missing_scale_candidate(
     assert replay["valid"] is False
     assert replay["winner_selectable"] is False
     assert replay["first_mismatch"]["reason"] == "seed_incoming_scales_missing_from_dp_candidates"
+
+
+def test_single_boundary_dp_debug_writes_artifact(toy_cost_json: str, tmp_path: Path):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    context = build_compile_context(graph, params)
+    task_context = build_context(
+        graph,
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": task_context,
+        }
+    ]
+
+    payload = oe_backend._run_single_boundary_dp_debug(
+        tmp_path,
+        context,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        params,
+        context["sampled_budget_tasks"],
+        123.0,
+        eval_timeout_sec=2,
+    )
+
+    assert payload is not None
+    path = tmp_path / "single_boundary_dp_debug.json"
+    assert path.is_file()
+    saved = json.loads(path.read_text())
+    assert saved["kind"] == "single_boundary_dp_debug"
+    assert saved["seed_assignment_states"]["winner_selectable"] is False
+    assert "qbp_dp_cache_stats" in saved["diagnostics"]
 
 
 def test_dp_failure_trace_artifacts_are_written(tmp_path: Path):

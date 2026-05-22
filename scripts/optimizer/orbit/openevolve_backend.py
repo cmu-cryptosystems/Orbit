@@ -84,6 +84,8 @@ class _QBPDPState:
     bootstrap_count: float = 0.0
     rescale_count: float = 0.0
     assign_data: dict[str, Any] | None = None
+    source: str = "candidate"
+    seed_bridge_count: float = 0.0
 
 
 @dataclass
@@ -97,6 +99,7 @@ class _QBPDPBudgetResult:
     assign: Assign | None = None
     reason: str = ""
     trace: dict[str, Any] | None = None
+    seed_bridge_count: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -11941,6 +11944,137 @@ def _apply_dp_probe_seed_reference(
     return updated_tasks, latency, result
 
 
+def _compact_seed_anchor_for_debug(seed_anchor: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(seed_anchor, dict):
+        return {"valid": False}
+    node_outputs = seed_anchor.get("node_outputs", {})
+    node_inputs = seed_anchor.get("node_inputs", {})
+    edge_outputs = seed_anchor.get("edge_outputs_by_dst", {})
+    sample_nodes = sorted(node_outputs)[:24] if isinstance(node_outputs, dict) else []
+    return {
+        "valid": bool(seed_anchor.get("valid", False)),
+        "winner_selectable": False,
+        "source": seed_anchor.get("source"),
+        "cost_usec": seed_anchor.get("cost_usec"),
+        "in_key": seed_anchor.get("in_key"),
+        "out_key": seed_anchor.get("out_key"),
+        "bootstrap_count": seed_anchor.get("bootstrap_count"),
+        "rescale_count": seed_anchor.get("rescale_count"),
+        "node_output_count": len(node_outputs) if isinstance(node_outputs, dict) else 0,
+        "node_input_count": len(node_inputs) if isinstance(node_inputs, dict) else 0,
+        "edge_dst_count": len(edge_outputs) if isinstance(edge_outputs, dict) else 0,
+        "sample_node_outputs": {
+            node: list(node_outputs[node])
+            for node in sample_nodes
+            if isinstance(node_outputs, dict) and node in node_outputs
+        },
+        "attempts": seed_anchor.get("attempts", [])[:4],
+    }
+
+
+def _run_single_boundary_dp_debug(
+    promotion_dir: Path,
+    context: dict[str, Any],
+    initial_hints: dict[str, Any] | None,
+    params: Params,
+    selected_probe_tasks: list[dict[str, Any]],
+    probe_reference_cost: float,
+    *,
+    eval_timeout_sec: int,
+) -> dict[str, Any] | None:
+    if not selected_probe_tasks or not initial_hints or not _use_qbp_dp_engine(params, initial_hints):
+        return None
+    debug_dir = promotion_dir / "single_boundary_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    task = deepcopy(selected_probe_tasks[0])
+    debug_context = deepcopy(context)
+    debug_context["sampled_budget_tasks"] = [task]
+    debug_context.setdefault("harness", {})["dp_trace_dir"] = str(debug_dir)
+    debug_context.setdefault("harness", {})["single_boundary_dp_debug"] = True
+    eval_hints = _compile_hints_for_eval_suite(
+        initial_hints,
+        getattr(params, "openevolve_eval_suite", "polybert-sampled"),
+    )
+    probe_hints = _dp_probe_lightweight_hints(_promotion_probe_hints(eval_hints, [task]))
+    probe_hints["enable_seed_frontier_anchor"] = True
+    probe_hints["dp_trace_label"] = "single_boundary_debug"
+    timeout = max(1, min(max(1, eval_timeout_sec), _int_hint(os.environ.get("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG_TIMEOUT_SEC"), max(1, eval_timeout_sec))))
+    result = _evaluate_dp_probe_for_promotion(
+        debug_context,
+        probe_hints,
+        [task],
+        timeout_sec=timeout,
+    )
+
+    seed_anchor = None
+    first_budget = None
+    try:
+        task_context = task.get("context") if isinstance(task, dict) else None
+        if isinstance(task_context, dict):
+            task_tdag = tdag_from_context(task_context)
+            task_params = task_tdag.params
+            task_params.openevolve_compile_hints = dict(probe_hints)
+            _apply_active_scale_floor_from_hints(task_params, probe_hints)
+            budgets = [
+                _io_budget_from_json(item)
+                for item in task_context.get("io_budgets", [])
+                if isinstance(item, dict)
+            ]
+            selected_group_keys = _sampled_task_group_keys(task)
+            for group_key, group_budgets in _budget_boundary_groups(budgets).items():
+                if selected_group_keys and _boundary_group_key_string(group_key) not in selected_group_keys:
+                    continue
+                if group_budgets:
+                    first_budget = group_budgets[0]
+                    seed_anchor = _qbp_dp_seed_anchor_data(
+                        task_tdag,
+                        task_params,
+                        first_budget,
+                        LatencyEstimator(task_params),
+                        probe_hints,
+                    )
+                    break
+    except Exception as exc:
+        seed_anchor = {
+            "valid": False,
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
+    payload = {
+        "kind": "single_boundary_dp_debug",
+        "probe_reference_latency_usec": float(probe_reference_cost),
+        "timeout_sec": timeout,
+        "task_index": task.get("index") if isinstance(task, dict) else None,
+        "group_keys": task.get("group_keys", []) if isinstance(task, dict) else [],
+        "io_budget": _jsonable_io_budget(first_budget) if isinstance(first_budget, dict) else None,
+        "seed_assignment_states": _compact_seed_anchor_for_debug(seed_anchor),
+        "result": _promotion_record_summary(
+            index=-1,
+            stage="single_boundary_dp_debug",
+            hints=probe_hints,
+            result=result,
+            reason=(
+                "direct_valid"
+                if _promotion_result_direct_valid(result)
+                else "incomplete_or_seed_bridge"
+            ),
+        ),
+        "diagnostics": {
+            "qbp_dp_cache_stats": (
+                result.get("diagnostics", {}).get("qbp_dp_cache_stats", {})
+                if isinstance(result.get("diagnostics"), dict)
+                else {}
+            ),
+            "dp_failure_summaries": _compact_dp_failure_summaries(result),
+        },
+    }
+    (promotion_dir / "single_boundary_dp_debug.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _write_promotion_progress(
     promotion_dir: Path,
     *,
@@ -12046,6 +12180,17 @@ def _evaluate_sampled_budget_tasks_dp_probe(
     eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
     eval_hints = dict(_compile_hints_for_eval_suite(hints, eval_suite))
     eval_hints["dp_trace"] = True
+    eval_hints.setdefault("enable_seed_frontier_anchor", True)
+    eval_hints["_qbp_dp_internal_cache"] = {
+        "stats": {
+            "transition_hits": 0,
+            "transition_misses": 0,
+            "output_state_hits": 0,
+            "output_state_misses": 0,
+            "online_prune_count": 0,
+            "seed_anchor_injected_states": 0,
+        }
+    }
     for trace_key in (
         "dp_trace_path",
         "dp_wall_time_budget_sec",
@@ -12117,6 +12262,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             selected_results: list[_QBPDPBudgetResult] = []
             group_failure_traces: list[dict[str, Any]] = []
             reachable = 0
+            seed_bridge_selected = 0
             for budget in group_budgets:
                 total["requested_budgets"] += 1
                 result = _qbp_dp_solve_budget(
@@ -12131,8 +12277,13 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                     selected_results.append(result)
                     reachable += 1
                     total["solved_budgets"] += 1
-                    total["candidate_solved_budgets"] += 1
-                    total["candidate_costs"].append(float(result.cost))
+                    if float(getattr(result, "seed_bridge_count", 0.0) or 0.0) > 0:
+                        seed_bridge_selected += 1
+                        total["fallback_solved_budgets"] += 1
+                        total["fallback_selected_budgets"] += 1
+                    else:
+                        total["candidate_solved_budgets"] += 1
+                        total["candidate_costs"].append(float(result.cost))
                     total["costs"].append(float(result.cost))
                 elif _boundary_budget_output_cannot_refresh(task_params, group_key, budget):
                     continue
@@ -12153,7 +12304,10 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             solved = len(selected_results)
             if requested > 0 and reachable > 0 and solved >= reachable:
                 total["solved_boundary_groups"] += 1
-                total["candidate_solved_boundary_groups"] += 1
+                if seed_bridge_selected:
+                    total["fallback_selected_boundary_groups"] += 1
+                else:
+                    total["candidate_solved_boundary_groups"] += 1
                 reason = "complete_candidate"
             elif solved > 0:
                 total["partial_boundary_groups"] += 1
@@ -12167,7 +12321,11 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             costs = [float(item.cost) for item in selected_results]
             bootstraps = [float(item.bootstrap_count) for item in selected_results]
             rescales = [float(item.rescale_count) for item in selected_results]
-            selected_source_counts = {"candidate:qbp_dp": solved} if solved else {}
+            selected_source_counts = {}
+            if solved - seed_bridge_selected > 0:
+                selected_source_counts["candidate:qbp_dp"] = solved - seed_bridge_selected
+            if seed_bridge_selected:
+                selected_source_counts["reference_seed_bridge:qbp_dp"] = seed_bridge_selected
             seed_bridge = None
             if solved < reachable and group_failure_traces:
                 seed_bridge = _qbp_dp_seed_bridge_summary(
@@ -12197,9 +12355,10 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                 "unreachable_budgets": int(max(0, requested - reachable)),
                 "solved_budgets": solved,
                 "candidate_solved_budgets": solved,
-                "fallback_selected_budgets": 0,
+                "fallback_selected_budgets": int(seed_bridge_selected),
                 "complete": bool(requested > 0 and reachable > 0 and solved >= reachable),
-                "candidate_complete": bool(requested > 0 and reachable > 0 and solved >= reachable),
+                "candidate_complete": bool(requested > 0 and reachable > 0 and solved >= reachable and not seed_bridge_selected),
+                "seed_bridge_selected_budgets": int(seed_bridge_selected),
                 "selected_source_counts": selected_source_counts,
                 "unsolved_reason": reason,
                 "unreachable_input": bool(reachable <= 0),
@@ -12274,6 +12433,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
     candidate_groups = int(total.get("candidate_solved_boundary_groups", 0) or 0)
     params = tdag_from_context(context).params
     scale_floor_bits = _apply_active_scale_floor_from_hints(params, eval_hints)
+    total["qbp_dp_cache_stats"] = dict(_qbp_dp_cache_stats(eval_hints))
     return {
         "valid": bool(solved),
         "validity": float(solved / requested),
@@ -12295,8 +12455,8 @@ def _evaluate_sampled_budget_tasks_dp_probe(
         "boundary_quality": 0.0,
         "profile_risk": 0.0 if solved else 1.0,
         "placement_runtime_sec": time.time() - start,
-        "fallback_selected_budgets": 0,
-        "fallback_selected_groups": 0,
+        "fallback_selected_budgets": int(total.get("fallback_selected_budgets", 0) or 0),
+        "fallback_selected_groups": int(total.get("fallback_selected_boundary_groups", 0) or 0),
         "invalid_boundary_groups": int(total.get("invalid_boundary_groups", 0)),
         "unreachable_boundary_groups": int(total.get("unreachable_boundary_groups", 0)),
         "selected_output_state": {},
@@ -12547,6 +12707,15 @@ def _run_sampled_promotion_pass(
         selected_probe_tasks,
         probe_reference_cost,
         timeout_sec=min(15, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
+    )
+    single_boundary_debug = _run_single_boundary_dp_debug(
+        promotion_dir,
+        context,
+        initial_hints,
+        params,
+        selected_probe_tasks,
+        probe_reference_cost,
+        eval_timeout_sec=min(15, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
     )
 
     full_reference_cost = _promotion_reference_latency(context)
@@ -13003,6 +13172,19 @@ def _run_sampled_promotion_pass(
                 else 0
             ),
         },
+        "single_boundary_dp_debug": {
+            "path": str(promotion_dir / "single_boundary_dp_debug.json"),
+            "valid": bool(
+                single_boundary_debug
+                and single_boundary_debug.get("result", {}).get("valid")
+            ),
+            "direct_valid": bool(
+                single_boundary_debug
+                and single_boundary_debug.get("result", {}).get("direct_valid")
+            ),
+        }
+        if single_boundary_debug is not None
+        else None,
         "probe_task_count": len(selected_probe_tasks),
         "probe_reference_latency_usec": probe_reference_cost,
         "sampled_reference_latency_usec": full_reference_cost,
@@ -14410,6 +14592,49 @@ def _qbp_dp_transition_metrics(
     return cost, 1.0 if uses_bootstrap else 0.0, rescale_count
 
 
+def _qbp_dp_internal_cache(hints: dict[str, Any]) -> dict[str, Any]:
+    cache = hints.setdefault("_qbp_dp_internal_cache", {})
+    return cache if isinstance(cache, dict) else {}
+
+
+def _qbp_dp_cache_stats(hints: dict[str, Any]) -> dict[str, int]:
+    cache = _qbp_dp_internal_cache(hints)
+    stats = cache.setdefault(
+        "stats",
+        {
+            "transition_hits": 0,
+            "transition_misses": 0,
+            "output_state_hits": 0,
+            "output_state_misses": 0,
+            "online_prune_count": 0,
+            "seed_anchor_injected_states": 0,
+        },
+    )
+    return stats if isinstance(stats, dict) else {}
+
+
+def _qbp_dp_transition_metrics_cached(
+    params: Params,
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+    in_lvl: int,
+    in_scl: int,
+    out_lvl: int,
+    out_scl: int,
+) -> tuple[float, float, float] | None:
+    cache = _qbp_dp_internal_cache(hints)
+    stats = _qbp_dp_cache_stats(hints)
+    transitions = cache.setdefault("transition_metrics", {})
+    key = (int(in_lvl), int(in_scl), int(out_lvl), int(out_scl))
+    if key in transitions:
+        stats["transition_hits"] = int(stats.get("transition_hits", 0) or 0) + 1
+        return transitions[key]
+    stats["transition_misses"] = int(stats.get("transition_misses", 0) or 0) + 1
+    value = _qbp_dp_transition_metrics(params, le, in_lvl, in_scl, out_lvl, out_scl)
+    transitions[key] = value
+    return value
+
+
 def _qbp_dp_op_cost(
     tdag: Tdag,
     node: str,
@@ -14430,6 +14655,17 @@ def _qbp_dp_op_cost(
 
 def _qbp_dp_state_sort_key(state: _QBPDPState) -> tuple[float, float, float, int, int]:
     return (
+        float(state.cost),
+        float(state.bootstrap_count),
+        float(state.rescale_count),
+        int(state.level),
+        int(state.scale),
+    )
+
+
+def _qbp_dp_state_select_key(state: _QBPDPState) -> tuple[int, float, float, float, int, int]:
+    return (
+        1 if float(getattr(state, "seed_bridge_count", 0.0) or 0.0) > 0 else 0,
         float(state.cost),
         float(state.bootstrap_count),
         float(state.rescale_count),
@@ -14641,9 +14877,9 @@ def _qbp_dp_prune_states(
     for state in states:
         key = _qbp_dp_state_key(state)
         prev = best_by_key.get(key)
-        if prev is None or _qbp_dp_state_sort_key(state) < _qbp_dp_state_sort_key(prev):
+        if prev is None or _qbp_dp_state_select_key(state) < _qbp_dp_state_select_key(prev):
             best_by_key[key] = state
-    unique = sorted(best_by_key.values(), key=_qbp_dp_state_sort_key)
+    unique = sorted(best_by_key.values(), key=_qbp_dp_state_select_key)
     if len(unique) <= cap:
         return unique
 
@@ -14677,7 +14913,7 @@ def _qbp_dp_prune_states(
         selected_keys.add(key)
 
     for bucket in buckets.values():
-        for state in sorted(bucket, key=_qbp_dp_state_sort_key)[:bucket_cap]:
+        for state in sorted(bucket, key=_qbp_dp_state_select_key)[:bucket_cap]:
             add_state(state)
 
     high_level = max(unique, key=lambda item: (int(item.level), -float(item.cost), int(item.scale)))
@@ -14689,7 +14925,7 @@ def _qbp_dp_prune_states(
         if len(selected) >= global_cap:
             break
         add_state(state)
-    return sorted(selected, key=_qbp_dp_state_sort_key)[:global_cap]
+    return sorted(selected, key=_qbp_dp_state_select_key)[:global_cap]
 
 
 def _qbp_dp_main_qbp_choices(io_budget: dict[str, Any]) -> list[tuple[tuple[int, int] | None, float]]:
@@ -14832,6 +15068,67 @@ def _qbp_dp_output_states(
     return results
 
 
+def _qbp_dp_output_states_cached(
+    tdag: Tdag,
+    node: str,
+    params: Params,
+    io_budget: dict[str, Any],
+    policy: dict[str, Any],
+    input_level: int,
+    input_scale: int,
+    node_level_hint: int | None,
+    node_scale_hint: int | None,
+    hints: dict[str, Any],
+    extra_output_scales: list[int] | None = None,
+) -> list[tuple[int, int]]:
+    cache = _qbp_dp_internal_cache(hints)
+    stats = _qbp_dp_cache_stats(hints)
+    output_cache = cache.setdefault("output_states", {})
+    key = (
+        str(node),
+        int(io_budget.get("out_lvl", -1)),
+        int(io_budget.get("out_scl", -1) or -1),
+        int(input_level),
+        int(input_scale),
+        int(node_level_hint) if node_level_hint is not None else None,
+        int(node_scale_hint) if node_scale_hint is not None else None,
+        tuple(sorted(int(value) for value in (extra_output_scales or []))),
+        str(policy.get("scale_lattice", "default")),
+        int(policy.get("max_scale_candidates", 32)),
+        int(policy.get("max_scale", _max_scale(params))),
+    )
+    if key in output_cache:
+        stats["output_state_hits"] = int(stats.get("output_state_hits", 0) or 0) + 1
+        return output_cache[key]
+    stats["output_state_misses"] = int(stats.get("output_state_misses", 0) or 0) + 1
+    merged_hint = node_scale_hint
+    states = _qbp_dp_output_states(
+        tdag,
+        node,
+        params,
+        io_budget,
+        policy,
+        input_level,
+        input_scale,
+        node_level_hint,
+        merged_hint,
+    )
+    if extra_output_scales:
+        is_output = node in tdag.outputs
+        levels = [int(io_budget["out_lvl"])] if is_output and int(io_budget.get("out_lvl", -1)) >= 0 else _qbp_dp_level_candidates(params, node_level_hint, policy)
+        lower = params.scale_lower_bound(node, tdag.nodes[node], "out")
+        for level in levels:
+            upper = min(int(policy.get("max_scale", _max_scale(params))), params.decryptable_scale_bound(level))
+            if is_output:
+                upper = min(upper, params.boundary_output_scale_bound(level))
+            for scale in extra_output_scales:
+                scale = int(scale)
+                if lower <= scale <= upper and params.is_decryptable_state(level, scale):
+                    states.append((int(level), scale))
+    output_cache[key] = sorted(set(states))
+    return output_cache[key]
+
+
 def _qbp_dp_incoming_options(
     tdag: Tdag,
     node: str,
@@ -14840,6 +15137,8 @@ def _qbp_dp_incoming_options(
     policy: dict[str, Any],
     node_scale_hint: int | None,
     edge_scale_hints: dict[str, int],
+    extra_input_scales: list[int] | None = None,
+    extra_edge_scales: dict[str, int] | None = None,
 ) -> list[tuple[int, dict[str, int], int]]:
     preds = [pred for pred, _state in pred_states]
     lower = max(
@@ -14853,8 +15152,15 @@ def _qbp_dp_incoming_options(
     options: list[tuple[int, dict[str, int], int]] = []
     if op != "mul":
         values: list[Any] = [lower, params.Sw, params.Csw, params.Sf, node_scale_hint]
+        values.extend(extra_input_scales or [])
         for pred, state in pred_states:
-            values.extend([state.scale, edge_scale_hints.get(_edge_key(pred, node))])
+            values.extend(
+                [
+                    state.scale,
+                    edge_scale_hints.get(_edge_key(pred, node)),
+                    (extra_edge_scales or {}).get(pred),
+                ]
+            )
             if tdag.nodes[pred].get("op") == "constant":
                 values.append(params.Csw)
         for scale in _qbp_dp_scale_candidates(values, lower, max_scale, params, policy):
@@ -14871,6 +15177,7 @@ def _qbp_dp_incoming_options(
         values = [
             edge_lower,
             edge_scale_hints.get(_edge_key(pred, node)),
+            (extra_edge_scales or {}).get(pred),
             state.scale,
             math.ceil(state.scale / 2),
             max(edge_lower, int(state.scale) - int(params.Sf)),
@@ -14880,6 +15187,7 @@ def _qbp_dp_incoming_options(
             params.Sf,
             node_scale_hint,
         ]
+        values.extend(extra_input_scales or [])
         per_pred.append(
             (
                 pred,
@@ -14953,6 +15261,139 @@ def _qbp_dp_add_assignment_for_transition(
     return True
 
 
+def _qbp_dp_seed_anchor_data(
+    pdag: Tdag,
+    params: Params,
+    io_budget: dict[str, Any],
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _bool_hint(hints.get("enable_seed_frontier_anchor"), False):
+        return None
+    cache = _qbp_dp_internal_cache(hints).setdefault("seed_anchor", {})
+    key = _hint_digest(
+        {
+            "graph": str(getattr(pdag, "name", "")),
+            "budget": {str(k): str(v) for k, v in sorted(io_budget.items())},
+        }
+    )
+    if key in cache:
+        return cache[key]
+    policies: list[tuple[str, dict[str, Any]]] = [
+        ("reference_seed_bridge_latency_beam", _budget_fulfillment_beam_policy()),
+    ]
+    for source, policy in _seed_fallback_attempts(params):
+        policies.append((f"reference_{source}", policy))
+    best: _BudgetAttempt | None = None
+    attempts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source, policy in policies[:4]:
+        digest = _hint_digest(_policy_effect_payload(policy))
+        if digest in seen:
+            continue
+        seen.add(digest)
+        try:
+            attempt = _solve_one_budget_attempt(pdag, params, io_budget, le, source, policy)
+        except Exception as exc:
+            attempts.append(
+                {
+                    "source": source,
+                    "valid": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+            )
+            continue
+        attempts.append(
+            {
+                "source": source,
+                "valid": True,
+                "cost_usec": float(attempt.actual_cost or attempt.cost),
+                "in_key": list(attempt.in_key),
+                "out_key": list(attempt.out_key),
+            }
+        )
+        if best is None or float(attempt.actual_cost or attempt.cost) < float(best.actual_cost or best.cost):
+            best = attempt
+    if best is None:
+        cache[key] = {"valid": False, "attempts": attempts}
+        return cache[key]
+    assign = best.assign
+    node_outputs: dict[str, tuple[int, int]] = {}
+    node_inputs: dict[str, tuple[int, int]] = {}
+    edge_outputs_by_dst: dict[str, dict[str, tuple[int, int]]] = {}
+    edge_scales_by_dst: dict[str, dict[str, int]] = {}
+    for node in pdag.nodes:
+        if node in assign.v_lvl_out and node in assign.v_scl_out:
+            node_outputs[str(node)] = (int(assign.v_lvl_out[node]), int(assign.v_scl_out[node]))
+        if node in assign.v_lvl_in and node in assign.v_scl_in:
+            node_inputs[str(node)] = (int(assign.v_lvl_in[node]), int(assign.v_scl_in[node]))
+    for edge, level in assign.e_lvl_out.items():
+        if edge not in assign.e_scl_out:
+            continue
+        pred, dst = edge
+        edge_outputs_by_dst.setdefault(str(dst), {})[str(pred)] = (
+            int(level),
+            int(assign.e_scl_out[edge]),
+        )
+        edge_scales_by_dst.setdefault(str(dst), {})[str(pred)] = int(assign.e_scl_out[edge])
+    cache[key] = {
+        "valid": True,
+        "winner_selectable": False,
+        "source": best.source,
+        "cost_usec": float(best.actual_cost or best.cost),
+        "in_key": list(best.in_key),
+        "out_key": list(best.out_key),
+        "node_outputs": node_outputs,
+        "node_inputs": node_inputs,
+        "edge_outputs_by_dst": edge_outputs_by_dst,
+        "edge_scales_by_dst": edge_scales_by_dst,
+        "bootstrap_count": float(_aggregate_counts([assign])["bootstrap"]),
+        "rescale_count": float(_aggregate_counts([assign])["rescale"]),
+        "attempts": attempts,
+    }
+    return cache[key]
+
+
+def _qbp_dp_seed_anchor_state(
+    seed_anchor: dict[str, Any] | None,
+    node: str,
+) -> _QBPDPState | None:
+    if not isinstance(seed_anchor, dict) or not seed_anchor.get("valid"):
+        return None
+    raw = seed_anchor.get("node_outputs", {}).get(str(node))
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    return _QBPDPState(
+        int(raw[0]),
+        int(raw[1]),
+        0.0,
+        0.0,
+        0.0,
+        None,
+        "reference_seed_bridge",
+        1.0,
+    )
+
+
+def _qbp_dp_add_seed_anchor_state(
+    states: list[_QBPDPState],
+    seed_anchor: dict[str, Any] | None,
+    node: str,
+    params: Params,
+    hints: dict[str, Any],
+) -> list[_QBPDPState]:
+    seed_state = _qbp_dp_seed_anchor_state(seed_anchor, node)
+    if seed_state is None:
+        return states
+    if not params.is_decryptable_state(seed_state.level, seed_state.scale):
+        return states
+    if any(_qbp_dp_state_key(state) == _qbp_dp_state_key(seed_state) for state in states):
+        return states
+    stats = _qbp_dp_cache_stats(hints)
+    stats["seed_anchor_injected_states"] = int(stats.get("seed_anchor_injected_states", 0) or 0) + 1
+    return sorted(states + [seed_state], key=_qbp_dp_state_select_key)
+
+
 def _qbp_dp_node_states(
     tdag: Tdag,
     node: str,
@@ -14964,6 +15405,7 @@ def _qbp_dp_node_states(
     *,
     materialize: bool,
     trace: dict[str, Any] | None = None,
+    seed_anchor: dict[str, Any] | None = None,
 ) -> list[_QBPDPState]:
     node_hints = _policy_hints_for_node(hints, list(hints.get("unit_policies", []) or []), str(node), dict(tdag.nodes[node]))
     policy = _policy_options(node_hints, params)
@@ -14978,6 +15420,20 @@ def _qbp_dp_node_states(
     rejection_counts: Counter[str] = Counter()
     combo_count = 0
     incoming_option_count = 0
+    seed_node_inputs = seed_anchor.get("node_inputs", {}) if isinstance(seed_anchor, dict) else {}
+    seed_node_outputs = seed_anchor.get("node_outputs", {}) if isinstance(seed_anchor, dict) else {}
+    seed_edge_scales = (
+        seed_anchor.get("edge_scales_by_dst", {}).get(str(node), {})
+        if isinstance(seed_anchor, dict)
+        else {}
+    )
+    seed_input_scales = []
+    if str(node) in seed_node_inputs:
+        seed_input_scales.append(int(seed_node_inputs[str(node)][1]))
+    seed_output_scales = []
+    if str(node) in seed_node_outputs:
+        seed_output_scales.append(int(seed_node_outputs[str(node)][1]))
+    online_prune_limit = max(state_cap * 8, 64)
     if isinstance(trace, dict):
         trace["active_node_progress"] = {
             "node": str(node),
@@ -15001,6 +15457,8 @@ def _qbp_dp_node_states(
             policy,
             node_scale_hints.get(node),
             edge_scale_hints,
+            seed_input_scales,
+            {str(k): int(v) for k, v in dict(seed_edge_scales).items()},
         )
         incoming_option_count += len(incoming_options)
         if not incoming_options:
@@ -15033,6 +15491,20 @@ def _qbp_dp_node_states(
                     }
                 _qbp_dp_checkpoint_progress(trace, hints, stage="node_incoming_option", node=str(node))
             for input_level in _qbp_dp_level_candidates(params, node_level_hints.get(node), policy):
+                if isinstance(trace, dict):
+                    trace["active_node_progress"] = {
+                        "node": str(node),
+                        "op": str(tdag.nodes[node].get("op", "")),
+                        "phase": "input_level",
+                        "pred_state_counts": [len(states) for states in pred_state_lists],
+                        "combo_count": int(combo_count),
+                        "incoming_option_index": int(option_index),
+                        "input_level": int(input_level),
+                        "incoming_option_count": int(incoming_option_count),
+                        "candidate_count_before_prune": len(candidate_states),
+                        "rejection_counts": dict(rejection_counts),
+                    }
+                _qbp_dp_checkpoint_progress(trace, hints, stage="node_input_level", node=str(node))
                 edge_cost = 0.0
                 edge_bootstrap = 0.0
                 edge_rescale = 0.0
@@ -15042,9 +15514,10 @@ def _qbp_dp_node_states(
                     if tdag.nodes[pred].get("op") == "constant":
                         edge_levels[pred] = int(input_level)
                         continue
-                    metrics = _qbp_dp_transition_metrics(
+                    metrics = _qbp_dp_transition_metrics_cached(
                         params,
                         le,
+                        hints,
                         state.level,
                         state.scale,
                         input_level,
@@ -15063,7 +15536,7 @@ def _qbp_dp_node_states(
                     if feasible:
                         rejection_counts["input_state_not_decryptable"] += 1
                     continue
-                output_states = _qbp_dp_output_states(
+                output_states = _qbp_dp_output_states_cached(
                     tdag,
                     node,
                     params,
@@ -15073,13 +15546,32 @@ def _qbp_dp_node_states(
                     node_scale,
                     node_level_hints.get(node),
                     node_scale_hints.get(node),
+                    hints,
+                    seed_output_scales,
                 )
                 if not output_states:
                     rejection_counts["output_states_empty"] += 1
-                for output_level, output_scale in output_states:
-                    metrics = _qbp_dp_transition_metrics(
+                for output_index, (output_level, output_scale) in enumerate(output_states):
+                    if output_index == 0 or (output_index + 1) % progress_interval == 0:
+                        if isinstance(trace, dict):
+                            trace["active_node_progress"] = {
+                                "node": str(node),
+                                "op": str(tdag.nodes[node].get("op", "")),
+                                "phase": "output_state",
+                                "pred_state_counts": [len(states) for states in pred_state_lists],
+                                "combo_count": int(combo_count),
+                                "incoming_option_index": int(option_index),
+                                "input_level": int(input_level),
+                                "output_state_index": int(output_index),
+                                "output_state_count": len(output_states),
+                                "candidate_count_before_prune": len(candidate_states),
+                                "rejection_counts": dict(rejection_counts),
+                            }
+                        _qbp_dp_checkpoint_progress(trace, hints, stage="node_output_state", node=str(node))
+                    metrics = _qbp_dp_transition_metrics_cached(
                         params,
                         le,
+                        hints,
                         input_level,
                         node_scale,
                         output_level,
@@ -15124,9 +15616,16 @@ def _qbp_dp_node_states(
                             float(sum(state.bootstrap_count for state in combo) + edge_bootstrap + vertex_bootstrap),
                             float(sum(state.rescale_count for state in combo) + edge_rescale + vertex_rescale),
                             assign_data,
+                            "candidate",
+                            float(sum(getattr(state, "seed_bridge_count", 0.0) for state in combo)),
                         )
                     )
+                    if len(candidate_states) > online_prune_limit:
+                        candidate_states = _qbp_dp_prune_states(candidate_states, state_cap, params)
+                        stats = _qbp_dp_cache_stats(hints)
+                        stats["online_prune_count"] = int(stats.get("online_prune_count", 0) or 0) + 1
     pruned = _qbp_dp_prune_states(candidate_states, state_cap, params)
+    pruned = _qbp_dp_add_seed_anchor_state(pruned, seed_anchor, str(node), params, hints)
     _qbp_dp_trace_node(
         trace,
         node=str(node),
@@ -15169,8 +15668,23 @@ def _qbp_dp_solve_budget(
     best_trace: dict[str, Any] | None = None
     input_node = list(tdag.inputs)[0]
     output_node = list(tdag.outputs)[0]
+    seed_anchor = _qbp_dp_seed_anchor_data(tdag, params, io_budget, le, hints)
     for fixed_main, main_cost in main_choices:
         trace = _qbp_dp_new_trace(io_budget, len(main_choices)) if _qbp_dp_trace_enabled(hints) else None
+        if isinstance(trace, dict) and isinstance(seed_anchor, dict):
+            trace["reference_seed_bridge"] = {
+                key: seed_anchor.get(key)
+                for key in (
+                    "valid",
+                    "winner_selectable",
+                    "source",
+                    "cost_usec",
+                    "in_key",
+                    "out_key",
+                    "bootstrap_count",
+                    "rescale_count",
+                )
+            }
         _write_qbp_dp_progress_trace(trace, hints, stage="budget_start")
         fixed_inputs = {}
         if fixed_main is not None and io_budget.get("maino_v"):
@@ -15252,6 +15766,7 @@ def _qbp_dp_solve_budget(
                     hints,
                     materialize=materialize,
                     trace=trace,
+                    seed_anchor=seed_anchor,
                 )
             output_states = states_by_node.get(output_node, [])
             _qbp_dp_checkpoint_progress(trace, hints, stage="budget_output_states", node=str(output_node))
@@ -15284,7 +15799,18 @@ def _qbp_dp_solve_budget(
             out_key = (int(state.level), int(state.scale))
             assign = None
             actual_cost = float(state.cost + main_cost)
+            if float(getattr(state, "seed_bridge_count", 0.0) or 0.0) > 0 and isinstance(seed_anchor, dict):
+                anchor_cost = _finite_float(seed_anchor.get("cost_usec"), float("inf"))
+                if math.isfinite(anchor_cost):
+                    actual_cost = float(anchor_cost + main_cost)
+                bootstrap_count = _finite_float(seed_anchor.get("bootstrap_count"), float(state.bootstrap_count))
+                rescale_count = _finite_float(seed_anchor.get("rescale_count"), float(state.rescale_count))
+            else:
+                bootstrap_count = float(state.bootstrap_count)
+                rescale_count = float(state.rescale_count)
             if materialize:
+                if float(getattr(state, "seed_bridge_count", 0.0) or 0.0) > 0:
+                    continue
                 if state.assign_data is None:
                     continue
                 try:
@@ -15299,12 +15825,19 @@ def _qbp_dp_solve_budget(
                 in_key,
                 out_key,
                 actual_cost,
-                float(state.bootstrap_count),
-                float(state.rescale_count),
+                float(bootstrap_count),
+                float(rescale_count),
                 assign,
                 trace=trace,
+                seed_bridge_count=float(getattr(state, "seed_bridge_count", 0.0) or 0.0),
             )
-            if best is None or (item.cost, item.bootstrap_count, item.rescale_count) < (
+            if best is None or (
+                1 if item.seed_bridge_count > 0 else 0,
+                item.cost,
+                item.bootstrap_count,
+                item.rescale_count,
+            ) < (
+                1 if best.seed_bridge_count > 0 else 0,
                 best.cost,
                 best.bootstrap_count,
                 best.rescale_count,

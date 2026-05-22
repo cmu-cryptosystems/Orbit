@@ -11772,13 +11772,11 @@ def _evaluate_promotion_probe(
     timeout_sec: int,
 ) -> dict[str, Any]:
     if _use_qbp_dp_engine(params, hints):
-        probe_context = deepcopy(context)
-        probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
-        probe_context.setdefault("harness", {})["dp_table_probe"] = True
-        return _evaluate_sampled_budget_tasks_dp_probe(
-            probe_context,
+        return _evaluate_dp_probe_for_promotion(
+            context,
             hints,
-            selected_tasks=probe_context["sampled_budget_tasks"],
+            selected_probe_tasks,
+            timeout_sec=timeout_sec,
         )
     return _evaluate_sampled_budget_tasks_for_promotion(
         context,
@@ -11868,6 +11866,40 @@ def _promotion_sampled_eval_worker(
             sampled_context,
             hints,
             suppress_output=True,
+        )
+        result_queue.put({"ok": True, "result": result})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "result": {
+                    "valid": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "traceback": traceback.format_exc()[-4000:],
+                },
+            }
+        )
+
+
+def _promotion_dp_probe_worker(
+    result_queue,
+    probe_context: dict[str, Any],
+    hints: dict[str, Any],
+    selected_tasks: list[dict[str, Any]],
+) -> None:
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
+    try:
+        context = deepcopy(probe_context)
+        context["sampled_budget_tasks"] = deepcopy(selected_tasks)
+        context.setdefault("harness", {})["dp_table_probe"] = True
+        result = _evaluate_sampled_budget_tasks_dp_probe(
+            context,
+            hints,
+            selected_tasks=context["sampled_budget_tasks"],
         )
         result_queue.put({"ok": True, "result": result})
     except BaseException as exc:
@@ -12173,6 +12205,83 @@ def _evaluate_sampled_budget_tasks_for_promotion(
         }
     result = payload.get("result") if isinstance(payload, dict) else None
     return result if isinstance(result, dict) else {"valid": False, "error": "promotion QBP worker returned no result"}
+
+
+def _evaluate_dp_probe_for_promotion(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]],
+    *,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    probe_context = deepcopy(context)
+    probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
+    probe_context.setdefault("harness", {})["dp_table_probe"] = True
+    if timeout_sec <= 0:
+        return _evaluate_sampled_budget_tasks_dp_probe(
+            probe_context,
+            hints,
+            selected_tasks=probe_context["sampled_budget_tasks"],
+        )
+    ctx = _mp_context()
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_promotion_dp_probe_worker,
+        args=(result_queue, probe_context, hints, selected_probe_tasks),
+    )
+    proc.start()
+    deadline = time.time() + float(timeout_sec)
+    payload: dict[str, Any] | None = None
+    while time.time() < deadline:
+        try:
+            payload = result_queue.get(timeout=min(0.5, max(0.0, deadline - time.time())))
+            break
+        except queue_module.Empty:
+            if not proc.is_alive():
+                break
+    if payload is None:
+        proc.join(0)
+        try:
+            payload = result_queue.get_nowait()
+        except queue_module.Empty:
+            payload = None
+    if payload is None and proc.is_alive():
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
+        else:
+            proc.terminate()
+        proc.join(5)
+        if proc.is_alive() and hasattr(proc, "kill"):
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.join(5)
+        return {
+            "valid": False,
+            "timed_out": True,
+            "timeout_sec": int(timeout_sec),
+            "timeout_phase": "dp_table_probe",
+            "last_timing_phase": "dp_table_probe",
+            "dp_table_probe": True,
+            "error": f"promotion DP probe timed out after {timeout_sec}s",
+        }
+    proc.join(5)
+    if payload is None:
+        return {
+            "valid": False,
+            "dp_table_probe": True,
+            "error": f"promotion DP probe worker exited with code {proc.exitcode}",
+            "worker_exitcode": proc.exitcode,
+        }
+    result = payload.get("result") if isinstance(payload, dict) else None
+    return result if isinstance(result, dict) else {"valid": False, "dp_table_probe": True, "error": "promotion DP probe worker returned no result"}
 
 
 def _run_sampled_promotion_pass(

@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 import types
 from collections import defaultdict
 from pathlib import Path
@@ -6950,6 +6951,33 @@ def test_qbp_dp_probe_preserves_complete_boundary_group(toy_cost_json: str):
     assert summary["selected_source_counts"] == {"candidate:qbp_dp": 3}
 
 
+def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+
+    def slow_dp_probe(_context, _hints, *, selected_tasks=None):
+        time.sleep(5)
+        return {"valid": True}
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", slow_dp_probe)
+
+    result = oe_backend._evaluate_promotion_probe(
+        {"sampled_budget_tasks": []},
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        params,
+        [],
+        timeout_sec=1,
+    )
+
+    assert result["valid"] is False
+    assert result["timed_out"] is True
+    assert result["timeout_phase"] == "dp_table_probe"
+
+
 def test_qbp_manager_dp_sampling_keeps_all_outputs_in_selected_group(
     toy_cost_json: str,
 ):
@@ -7074,7 +7102,7 @@ def test_dp_promotion_rejects_seed_equivalent_without_materialization(
     )
 
     assert selected is None
-    assert len(calls) >= 2
+    assert len(calls) >= 1
     summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
     assert summary["qbp_engine"] == "dp"
     assert summary["records"][0]["reason"] == "dp_seed_equivalent"

@@ -13,6 +13,7 @@ import queue as queue_module
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -19066,6 +19067,16 @@ def _solve_budget_batch_qbp_dp(
     dict[tuple[int, int], dict[tuple[int, int], Assign]],
     dict[tuple[int, int], dict[tuple[int, int], float]],
 ]:
+    if not hints.get("_disable_qbp_dp_parallel"):
+        parallel = _solve_budget_batch_qbp_dp_parallel(
+            pdag,
+            io_budgets_list,
+            params,
+            hints,
+            diagnostics,
+        )
+        if parallel is not None:
+            return parallel
     io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
     io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
     for group_key, budgets in _budget_boundary_groups(io_budgets_list).items():
@@ -19145,6 +19156,153 @@ def _solve_budget_batch_qbp_dp(
                 len(reachable_budget_indices),
             )
     return io_to_assign, io_to_cost
+
+
+def _solve_budget_batch_qbp_dp_parallel(
+    pdag: Tdag,
+    io_budgets_list: list[dict],
+    params: Params,
+    hints: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> tuple[
+    dict[tuple[int, int], dict[tuple[int, int], Assign]],
+    dict[tuple[int, int], dict[tuple[int, int], float]],
+] | None:
+    grouped_budgets = list(_budget_boundary_groups(io_budgets_list).values())
+    if len(grouped_budgets) > 1:
+        task_budgets = grouped_budgets
+        task_kind = "boundary_groups"
+    elif len(io_budgets_list) > 1:
+        task_budgets = [[dict(budget)] for budget in io_budgets_list]
+        task_kind = "output_budgets"
+    else:
+        return None
+    workers = _parallel_qbp_worker_count(params, len(task_budgets))
+    if workers <= 1:
+        return None
+    if _openevolve_live_progress_enabled():
+        print(
+            "[OpenEvolve QBP] qbp_dp parallel start "
+            f"pdag={pdag.name} tasks={len(task_budgets)} kind={task_kind} workers={workers}",
+            file=sys.__stderr__,
+            flush=True,
+        )
+    payloads = [
+        (build_context(pdag, [dict(budget) for budget in budgets], params), hints)
+        for budgets in task_budgets
+    ]
+    io_to_assign: dict[tuple[int, int], dict[tuple[int, int], Assign]] = {}
+    io_to_cost: dict[tuple[int, int], dict[tuple[int, int], float]] = {}
+    start = time.perf_counter()
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        for payload in executor.map(_run_qbp_dp_group_payload, payloads):
+            if payload.get("error"):
+                if diagnostics is not None:
+                    _record_invalid_reason(
+                        diagnostics,
+                        "invalid_reasons",
+                        PlacementError(str(payload.get("error"))),
+                    )
+                continue
+            context = payload.get("context")
+            if not isinstance(context, dict):
+                continue
+            task_tdag = tdag_from_context(context)
+            for record in payload.get("records", []) or []:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    in_key = (int(record["in_key"][0]), int(record["in_key"][1]))
+                    out_key = (int(record["out_key"][0]), int(record["out_key"][1]))
+                    cost = float(record["cost"])
+                    assign = _assign_from_serialized(task_tdag, record["assign"])
+                except Exception as exc:
+                    if diagnostics is not None:
+                        _record_invalid_reason(diagnostics, "invalid_reasons", exc)
+                    continue
+                current = io_to_cost.get(in_key, {}).get(out_key)
+                if current is None or cost < current:
+                    io_to_cost.setdefault(in_key, {})[out_key] = cost
+                    io_to_assign.setdefault(in_key, {})[out_key] = assign
+            if diagnostics is not None:
+                _merge_boundary_replay_diagnostics(
+                    diagnostics,
+                    payload.get("diagnostics", {}),
+                )
+    if _openevolve_live_progress_enabled():
+        print(
+            "[OpenEvolve QBP] qbp_dp parallel done "
+            f"pdag={pdag.name} input_states={len(io_to_cost)} "
+            f"elapsed={time.perf_counter() - start:.2f}s",
+            file=sys.__stderr__,
+            flush=True,
+        )
+    return io_to_assign, io_to_cost
+
+
+def _run_qbp_dp_group_payload(
+    payload: tuple[dict[str, Any], dict[str, Any]]
+) -> dict[str, Any]:
+    context, hints = payload
+    diagnostics: dict[str, Any] = {}
+    try:
+        task_tdag = tdag_from_context(context)
+        task_params = task_tdag.params
+        task_params.openevolve_iterations = 0
+        task_params.openevolve_harness = "compile"
+        task_params.openevolve_compile_hints = hints
+        task_params.openevolve_evaluating_candidate = False
+        task_params.openevolve_collect_diagnostics = True
+        _apply_active_scale_floor_from_hints(task_params, hints)
+        task_le = LatencyEstimator(task_params)
+        budgets = [
+            _io_budget_from_json(item)
+            for item in context.get("io_budgets", [])
+            if isinstance(item, dict)
+        ]
+        _init_budget_diagnostics(diagnostics, len(budgets))
+        worker_hints = dict(hints)
+        worker_hints["_disable_qbp_dp_parallel"] = True
+        io_to_assign, io_to_cost = _solve_budget_batch_qbp_dp(
+            task_tdag,
+            budgets,
+            task_le,
+            task_params,
+            worker_hints,
+            diagnostics,
+        )
+        records = []
+        for in_key, out_to_cost in io_to_cost.items():
+            for out_key, cost in out_to_cost.items():
+                assign = io_to_assign.get(in_key, {}).get(out_key)
+                if assign is None:
+                    continue
+                records.append(
+                    {
+                        "in_key": [int(in_key[0]), int(in_key[1])],
+                        "out_key": [int(out_key[0]), int(out_key[1])],
+                        "cost": float(cost),
+                        "assign": _serialize_assign(assign),
+                    }
+                )
+        diagnostics.pop("assignments", None)
+        return {
+            "context": context,
+            "records": records,
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        return {
+            "context": context,
+            "records": [],
+            "diagnostics": diagnostics,
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
+
+def _openevolve_live_progress_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PARTITION_PROGRESS", "").strip().lower()
+    return raw not in {"", "0", "false", "no", "off"}
 
 
 def solve_budget_batch(

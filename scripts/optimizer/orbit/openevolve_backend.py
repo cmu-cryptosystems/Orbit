@@ -11791,15 +11791,16 @@ def _apply_dp_probe_seed_reference(
     params: Params,
     selected_probe_tasks: list[dict[str, Any]],
     fallback_reference_cost: float,
+    *,
+    timeout_sec: int = 0,
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any] | None]:
     if not initial_hints or not _use_qbp_dp_engine(params, initial_hints):
         return selected_probe_tasks, fallback_reference_cost, None
-    probe_context = deepcopy(context)
-    probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
-    result = _evaluate_sampled_budget_tasks_dp_probe(
-        probe_context,
+    result = _evaluate_dp_probe_for_promotion(
+        context,
         initial_hints,
-        selected_tasks=probe_context["sampled_budget_tasks"],
+        selected_probe_tasks,
+        timeout_sec=timeout_sec,
     )
     latency = _promotion_latency(result)
     if not (math.isfinite(latency) and latency > 0):
@@ -12313,6 +12314,7 @@ def _run_sampled_promotion_pass(
         params,
         selected_probe_tasks,
         probe_reference_cost,
+        timeout_sec=min(15, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
     )
 
     full_reference_cost = _promotion_reference_latency(context)

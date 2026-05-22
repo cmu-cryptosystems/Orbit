@@ -7085,7 +7085,7 @@ def test_dp_promotion_rejects_seed_equivalent_without_materialization(
             },
         }
 
-    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", fake_dp_probe)
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
 
     def fail_materialize(*_args, **_kwargs):
         raise AssertionError("seed-equivalent DP probe should not materialize")
@@ -7190,7 +7190,7 @@ def test_dp_promotion_selects_materialized_latency_improvement(
             },
         }
 
-    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", fake_dp_probe)
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
 
     def fake_materialize(*_args, **_kwargs):
         return {

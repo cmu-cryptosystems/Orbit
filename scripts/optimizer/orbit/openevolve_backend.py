@@ -5277,9 +5277,22 @@ def _promotion_probe_tasks_from_seed_metrics(
             )
         if position < 0 or position >= len(tasks) or position in seen_positions:
             continue
-        selected.append(tasks[position])
+        selected_task = deepcopy(tasks[position])
+        group_cost = _task_seed_metric_latency(metric)
+        metric_groups = [
+            item
+            for item in metric.get("top_costly_boundary_groups", []) or []
+            if isinstance(item, dict) and isinstance(item.get("group_key"), dict)
+        ]
+        if metric_groups:
+            group = metric_groups[0]
+            selected_task["group_keys"] = [deepcopy(group["group_key"])]
+            group_cost = _finite_float(group.get("min_cost_usec"), group_cost)
+        elif metric.get("group_keys"):
+            selected_task["group_keys"] = deepcopy(metric.get("group_keys", []))
+        selected.append(selected_task)
         seen_positions.add(position)
-        selected_cost += _task_seed_metric_latency(metric)
+        selected_cost += group_cost
         if len(selected) >= limit:
             break
     if not selected or selected_cost <= 0:
@@ -5317,9 +5330,17 @@ def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any
     selected_keys: set[str] = set()
     for task in tasks:
         keys = _sampled_task_group_keys(task)
-        if keys & wanted:
-            selected.append(task)
-            selected_keys |= keys & wanted
+        matched_keys = keys & wanted
+        if matched_keys:
+            selected_task = deepcopy(task)
+            selected_task["group_keys"] = [
+                item.get("group_key")
+                for item in top_groups
+                if isinstance(item.get("group_key"), dict)
+                and _boundary_group_key_from_dict(item["group_key"]) in matched_keys
+            ]
+            selected.append(selected_task)
+            selected_keys |= matched_keys
         if len(selected) >= _experience_probe_limit():
             break
     if not selected:

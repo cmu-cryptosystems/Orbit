@@ -6389,6 +6389,47 @@ def test_promotion_probe_reference_uses_same_seed_task_metrics(toy_cost_json: st
     assert selected[0]["index"] == 1
 
 
+def test_promotion_probe_uses_top_group_from_seed_metrics(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "context": {
+                "io_budgets": [
+                    {"in_lvl": -1, "in_scl": 40, "out_lvl": 16},
+                    {"in_lvl": 8, "in_scl": 120, "out_lvl": 16},
+                ]
+            },
+        }
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {
+            "task_position": 0,
+            "task_index": 0,
+            "sampled_dp_latency_usec": 500.0,
+            "top_costly_boundary_groups": [
+                {
+                    "group_key": {
+                        "in_lvl": 8,
+                        "in_scl": 120,
+                        "maino_v": "",
+                        "main_dag_size": 0,
+                    },
+                    "min_cost_usec": 125.0,
+                }
+            ],
+        }
+    ]
+
+    selected, reference = oe_backend._promotion_probe_tasks(context)
+
+    assert reference == 125.0
+    assert selected[0]["group_keys"] == [
+        {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0}
+    ]
+
+
 def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)

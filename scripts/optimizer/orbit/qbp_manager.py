@@ -24,6 +24,7 @@ class QBPManager:
             self.ilp_worker = ILP_Worker(params, le)
         self.openevolve_diagnostics = []
         self.openevolve_budget_tasks = []
+        self.openevolve_selected_path_records = []
     
     def save_qbps(self, dirpath: str):
         os.makedirs(dirpath, exist_ok=True)

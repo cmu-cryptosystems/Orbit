@@ -42,7 +42,7 @@ class PlacementError(Exception):
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 CONTEXT_SCHEMA_VERSION = "orbit-openevolve-placement-context-v4"
-COMPILE_CONTEXT_SCHEMA_VERSION = "orbit-openevolve-compile-harness-v5"
+COMPILE_CONTEXT_SCHEMA_VERSION = "orbit-openevolve-compile-harness-v6"
 SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION = "orbit-openevolve-sampled-qbp-task-v1"
 BANNED_CANDIDATE_TOKENS = (
     "gurobipy",
@@ -2568,7 +2568,12 @@ def _merge_cached_compile_context(
         context["placement_profile"] = cached["placement_profile"]
     if isinstance(cached.get("unit_hotspots"), list):
         context["unit_hotspots"] = cached["unit_hotspots"]
-    for key in ("top_costly_boundary_groups", "unsolved_boundary_groups"):
+    for key in (
+        "top_costly_boundary_groups",
+        "unsolved_boundary_groups",
+        "selected_path_records",
+        "final_selected_path_record",
+    ):
         if key in cached_harness:
             harness[key] = deepcopy(cached_harness[key])
         elif isinstance(sampled_seed, dict) and key in sampled_seed:
@@ -2621,6 +2626,13 @@ def _ensure_sampled_seed_metadata(
     harness["unsolved_boundary_groups"] = dict(
         sampled_baseline.get("unsolved_boundary_groups", {}) or {}
     )
+    harness["selected_path_records"] = list(
+        sampled_baseline.get("selected_path_records", []) or []
+    )[:64]
+    if isinstance(sampled_baseline.get("final_selected_path_record"), dict):
+        harness["final_selected_path_record"] = dict(
+            sampled_baseline["final_selected_path_record"]
+        )
     context["reference"] = dict(sampled_baseline)
     return True
 
@@ -2775,6 +2787,13 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 harness["top_costly_boundary_groups"] = list(
                     sampled_baseline.get("top_costly_boundary_groups", []) or []
                 )[:8]
+                harness["selected_path_records"] = list(
+                    sampled_baseline.get("selected_path_records", []) or []
+                )[:64]
+                if isinstance(sampled_baseline.get("final_selected_path_record"), dict):
+                    harness["final_selected_path_record"] = dict(
+                        sampled_baseline["final_selected_path_record"]
+                    )
                 harness["unsolved_boundary_groups"] = dict(
                     sampled_baseline.get("unsolved_boundary_groups", {}) or {}
                 )
@@ -5665,6 +5684,22 @@ def _promotion_probe_tasks_from_seed_metrics(
     seen_positions: set[int] = set()
     limit = _promotion_probe_limit()
 
+    selected_path_candidates = _selected_path_probe_task_candidates(
+        context,
+        tasks,
+        metrics,
+    )
+    for candidate_task, candidate_cost in selected_path_candidates:
+        if len(selected) >= limit:
+            break
+        position = _safe_int(candidate_task.get("_task_position"), -1)
+        if position < 0 or position in seen_positions:
+            continue
+        candidate_task.pop("_task_position", None)
+        selected.append(candidate_task)
+        seen_positions.add(position)
+        selected_cost += candidate_cost
+
     def add_metric(
         metric: dict[str, Any],
         position: int,
@@ -5702,6 +5737,102 @@ def _promotion_probe_tasks_from_seed_metrics(
     if not selected or selected_cost <= 0:
         return None
     return selected, float(selected_cost)
+
+
+def _task_context_pdag_name(task: dict[str, Any]) -> str:
+    task_context = task.get("context") if isinstance(task, dict) else None
+    if not isinstance(task_context, dict):
+        return ""
+    tdag = task_context.get("tdag")
+    if isinstance(tdag, dict):
+        return str(tdag.get("name", ""))
+    return ""
+
+
+def _metric_group_cost_for_key(metric: dict[str, Any], group_key: dict[str, Any]) -> float:
+    target = _boundary_group_key_from_dict(group_key)
+    for item in metric.get("top_costly_boundary_groups", []) or []:
+        if not isinstance(item, dict) or not isinstance(item.get("group_key"), dict):
+            continue
+        if _boundary_group_key_from_dict(item["group_key"]) != target:
+            continue
+        for key in ("min_cost_usec", "avg_cost_usec", "max_cost_usec"):
+            value = _finite_float(item.get(key), 0.0)
+            if value > 0:
+                return float(value)
+    return 0.0
+
+
+def _selected_path_probe_task_candidates(
+    context: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], float]]:
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    records: list[dict[str, Any]] = []
+    sources: list[Any] = [harness.get("final_selected_path_record")]
+    sources.extend(harness.get("selected_path_records", []) or [])
+    reference = context.get("reference", {})
+    if isinstance(reference, dict):
+        sources.append(reference.get("final_selected_path_record"))
+        sources.extend(reference.get("selected_path_records", []) or [])
+    for source in sources:
+        if isinstance(source, dict):
+            records.append(source)
+    if not records:
+        return []
+    metrics_by_position: dict[int, dict[str, Any]] = {}
+    metrics_by_index: dict[int, dict[str, Any]] = {}
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        position = _metric_task_position(metric, tasks)
+        if position >= 0:
+            metrics_by_position[position] = metric
+        metrics_by_index[_safe_int(metric.get("task_index"), -1)] = metric
+    candidates: list[tuple[float, int, dict[str, Any], float]] = []
+    seen: set[tuple[int, str]] = set()
+    for record in records:
+        for part in record.get("partitions", []) or []:
+            if not isinstance(part, dict) or not isinstance(part.get("group_key"), dict):
+                continue
+            pdag_name = str(part.get("pdag_name", ""))
+            group_key = dict(part["group_key"])
+            group_digest = _boundary_group_key_from_dict(group_key)
+            for position, task in enumerate(tasks):
+                if pdag_name and _task_context_pdag_name(task) != pdag_name:
+                    continue
+                task_group_keys = _sampled_task_group_keys(task)
+                if group_digest not in task_group_keys:
+                    continue
+                dedupe_key = (position, group_digest)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                metric = metrics_by_position.get(position) or metrics_by_index.get(
+                    _safe_int(task.get("index"), position),
+                    {},
+                )
+                cost = _finite_float(part.get("cost_usec"), 0.0)
+                if cost <= 0 and isinstance(metric, dict):
+                    cost = _metric_group_cost_for_key(metric, group_key)
+                if cost <= 0 and isinstance(metric, dict):
+                    cost = _task_seed_metric_latency(metric)
+                selected_task = deepcopy(task)
+                selected_task["group_keys"] = [group_key]
+                selected_task["selected_path_probe"] = True
+                selected_task["selected_path_part"] = {
+                    "pdag_name": pdag_name,
+                    "partition_index": part.get("partition_index"),
+                    "in_key": part.get("in_key"),
+                    "out_key": part.get("out_key"),
+                    "cost_usec": cost,
+                    "bootstrap_count": part.get("bootstrap_count"),
+                }
+                selected_task["_task_position"] = position
+                candidates.append((float(cost), position, selected_task, float(cost)))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [(task, cost) for _rank, _position, task, cost in candidates]
 
 
 def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
@@ -7194,10 +7325,33 @@ def _sampled_budget_tasks_from_qbp_manager(
         group_limit = max(1, remaining // remaining_records)
         if remaining % remaining_records:
             group_limit += 1
-        group_keys = _evenly_spaced_items(
-            _rank_sampled_boundary_group_keys(record["groups"], params),
-            min(len(record["groups"]), group_limit),
-        )
+        ranked_keys = _rank_sampled_boundary_group_keys(record["groups"], params)
+        selected_path_keys = [
+            key
+            for key in _selected_path_group_keys_for_pdag(
+                qbp_manager,
+                str(getattr(record["pdag"], "name", "")),
+            )
+            if key in record["groups"]
+        ]
+        group_keys = []
+        seen_group_keys = set()
+        for key in selected_path_keys:
+            if key in seen_group_keys:
+                continue
+            seen_group_keys.add(key)
+            group_keys.append(key)
+            if len(group_keys) >= group_limit:
+                break
+        if len(group_keys) < group_limit:
+            for key in _evenly_spaced_items(
+                [key for key in ranked_keys if key not in seen_group_keys],
+                min(len(record["groups"]), group_limit - len(group_keys)),
+            ):
+                if key in seen_group_keys:
+                    continue
+                seen_group_keys.add(key)
+                group_keys.append(key)
         sampled_budgets = [
             dict(budget)
             for key in group_keys
@@ -7229,6 +7383,35 @@ def _sampled_budget_tasks_from_qbp_manager(
         if remaining <= 0:
             break
     return tasks
+
+
+def _selected_path_group_keys_for_pdag(qbp_manager, pdag_name: str) -> list[tuple]:
+    keys: list[tuple[float, tuple]] = []
+    for record in getattr(qbp_manager, "openevolve_selected_path_records", []) or []:
+        if not isinstance(record, dict):
+            continue
+        for part in record.get("partitions", []) or []:
+            if not isinstance(part, dict) or str(part.get("pdag_name", "")) != str(pdag_name):
+                continue
+            group_key = part.get("group_key", {})
+            if not isinstance(group_key, dict):
+                continue
+            key = (
+                _safe_int(group_key.get("in_lvl"), -1),
+                _safe_int(group_key.get("in_scl"), -1),
+                str(group_key.get("maino_v", "")),
+                _safe_int(group_key.get("main_dag_size"), 0),
+            )
+            keys.append((_finite_float(part.get("cost_usec"), 0.0), key))
+    keys.sort(key=lambda item: item[0], reverse=True)
+    ordered: list[tuple] = []
+    seen: set[tuple] = set()
+    for _cost, key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
 
 
 def _sampled_compile_boundary_group_limit(params: Params) -> int:
@@ -7894,6 +8077,8 @@ def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
             boundary_group_summaries
         )
         or _top_costly_boundary_groups_from_task_metrics(sampled_task_metrics),
+        "selected_path_records": list(diagnostics.get("selected_path_records", []) or [])[:64],
+        "final_selected_path_record": diagnostics.get("final_selected_path_record", {}),
         "sampled_task_seed_metrics": sampled_task_metrics,
     }
 
@@ -15427,6 +15612,7 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
         "mcts_action_invalid_counts": {},
         "mcts_action_duplicate_skips": {},
         "boundary_group_summaries": [],
+        "selected_path_records": [],
     }
     for item in getattr(qbp_manager, "openevolve_diagnostics", []):
         for key in (
@@ -15467,6 +15653,20 @@ def _collect_qbp_diagnostics(qbp_manager) -> dict[str, Any]:
             totals["boundary_group_summaries"].extend(
                 list(item.get("boundary_group_summaries", []))[:remaining]
             )
+    selected_records = [
+        item
+        for item in getattr(qbp_manager, "openevolve_selected_path_records", [])
+        if isinstance(item, dict)
+    ]
+    if selected_records:
+        totals["selected_path_records"] = selected_records[:64]
+        whole = [item for item in selected_records if item.get("whole_circuit")]
+        best_candidates = whole or selected_records
+        best = min(
+            best_candidates,
+            key=lambda item: _finite_float(item.get("final_cost_usec"), float("inf")),
+        )
+        totals["final_selected_path_record"] = best
     return totals
 
 

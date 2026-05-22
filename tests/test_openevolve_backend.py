@@ -1826,6 +1826,61 @@ def test_compile_sampled_budget_cache_caps_groups_globally(toy_cost_json: str):
     assert all(levels == {1, 4, 8, 16} for levels in sampled_groups.values())
 
 
+def test_compile_sampled_budget_cache_prioritizes_selected_path_group(
+    toy_cost_json: str,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_harness="compile",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_max_unit_samples=4,
+    )
+    graph = _toy_pdag(params)
+    budgets = []
+    for group_idx in range(8):
+        for out_lvl in (1, 4, 8, 16):
+            budgets.append(
+                {
+                    "in_lvl": group_idx + 1,
+                    "in_scl": params.Sw + group_idx,
+                    "out_lvl": out_lvl,
+                }
+            )
+    selected_group = {
+        "in_lvl": 4,
+        "in_scl": params.Sw + 3,
+        "maino_v": "",
+        "main_dag_size": 0,
+    }
+    fake_manager = types.SimpleNamespace(
+        openevolve_budget_tasks=[
+            {"kind": "normal", "pdag": graph, "io_budgets": budgets}
+        ],
+        openevolve_selected_path_records=[
+            {
+                "final_cost_usec": 1000.0,
+                "partitions": [
+                    {
+                        "pdag_name": graph.name,
+                        "group_key": selected_group,
+                        "cost_usec": 1000.0,
+                    }
+                ],
+            }
+        ],
+    )
+
+    tasks = oe_backend._sampled_budget_tasks_from_qbp_manager(fake_manager, params)
+    sampled_groups = [
+        group
+        for task in tasks
+        for group in task.get("group_keys", [])
+    ]
+
+    assert selected_group in sampled_groups
+
+
 def test_sampled_boundary_group_ranking_prefers_reachable_inputs(toy_cost_json: str):
     params = _params(toy_cost_json)
     reachable = (-1, params.Sw, "", 0)
@@ -6703,6 +6758,80 @@ def test_promotion_probe_uses_top_group_from_seed_metrics(toy_cost_json: str):
     assert selected[0]["group_keys"] == [
         {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0}
     ]
+
+
+def test_promotion_probe_prefers_selected_final_path_group(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", "1")
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    plain = _toy_pdag(params)
+    plain.name = "plain_probe_graph"
+    selected_graph = _mul_chain_pdag(params, length=1)
+    selected_graph.name = "selected_probe_graph"
+    plain_group = {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+    selected_group = {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0}
+    context = build_compile_context(selected_graph, params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [plain_group],
+            "context": build_context(
+                plain,
+                [{"in_lvl": -1, "in_scl": 40, "out_lvl": params.lvl_ub}],
+                params,
+            ),
+        },
+        {
+            "index": 1,
+            "group_keys": [selected_group],
+            "context": build_context(
+                selected_graph,
+                [{"in_lvl": 8, "in_scl": 120, "out_lvl": params.lvl_ub}],
+                params,
+            ),
+        },
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {
+            "task_position": 0,
+            "task_index": 0,
+            "sampled_dp_latency_usec": 900.0,
+            "top_costly_boundary_groups": [
+                {"group_key": plain_group, "min_cost_usec": 900.0}
+            ],
+        },
+        {
+            "task_position": 1,
+            "task_index": 1,
+            "sampled_dp_latency_usec": 100.0,
+            "top_costly_boundary_groups": [
+                {"group_key": selected_group, "min_cost_usec": 100.0}
+            ],
+        },
+    ]
+    context["harness"]["final_selected_path_record"] = {
+        "final_cost_usec": 777.0,
+        "partitions": [
+            {
+                "pdag_name": selected_graph.name,
+                "partition_index": 3,
+                "group_key": selected_group,
+                "cost_usec": 77.0,
+                "bootstrap_count": 2.0,
+            }
+        ],
+    }
+
+    selected, reference_cost = oe_backend._promotion_probe_tasks(context)
+
+    assert reference_cost == 77.0
+    assert len(selected) == 1
+    assert selected[0]["index"] == 1
+    assert selected[0]["selected_path_probe"] is True
+    assert selected[0]["selected_path_part"]["partition_index"] == 3
+    assert selected[0]["group_keys"] == [selected_group]
 
 
 def test_promotion_probe_prefers_reference_anchor_task_over_plain_top_cost(

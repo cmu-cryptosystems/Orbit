@@ -114,19 +114,42 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
             prev_cost[l] = {params.Sw: 0}
     
     # merge results from all partitions
+    path_candidates = []
     for out_lvl, out_scl_to_cost in this_prev_cost.items():
         for out_scl, final_cost in out_scl_to_cost.items():
             this_choice_lvl = out_lvl
             this_choice_scl = out_scl
             final_assign = dict()
+            path_records_reversed = []
             
             for i in range(len(pdags)-1, -1, -1):
                 pdag = pdags[i]
                 assert (this_choice_lvl, this_choice_scl) in in_budget_choices[i], f"Error: No choice found for out-level {this_choice_lvl} and out-scale {this_choice_scl} at pdag #{pdag.name}"
+                out_choice_lvl = this_choice_lvl
+                out_choice_scl = this_choice_scl
                 in_choice_lvl = in_budget_choices[i][(this_choice_lvl, this_choice_scl)][0]
                 in_choice_scl = in_budget_choices[i][(this_choice_lvl, this_choice_scl)][1]
                 # get assignment
                 this_assign = qbp_manager.get_qbp_assign(pdag)[(in_choice_lvl, in_choice_scl)][(this_choice_lvl, this_choice_scl)]
+                part_cost = (
+                    qbp_manager.get_qbp_cost(pdag.name)
+                    .get((in_choice_lvl, in_choice_scl), {})
+                    .get((out_choice_lvl, out_choice_scl), None)
+                )
+                path_records_reversed.append({
+                    "pdag_name": pdag.name,
+                    "partition_index": i,
+                    "in_key": [int(in_choice_lvl), int(in_choice_scl)],
+                    "out_key": [int(out_choice_lvl), int(out_choice_scl)],
+                    "group_key": {
+                        "in_lvl": int(in_choice_lvl),
+                        "in_scl": int(in_choice_scl),
+                        "maino_v": "",
+                        "main_dag_size": 0,
+                    },
+                    "cost_usec": float(part_cost) if part_cost is not None else None,
+                    "bootstrap_count": float(_count_assign_bootstraps(this_assign, params)),
+                })
                 this_choice_lvl = in_choice_lvl
                 this_choice_scl = in_choice_scl
                 
@@ -162,6 +185,24 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
             else:
                 dag_io_to_cost[(this_choice_lvl, this_choice_scl)][(out_lvl, out_scl)] = real_final_cost
                 dag_io_to_assign[(this_choice_lvl, this_choice_scl)][(out_lvl, out_scl)] = final_assign_update
+            path_candidates.append({
+                "dag_name": dag.name,
+                "whole_circuit": bool(is_whole_circ),
+                "input_key": [int(this_choice_lvl), int(this_choice_scl)],
+                "output_key": [int(out_lvl), int(out_scl)],
+                "final_cost_usec": float(real_final_cost),
+                "partition_count": len(pdags),
+                "partitions": list(reversed(path_records_reversed)),
+            })
+    if (
+        path_candidates
+        and (
+            getattr(params, "openevolve_evaluating_candidate", False)
+            or getattr(params, "openevolve_collect_diagnostics", False)
+        )
+    ):
+        path_candidates.sort(key=lambda item: float(item.get("final_cost_usec", float("inf"))))
+        qbp_manager.openevolve_selected_path_records.extend(path_candidates[:8])
     if not is_whole_circ:
         qbp_manager.add_qbp_existing(dag, dag_io_to_cost, dag_io_to_assign)
     else:
@@ -179,3 +220,40 @@ def _register_partition_result(qbp_manager: QBPManager, pdag: Tdag, partition_re
     if io_to_assign is None or io_to_cost is None:
         return
     qbp_manager.add_qbp_existing(pdag, io_to_cost, io_to_assign)
+
+
+def _count_assign_bootstraps(assign: Assign, params: Params) -> int:
+    total = 0
+    for node in assign.tdag.nodes:
+        if assign.tdag.nodes[node].get("op") == "constant":
+            continue
+        if (
+            node in assign.v_lvl_in
+            and node in assign.v_scl_in
+            and node in assign.v_lvl_out
+            and node in assign.v_scl_out
+            and not params.check_res(
+                assign.v_lvl_in[node],
+                assign.v_scl_in[node],
+                assign.v_lvl_out[node],
+                assign.v_scl_out[node],
+            )
+        ):
+            total += 1
+    for pred, dst in assign.tdag.edges:
+        if assign.tdag.nodes[pred].get("op") == "constant":
+            continue
+        if (
+            (pred, dst) in assign.e_lvl_out
+            and (pred, dst) in assign.e_scl_out
+            and pred in assign.v_lvl_out
+            and pred in assign.v_scl_out
+            and not params.check_res(
+                assign.v_lvl_out[pred],
+                assign.v_scl_out[pred],
+                assign.e_lvl_out[(pred, dst)],
+                assign.e_scl_out[(pred, dst)],
+            )
+        ):
+            total += 1
+    return total

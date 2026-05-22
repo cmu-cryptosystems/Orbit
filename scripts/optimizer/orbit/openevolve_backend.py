@@ -11902,9 +11902,16 @@ def _apply_dp_probe_seed_reference(
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any] | None]:
     if not initial_hints or not _use_qbp_dp_engine(params, initial_hints):
         return selected_probe_tasks, fallback_reference_cost, None
+    seed_eval_hints = _compile_hints_for_eval_suite(
+        initial_hints,
+        getattr(params, "openevolve_eval_suite", "polybert-sampled"),
+    )
+    seed_probe_hints = _dp_probe_lightweight_hints(
+        _promotion_probe_hints(seed_eval_hints, selected_probe_tasks)
+    )
     result = _evaluate_dp_probe_for_promotion(
         context,
-        initial_hints,
+        seed_probe_hints,
         selected_probe_tasks,
         timeout_sec=timeout_sec,
     )

@@ -7021,6 +7021,32 @@ def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
     assert result["timeout_phase"] == "dp_table_probe"
 
 
+def test_qbp_dp_promotion_probe_uses_lightweight_frontier():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "qbp_engine": "dp",
+        "max_scale_candidates": 64,
+        "state_cap_per_node": 64,
+        "beam_width": 16,
+        "boundary_state_cap": 16,
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": 16, "in_scl": 40},
+                "policy": {"max_scale_candidates": 64, "state_cap_per_node": 64},
+            }
+        ],
+    }
+
+    clamped = oe_backend._dp_probe_lightweight_hints(hints)
+
+    assert clamped["max_scale_candidates"] == 8
+    assert clamped["state_cap_per_node"] == 8
+    assert clamped["beam_width"] == 4
+    assert clamped["boundary_state_cap"] == 4
+    assert clamped["boundary_group_policies"][0]["policy"]["max_scale_candidates"] == 8
+    assert clamped["boundary_group_policies"][0]["policy"]["state_cap_per_node"] == 8
+
+
 def test_qbp_manager_dp_sampling_keeps_all_outputs_in_selected_group(
     toy_cost_json: str,
 ):

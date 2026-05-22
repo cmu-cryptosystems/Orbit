@@ -11484,6 +11484,35 @@ def _bounded_retry_probe_hints(hints: dict[str, Any]) -> dict[str, Any]:
     return retry
 
 
+def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    """Clamp DP table probes to a cheap frontier before promotion materialization."""
+
+    limits = {
+        "max_scale_candidates": 8,
+        "state_cap_per_node": 8,
+        "beam_width": 4,
+        "boundary_state_cap": 4,
+        "frontier_cap": 8,
+    }
+
+    def clamp_policy(policy: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(policy)
+        for key, limit in limits.items():
+            if key in updated:
+                updated[key] = min(limit, _int_hint(updated.get(key), limit))
+        return updated
+
+    def recursive_clamp(value: Any) -> Any:
+        if isinstance(value, dict):
+            updated = clamp_policy(value)
+            return {key: recursive_clamp(child) for key, child in updated.items()}
+        if isinstance(value, list):
+            return [recursive_clamp(item) for item in value]
+        return value
+
+    return recursive_clamp(deepcopy(hints))
+
+
 def _candidate_intent_survived_retry(original: dict[str, Any], retry: dict[str, Any]) -> bool:
     original_actions = set(_promotion_probe_action_names(original, limit=8))
     retry_actions = set(_promotion_probe_action_names(retry, limit=8))
@@ -11793,6 +11822,7 @@ def _evaluate_promotion_probe(
     timeout_sec: int,
 ) -> dict[str, Any]:
     if _use_qbp_dp_engine(params, hints):
+        hints = _dp_probe_lightweight_hints(hints)
         return _evaluate_dp_probe_for_promotion(
             context,
             hints,

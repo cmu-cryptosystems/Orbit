@@ -7488,6 +7488,30 @@ def test_qbp_dp_promotion_probe_uses_lightweight_frontier():
     assert clamped["boundary_group_policies"][0]["policy"]["state_cap_per_node"] == 4
 
 
+def test_qbp_dp_promotion_probe_preserves_requested_seed_neighborhood():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "qbp_engine": "dp",
+        "dp_probe_mode": "seed_neighborhood",
+        "dp_seed_exact_only": False,
+        "dp_disable_seed_exact_candidate": True,
+        "dp_max_combos_per_node": 2,
+        "dp_max_incoming_options_per_combo": 3,
+        "dp_max_level_candidates": 2,
+        "dp_max_output_states_per_input": 4,
+    }
+
+    clamped = oe_backend._dp_probe_lightweight_hints(hints)
+
+    assert clamped["dp_seed_exact_only"] is False
+    assert clamped["dp_disable_seed_exact_candidate"] is True
+    assert clamped["enable_seed_frontier_anchor"] is True
+    assert clamped["dp_max_combos_per_node"] == 2
+    assert clamped["dp_max_incoming_options_per_combo"] == 3
+    assert clamped["dp_max_level_candidates"] == 2
+    assert clamped["dp_max_output_states_per_input"] == 4
+
+
 def test_qbp_manager_dp_sampling_keeps_all_outputs_in_selected_group(
     toy_cost_json: str,
 ):
@@ -7669,8 +7693,8 @@ def test_dp_promotion_selects_materialized_latency_improvement(
 
     def fake_dp_probe(*_args, **_kwargs):
         dp_calls.append("dp")
-        latency = 100.0 if len(dp_calls) == 1 else 90.0
-        digest = "seed" if len(dp_calls) == 1 else "better"
+        latency = {1: 100.0, 2: 90.0}.get(len(dp_calls), 80.0)
+        digest = {1: "seed", 2: "better"}.get(len(dp_calls), "better-full")
         return {
             "valid": True,
             "boundary_group_validity": 1.0,
@@ -7738,6 +7762,125 @@ def test_dp_promotion_selects_materialized_latency_improvement(
     assert selected["openevolve_promotion_stage"] == "sampled_qbp"
     assert selected["openevolve_promotion_latency_usec"] == 80.0
     summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
+    assert summary["selected"] is True
+
+
+def test_dp_promotion_reuses_latency_improved_discovery_probe(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    task_context = build_context(
+        _toy_pdag(params),
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    task_context["harness"] = {"eval_suite": "polybert-sampled"}
+    task = {
+        "index": 0,
+        "group_keys": [
+            {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+        ],
+        "context": task_context,
+        "seed_metrics": {
+            "selected_path_digest": "seed",
+            "sampled_dp_latency_usec": 100.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+        },
+    }
+    context["sampled_budget_tasks"] = [task]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'strategy': 'bootstrap_mcts', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda context, initial_hints, params, selected, reference, timeout_sec=0: (
+            selected,
+            reference,
+            {"valid": True, "sampled_dp_latency_usec": reference},
+        ),
+    )
+    monkeypatch.setattr(oe_backend, "_run_single_boundary_dp_debug", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [code],
+            "latency_improved_codes": [
+                {
+                    "code": code,
+                    "record": {
+                        "direct_valid": True,
+                        "latency_usec": 90.0,
+                        "selected_path_digest": "better-probe",
+                        "selected_source_counts": {"candidate:qbp_dp": 1},
+                        "bootstrap_count": 0.0,
+                        "rescale_count": 0.0,
+                    },
+                }
+            ],
+            "skip_policy_digests": set(),
+            "examples": [],
+            "summary": {"latency_improved_count": 1, "path_moving_count": 1},
+        },
+    )
+    dp_calls = []
+
+    def fake_dp_probe(*_args, **_kwargs):
+        dp_calls.append("sampled")
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 80.0,
+            "objective_cost_usec": 80.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": "better-full",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+
+    assert selected is not None
+    assert dp_calls == ["sampled"]
+    summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
+    assert summary["records"][0]["stage"] == "dp_table_probe"
+    assert summary["records"][0]["reason"] == "dp_changed_faster"
+    assert summary["records"][0]["latency_usec"] == 90.0
+    assert summary["records"][1]["stage"] == "sampled_qbp"
     assert summary["selected"] is True
 
 

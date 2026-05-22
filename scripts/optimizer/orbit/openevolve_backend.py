@@ -10576,9 +10576,9 @@ def _strategy_discovery_enabled() -> bool:
 def _strategy_discovery_limit() -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "").strip()
     try:
-        value = int(raw) if raw else 8
+        value = int(raw) if raw else 12
     except ValueError:
-        value = 8
+        value = 12
     return max(0, min(64, value))
 
 
@@ -10600,6 +10600,15 @@ def _strategy_discovery_eval_timeout_sec(promotion_eval_timeout_sec: int) -> int
     return max(0, min(max(0, promotion_eval_timeout_sec), value))
 
 
+def _strategy_discovery_stop_after_improved() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_STOP_AFTER_IMPROVED", "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 3
+    return max(0, min(64, value))
+
+
 def _promotion_bounded_retry_enabled() -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_BOUNDED_RETRY", "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -10612,6 +10621,11 @@ def _promotion_probe_limit() -> int:
     except ValueError:
         value = 1
     return max(1, min(16, value))
+
+
+def _promotion_stop_after_selected() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_STOP_AFTER_SELECTED", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
@@ -10770,6 +10784,159 @@ def _promotion_record_summary(
         "dp_progress_trace": result.get("dp_progress_trace") if result else None,
         "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
         "policy_summary": _compact_policy_summary(hints or {}),
+    }
+
+
+def _promotion_probe_result_from_discovery_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct a compact probe result from strategy discovery artifacts.
+
+    Discovery already ran the same top-boundary probe. Reusing its compact
+    result prevents promotion from spending the long DP timeout redoing a probe
+    that is only meant to gate the full sampled replay.
+    """
+
+    diagnostics = {
+        "fallback_selected_boundary_groups": 0,
+        "invalid_boundary_groups": 0,
+        "candidate_solved_boundary_groups": 1,
+        "selected_source_counts": dict(record.get("selected_source_counts", {}) or {}),
+        "sampled_task_metrics": [
+            {
+                "selected_path_digest": str(record.get("selected_path_digest", "")),
+                "sampled_dp_latency_usec": _finite_float(
+                    record.get("latency_usec"),
+                    float("inf"),
+                ),
+                "bootstrap_count": _finite_float(record.get("bootstrap_count"), 0.0),
+                "rescale_count": _finite_float(record.get("rescale_count"), 0.0),
+                "boundary_group_count": 1,
+            }
+        ],
+    }
+    return {
+        "valid": bool(record.get("direct_valid", False)),
+        "boundary_group_validity": 1.0 if record.get("direct_valid", False) else 0.0,
+        "candidate_qbp_coverage": 1.0 if record.get("direct_valid", False) else 0.0,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "sampled_dp_latency_usec": _finite_float(record.get("latency_usec"), float("inf")),
+        "objective_cost_usec": _finite_float(record.get("latency_usec"), float("inf")),
+        "bootstrap_count": _finite_float(record.get("bootstrap_count"), 0.0),
+        "rescale_count": _finite_float(record.get("rescale_count"), 0.0),
+        "sampled_selected_path_digest": str(record.get("selected_path_digest", "")),
+        "diagnostics": diagnostics,
+        "strategy_discovery_reused_probe": True,
+    }
+
+
+def _scoped_boundary_policy_selectors(hints: dict[str, Any]) -> list[dict[str, Any]]:
+    selectors: list[dict[str, Any]] = []
+    for item in hints.get("boundary_group_policies", []) or []:
+        if not isinstance(item, dict):
+            continue
+        selector = item.get("selector", {})
+        if isinstance(selector, dict) and selector.get("task_index") is not None:
+            selectors.append(dict(selector))
+    return selectors
+
+
+def _sampled_seed_metric_sum(context: dict[str, Any], key: str) -> float:
+    total = 0.0
+    for task in context.get("sampled_budget_tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        metrics = task.get("seed_metrics", {})
+        if not isinstance(metrics, dict):
+            continue
+        value = _finite_float(metrics.get(key), 0.0)
+        if math.isfinite(value):
+            total += value
+    return total
+
+
+def _sampled_delta_replay_result(
+    context: dict[str, Any],
+    hints: dict[str, Any],
+    probe_result: dict[str, Any],
+    *,
+    probe_reference_cost: float,
+    full_reference_cost: float,
+) -> dict[str, Any] | None:
+    """Compose a scoped DP probe improvement with cached sampled seed metrics.
+
+    A boundary-group overlay with a task index changes exactly one sampled
+    boundary. Replaying all other sampled boundaries through DP is both slower
+    and stricter than the cached seed replay. This helper keeps the validation
+    strict for the changed boundary while carrying forward unchanged seed
+    metrics as candidate-owned baseline paths.
+    """
+
+    selectors = _scoped_boundary_policy_selectors(hints)
+    if len(selectors) != 1:
+        return None
+    if not _promotion_result_direct_valid(probe_result):
+        return None
+    probe_latency = _promotion_latency(probe_result)
+    if not (
+        math.isfinite(probe_latency)
+        and math.isfinite(probe_reference_cost)
+        and math.isfinite(full_reference_cost)
+    ):
+        return None
+    latency = max(0.0, float(full_reference_cost) - float(probe_reference_cost) + probe_latency)
+    path_diff = probe_result.get("path_differential", {})
+    if not isinstance(path_diff, dict):
+        path_diff = {}
+    seed_bootstrap = _finite_float(path_diff.get("seed_bootstrap_count"), float("nan"))
+    seed_rescale = _finite_float(path_diff.get("seed_rescale_count"), float("nan"))
+    candidate_bootstrap = _finite_float(path_diff.get("candidate_bootstrap_count"), float("nan"))
+    candidate_rescale = _finite_float(path_diff.get("candidate_rescale_count"), float("nan"))
+    total_bootstrap = _sampled_seed_metric_sum(context, "bootstrap_count")
+    total_rescale = _sampled_seed_metric_sum(context, "rescale_count")
+    if math.isfinite(seed_bootstrap) and math.isfinite(candidate_bootstrap):
+        total_bootstrap = max(0.0, total_bootstrap - seed_bootstrap + candidate_bootstrap)
+    if math.isfinite(seed_rescale) and math.isfinite(candidate_rescale):
+        total_rescale = max(0.0, total_rescale - seed_rescale + candidate_rescale)
+    selected_digest = _hint_digest(
+        {
+            "seed_sampled_path": context.get("reference", {}).get("sampled_selected_path_digest")
+            if isinstance(context.get("reference"), dict)
+            else "",
+            "selector": selectors[0],
+            "probe_path": probe_result.get("sampled_selected_path_digest", ""),
+            "latency": latency,
+        }
+    )
+    task_count = sum(1 for task in context.get("sampled_budget_tasks", []) if isinstance(task, dict))
+    source_counts = {"candidate:seed_carry_forward": max(0, task_count - 1)}
+    source_counts.update(_selected_source_counts_from_result(probe_result))
+    return {
+        "valid": True,
+        "sampled_delta_replay": True,
+        "boundary_group_validity": 1.0,
+        "candidate_qbp_coverage": 1.0,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "sampled_dp_latency_usec": latency,
+        "objective_cost_usec": latency,
+        "bootstrap_count": total_bootstrap,
+        "rescale_count": total_rescale,
+        "sampled_selected_path_digest": selected_digest,
+        "diagnostics": {
+            "fallback_selected_boundary_groups": 0,
+            "invalid_boundary_groups": 0,
+            "candidate_solved_boundary_groups": task_count,
+            "selected_source_counts": source_counts,
+            "sampled_delta": {
+                "selector": selectors[0],
+                "full_reference_cost_usec": full_reference_cost,
+                "probe_reference_cost_usec": probe_reference_cost,
+                "probe_candidate_cost_usec": probe_latency,
+                "latency_delta_usec": probe_latency - probe_reference_cost,
+            },
+        },
     }
 
 
@@ -11238,6 +11405,8 @@ def _boundary_group_selector_matches_sampled_tasks(
     for task in tasks:
         if not isinstance(task, dict):
             continue
+        if not _boundary_group_selector_matches_task(selector, task):
+            continue
         for group_key in task.get("group_keys", []) or []:
             if isinstance(group_key, dict):
                 key_tuple = (
@@ -11257,6 +11426,21 @@ def _boundary_group_selector_matches_sampled_tasks(
             if any(_boundary_group_selector_matches_key(selector, key) for key in groups):
                 return True
     return False
+
+
+def _boundary_group_selector_matches_task(selector: Any, task: dict[str, Any] | None) -> bool:
+    if not isinstance(selector, dict):
+        return False
+    task_key = None
+    for key in ("task_index", "sampled_task_index", "sample_index"):
+        if key in selector and selector.get(key) is not None:
+            task_key = selector.get(key)
+            break
+    if task_key is None:
+        return True
+    if not isinstance(task, dict):
+        return False
+    return str(task.get("index")) == str(task_key)
 
 
 def _promotion_probe_hints(
@@ -11363,6 +11547,74 @@ def _strategy_discovery_variants(
 
     # Ensure the default bounded discovery limit still covers every strategy
     # dimension once before exploring additional values.
+    output_splice_selectors = []
+    for task in selected_probe_tasks or []:
+        if not isinstance(task, dict):
+            continue
+        task_index = task.get("index")
+        for group_key in task.get("group_keys", []) or []:
+            if not isinstance(group_key, dict):
+                continue
+            selector = dict(group_key)
+            if task_index is not None:
+                selector["task_index"] = task_index
+            output_splice_selectors.append(selector)
+            break
+        if output_splice_selectors:
+            break
+    for item in [group for group in top_groups or [] if isinstance(group, dict)][:1]:
+        if output_splice_selectors:
+            break
+        selector = item.get("group_key", item)
+        if isinstance(selector, dict):
+            output_splice_selectors.append(selector)
+    if not output_splice_selectors:
+        output_splice_selectors.append({})
+    for label, boundary_policy, scale_lattice in (
+        ("dp_output_splice_frontier", "frontier", "waterline_sf"),
+        ("dp_output_splice_waterline", "waterline", "waterline_sf"),
+        ("dp_output_splice_low", "low", "dense"),
+    ):
+        patch = {
+            "dp_probe_mode": "output_splice",
+            "dp_seed_exact_only": False,
+            "dp_disable_seed_exact_candidate": True,
+            "dp_seed_splice_output_only": True,
+            "dp_seed_neighborhood_radius": 1,
+            "dp_max_combos_per_node": 1,
+            "dp_max_incoming_options_per_combo": 4,
+            "dp_max_level_candidates": 2,
+            "dp_max_output_states_per_input": 6,
+            "boundary_scale_policy": boundary_policy,
+            "scale_lattice": scale_lattice,
+            "frontier_cap": 6,
+            "state_cap_per_node": 6,
+            "boundary_state_cap": 4,
+            "max_scale_candidates": 16,
+        }
+        add(
+            label,
+            "dp_probe_mode",
+            {
+                "boundary_group_policies": [
+                    {
+                        "selector": output_splice_selectors[0],
+                        "policy": patch,
+                    }
+                ]
+            }
+            if output_splice_selectors[0]
+            else patch,
+            changed_keys=[
+                "boundary_group_policies",
+                "dp_probe_mode",
+                "dp_seed_exact_only",
+                "dp_disable_seed_exact_candidate",
+                "dp_seed_splice_output_only",
+                "boundary_scale_policy",
+                "scale_lattice",
+            ],
+        )
     add(
         "boundary_scale_policy_waterline",
         "boundary_scale_policy",
@@ -11573,7 +11825,38 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
         return value
 
     result = recursive_clamp(deepcopy(hints))
-    if not _bool_hint(os.environ.get("ORBIT_OPENEVOLVE_DP_PROBE_BROAD"), False):
+    mode = str(result.get("dp_probe_mode", "seed_exact")).strip().lower()
+    explicit_broad = mode in {
+        "seed_neighborhood",
+        "seed-neighborhood",
+        "bounded_neighborhood",
+        "bounded-neighborhood",
+        "neighborhood",
+        "output_splice",
+        "output-splice",
+        "terminal_splice",
+        "terminal-splice",
+        "broad",
+    } or (
+        "dp_seed_exact_only" in result
+        and not _bool_hint(result.get("dp_seed_exact_only"), True)
+    )
+    if explicit_broad or _bool_hint(os.environ.get("ORBIT_OPENEVOLVE_DP_PROBE_BROAD"), False):
+        result["dp_seed_exact_only"] = False
+        result.setdefault("enable_seed_frontier_anchor", True)
+        result.setdefault("dp_seed_neighborhood_radius", 1)
+        if mode in {"output_splice", "output-splice", "terminal_splice", "terminal-splice"}:
+            result["dp_seed_splice_output_only"] = True
+            result.setdefault("dp_disable_seed_exact_candidate", True)
+            result.setdefault("dp_max_combos_per_node", 1)
+            result.setdefault("dp_max_incoming_options_per_combo", 4)
+            result.setdefault("dp_max_output_states_per_input", 6)
+        else:
+            result.setdefault("dp_max_combos_per_node", 2)
+            result.setdefault("dp_max_incoming_options_per_combo", 3)
+            result.setdefault("dp_max_output_states_per_input", 4)
+        result.setdefault("dp_max_level_candidates", 2)
+    else:
         result["dp_seed_exact_only"] = True
         result["enable_seed_frontier_anchor"] = True
         result["dp_max_combos_per_node"] = 1
@@ -11670,8 +11953,11 @@ def _run_strategy_discovery_prepass(
     records: list[dict[str, Any]] = []
     path_rows: list[dict[str, Any]] = []
     path_moving_codes: list[str] = []
+    latency_improved_codes: list[dict[str, Any]] = []
     skip_policy_digests: set[str] = set()
     timed_out = False
+    stop_after_improved = _strategy_discovery_stop_after_improved()
+    stopped_after_improved = False
     if not _strategy_discovery_enabled() or not variants:
         summary = {
             "enabled": bool(_strategy_discovery_enabled()),
@@ -11686,6 +11972,7 @@ def _run_strategy_discovery_prepass(
         return {
             "records": records,
             "path_moving_codes": path_moving_codes,
+            "latency_improved_codes": latency_improved_codes,
             "skip_policy_digests": skip_policy_digests,
             "examples": [],
             "summary": summary,
@@ -11833,9 +12120,18 @@ def _run_strategy_discovery_prepass(
         if diff["collapse_reason"] in {"same_action_order", "same_boundary_states", "probe_tied_seed"}:
             skip_policy_digests.add(policy_digest)
         if bool(diff.get("selected_path_changed")):
-            path_moving_codes.append(
-                _strategy_discovery_program_source(str(variant.get("label", "strategy")), active_hints)
+            discovery_code = _strategy_discovery_program_source(
+                str(variant.get("label", "strategy")),
+                active_hints,
             )
+            path_moving_codes.append(discovery_code)
+            if improved:
+                latency_improved_codes.append(
+                    {
+                        "code": discovery_code,
+                        "record": deepcopy(record),
+                    }
+                )
         partial_summary = {
             "enabled": True,
             "variant_count": len(variants),
@@ -11847,6 +12143,10 @@ def _run_strategy_discovery_prepass(
             "skip_policy_digest_count": len(skip_policy_digests),
             "path_moving_code_count": len(path_moving_codes),
             "timed_out": False,
+            "stopped_after_improved": (
+                stop_after_improved > 0 and len(latency_improved_codes) >= stop_after_improved
+            ),
+            "stop_after_improved": stop_after_improved,
             "timeout_sec": discovery_timeout_sec,
             "eval_timeout_sec": discovery_eval_timeout_sec,
             "records": records,
@@ -11857,6 +12157,9 @@ def _run_strategy_discovery_prepass(
             path_rows,
             _strategy_discovery_examples(records),
         )
+        if stop_after_improved > 0 and len(latency_improved_codes) >= stop_after_improved:
+            stopped_after_improved = True
+            break
     summary = {
         "enabled": True,
         "variant_count": len(variants),
@@ -11868,6 +12171,8 @@ def _run_strategy_discovery_prepass(
         "skip_policy_digest_count": len(skip_policy_digests),
         "path_moving_code_count": len(path_moving_codes),
         "timed_out": timed_out,
+        "stopped_after_improved": stopped_after_improved,
+        "stop_after_improved": stop_after_improved,
         "timeout_sec": discovery_timeout_sec,
         "eval_timeout_sec": discovery_eval_timeout_sec,
         "elapsed_sec": round(time.monotonic() - discovery_started_at, 6),
@@ -11878,6 +12183,7 @@ def _run_strategy_discovery_prepass(
     return {
         "records": records,
         "path_moving_codes": path_moving_codes[:16],
+        "latency_improved_codes": latency_improved_codes[:16],
         "skip_policy_digests": skip_policy_digests,
         "examples": examples,
         "summary": summary,
@@ -12273,6 +12579,11 @@ def _evaluate_sampled_budget_tasks_dp_probe(
         for group_key, group_budgets in _budget_boundary_groups(budgets).items():
             if selected_group_keys and _boundary_group_key_string(group_key) not in selected_group_keys:
                 continue
+            group_eval_hints = _apply_boundary_group_policy_overlays(
+                eval_hints,
+                group_key,
+                task,
+            )
             selected_results: list[_QBPDPBudgetResult] = []
             group_failure_traces: list[dict[str, Any]] = []
             reachable = 0
@@ -12284,7 +12595,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                     task_params,
                     budget,
                     task_le,
-                    eval_hints,
+                    group_eval_hints,
                     materialize=False,
                 )
                 if result.valid and result.out_key is not None:
@@ -12347,7 +12658,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                     task_params,
                     group_budgets[0],
                     task_le,
-                    eval_hints,
+                    group_eval_hints,
                 )
                 group_failure_traces[0]["reference_seed_bridge"] = seed_bridge
             summary = {
@@ -12803,9 +13114,31 @@ def _run_sampled_promotion_pass(
             discovery.get("examples", []),
         )
     discovery_limit = min(128, max(limit, limit * 4))
-    codes = list(discovery.get("path_moving_codes", []) or []) + _discover_finalist_codes(
-        output_dir, best_code, discovery_limit
-    )
+    prevalidated_probe_records: dict[str, dict[str, Any]] = {}
+    priority_codes: list[str] = []
+    for item in discovery.get("latency_improved_codes", []) or []:
+        if not isinstance(item, dict) or not isinstance(item.get("code"), str):
+            continue
+        code = str(item["code"])
+        priority_codes.append(code)
+        if isinstance(item.get("record"), dict):
+            prevalidated_probe_records[hashlib.sha256(code.encode("utf-8")).hexdigest()] = deepcopy(
+                item["record"]
+            )
+    codes: list[str] = []
+    code_digests: set[str] = set()
+    for code in (
+        priority_codes
+        + list(discovery.get("path_moving_codes", []) or [])
+        + _discover_finalist_codes(output_dir, best_code, discovery_limit)
+    ):
+        if not isinstance(code, str) or not code.strip():
+            continue
+        digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        if digest in code_digests:
+            continue
+        code_digests.add(digest)
+        codes.append(code)
     records: list[dict[str, Any]] = []
     best: tuple[float, float, float, int, dict[str, Any], dict[str, Any], str] | None = None
     seen: set[str] = set()
@@ -13003,30 +13336,49 @@ def _run_sampled_promotion_pass(
         probe_stage_name = (
             "dp_table_probe" if _use_qbp_dp_engine(params, probe_hints) else "probe_qbp"
         )
-        print(
-            "OpenEvolve compile harness: sampled promotion "
-            f"candidate {len(seen)}/{len(codes)} {probe_stage_name} timeout={eval_timeout_sec}s.",
-            flush=True,
-        )
-        _write_promotion_progress(
-            promotion_dir,
-            started_at=started_at,
-            timeout_sec=timeout_sec,
-            current_stage=probe_stage_name,
-            current_index=index,
-            total_candidates=min(limit, len(codes)),
-            records=records,
-            selected=best is not None,
-        )
-        probe_result = _evaluate_promotion_probe(
-            probe_context,
-            probe_hints,
-            params,
-            selected_probe_tasks,
-            timeout_sec=eval_timeout_sec,
-        )
         active_probe_hints = probe_hints
         bounded_retry_summary: dict[str, Any] | None = None
+        prevalidated_probe = prevalidated_probe_records.get(code_digest)
+        if prevalidated_probe is not None and _use_qbp_dp_engine(params, probe_hints):
+            print(
+                "OpenEvolve compile harness: sampled promotion "
+                f"candidate {len(seen)}/{len(codes)} reusing strategy discovery probe.",
+                flush=True,
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage=f"{probe_stage_name}_reused",
+                current_index=index,
+                total_candidates=min(limit, len(codes)),
+                records=records,
+                selected=best is not None,
+            )
+            probe_result = _promotion_probe_result_from_discovery_record(prevalidated_probe)
+        else:
+            print(
+                "OpenEvolve compile harness: sampled promotion "
+                f"candidate {len(seen)}/{len(codes)} {probe_stage_name} timeout={eval_timeout_sec}s.",
+                flush=True,
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage=probe_stage_name,
+                current_index=index,
+                total_candidates=min(limit, len(codes)),
+                records=records,
+                selected=best is not None,
+            )
+            probe_result = _evaluate_promotion_probe(
+                probe_context,
+                probe_hints,
+                params,
+                selected_probe_tasks,
+                timeout_sec=eval_timeout_sec,
+            )
         if (
             bool(probe_result.get("timed_out", False))
             and _promotion_bounded_retry_enabled()
@@ -13155,6 +13507,11 @@ def _run_sampled_promotion_pass(
                 else "probe_not_latency_improved"
             )
             continue
+        probe_record["reason"] = (
+            _dp_probe_reason(path_diff, True, True)
+            if _use_qbp_dp_engine(params, active_probe_hints)
+            else "probe_latency_improved"
+        )
 
         if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
             timed_out = True
@@ -13181,11 +13538,33 @@ def _run_sampled_promotion_pass(
             records=records,
             selected=best is not None,
         )
-        full_result = _evaluate_sampled_budget_tasks_for_promotion(
-            context,
-            active_probe_hints,
-            timeout_sec=eval_timeout_sec,
-        )
+        if _use_qbp_dp_engine(params, active_probe_hints):
+            full_result = _sampled_delta_replay_result(
+                context,
+                active_probe_hints,
+                probe_result,
+                probe_reference_cost=probe_reference_cost,
+                full_reference_cost=full_reference_cost,
+            )
+            if full_result is None:
+                sampled_tasks = [
+                    task
+                    for task in context.get("sampled_budget_tasks", [])
+                    if isinstance(task, dict)
+                ]
+                full_result = _evaluate_dp_probe_for_promotion(
+                    context,
+                    _dp_probe_lightweight_hints(active_probe_hints),
+                    sampled_tasks,
+                    timeout_sec=eval_timeout_sec,
+                )
+                full_result["sampled_dp_replay"] = True
+        else:
+            full_result = _evaluate_sampled_budget_tasks_for_promotion(
+                context,
+                active_probe_hints,
+                timeout_sec=eval_timeout_sec,
+            )
         full_latency = _promotion_latency(full_result)
         full_record = _promotion_record_summary(
             index=index,
@@ -13229,6 +13608,16 @@ def _run_sampled_promotion_pass(
         )
         if best is None or item[:4] < best[:4]:
             best = item
+        if _promotion_stop_after_selected():
+            records.append(
+                {
+                    "index": index,
+                    "stage": "selected_stop",
+                    "reason": "stopping promotion after first latency-improving sampled candidate",
+                    "selected_latency_usec": full_latency,
+                }
+            )
+            break
 
     summary = {
         "candidate_count": len(codes),
@@ -14999,7 +15388,11 @@ def _qbp_dp_prune_states(
         selected_keys.add(key)
 
     for state in unique:
-        if str(getattr(state, "source", "")) == "candidate_seed_neighborhood":
+        if str(getattr(state, "source", "")) in {
+            "candidate_seed_exact",
+            "candidate_seed_neighborhood",
+            "candidate_seed_output_splice",
+        }:
             add_state(state)
 
     for bucket in buckets.values():
@@ -15465,6 +15858,27 @@ def _qbp_dp_seed_anchor_state(
     )
 
 
+def _qbp_dp_seed_candidate_state(
+    seed_anchor: dict[str, Any] | None,
+    node: str,
+) -> _QBPDPState | None:
+    if not isinstance(seed_anchor, dict) or not seed_anchor.get("valid"):
+        return None
+    raw = seed_anchor.get("node_outputs", {}).get(str(node))
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    return _QBPDPState(
+        int(raw[0]),
+        int(raw[1]),
+        0.0,
+        0.0,
+        0.0,
+        None,
+        "candidate_seed_exact",
+        0.0,
+    )
+
+
 def _qbp_dp_seed_tuple(raw: Any) -> tuple[int, int] | None:
     if not isinstance(raw, (list, tuple)) or len(raw) != 2:
         return None
@@ -15628,7 +16042,7 @@ def _qbp_dp_seed_exact_state(
             + vertex_rescale
         ),
         assign_data,
-        "candidate_seed_neighborhood",
+        "candidate_seed_exact",
         float(sum(float(getattr(state, "seed_bridge_count", 0.0) or 0.0) for state in chosen_states)),
     )
 
@@ -15696,6 +16110,8 @@ def _qbp_dp_node_states(
         if str(node) in seed_node_inputs
         else None
     )
+    seed_output_tuple = _qbp_dp_seed_tuple(seed_node_outputs.get(str(node))) if isinstance(seed_node_outputs, dict) else None
+    output_splice_only = _bool_hint(hints.get("dp_seed_splice_output_only"), False)
     seed_edge_targets: dict[str, int] = {
         str(k): int(v) for k, v in dict(seed_edge_scales).items()
     }
@@ -15724,13 +16140,27 @@ def _qbp_dp_node_states(
         hints,
         materialize=materialize,
     )
-    if seed_exact_state is not None:
+    if seed_exact_state is None and output_splice_only and node not in tdag.outputs:
+        seed_exact_state = _qbp_dp_seed_candidate_state(seed_anchor, str(node))
+    seed_exact_disabled_requested = _bool_hint(hints.get("dp_disable_seed_exact_candidate"), False)
+    seed_exact_disabled = seed_exact_disabled_requested and not (
+        _bool_hint(hints.get("dp_seed_splice_output_only"), False)
+        and node not in tdag.outputs
+    )
+    if seed_exact_state is not None and not seed_exact_disabled:
         candidate_states.append(seed_exact_state)
         stats = _qbp_dp_cache_stats(hints)
         stats["seed_neighborhood_candidate_states"] = (
             int(stats.get("seed_neighborhood_candidate_states", 0) or 0) + 1
         )
-    if seed_exact_state is not None and _bool_hint(hints.get("dp_seed_exact_only"), False):
+    if (
+        seed_exact_state is not None
+        and not seed_exact_disabled
+        and (
+            _bool_hint(hints.get("dp_seed_exact_only"), False)
+            or (output_splice_only and node not in tdag.outputs)
+        )
+    ):
         pruned = _qbp_dp_prune_states(candidate_states, state_cap, params)
         _qbp_dp_trace_node(
             trace,
@@ -15936,6 +16366,13 @@ def _qbp_dp_node_states(
                 if not output_states:
                     rejection_counts["output_states_empty"] += 1
                 for output_index, (output_level, output_scale) in enumerate(output_states):
+                    if (
+                        output_splice_only
+                        and seed_exact_disabled
+                        and node in tdag.outputs
+                        and seed_output_tuple == (int(output_level), int(output_scale))
+                    ):
+                        continue
                     if output_index == 0 or (output_index + 1) % progress_interval == 0:
                         if isinstance(trace, dict):
                             trace["active_node_progress"] = {
@@ -15972,6 +16409,39 @@ def _qbp_dp_node_states(
                         + op_cost
                         + float(tdag.nodes[node].get("weight", 1)) * vertex_cost
                     )
+                    total_bootstrap = float(
+                        sum(state.bootstrap_count for state in combo)
+                        + edge_bootstrap
+                        + vertex_bootstrap
+                    )
+                    total_rescale = float(
+                        sum(state.rescale_count for state in combo)
+                        + edge_rescale
+                        + vertex_rescale
+                    )
+                    state_source = "candidate"
+                    if (
+                        output_splice_only
+                        and node in tdag.outputs
+                        and seed_exact_state is not None
+                        and isinstance(seed_anchor, dict)
+                    ):
+                        anchor_cost = _finite_float(seed_anchor.get("cost_usec"), float("inf"))
+                        if math.isfinite(anchor_cost) and math.isfinite(float(seed_exact_state.cost)):
+                            total_cost = max(0.0, float(anchor_cost) + (float(total_cost) - float(seed_exact_state.cost)))
+                        anchor_bootstrap = _finite_float(seed_anchor.get("bootstrap_count"), total_bootstrap)
+                        anchor_rescale = _finite_float(seed_anchor.get("rescale_count"), total_rescale)
+                        total_bootstrap = max(
+                            0.0,
+                            float(anchor_bootstrap)
+                            + (total_bootstrap - float(seed_exact_state.bootstrap_count)),
+                        )
+                        total_rescale = max(
+                            0.0,
+                            float(anchor_rescale)
+                            + (total_rescale - float(seed_exact_state.rescale_count)),
+                        )
+                        state_source = "candidate_seed_output_splice"
                     assign_data = _qbp_dp_merge_assign_data(list(combo), materialize=materialize)
                     if materialize:
                         if assign_data is None:
@@ -15997,10 +16467,10 @@ def _qbp_dp_node_states(
                             int(output_level),
                             int(output_scale),
                             float(total_cost),
-                            float(sum(state.bootstrap_count for state in combo) + edge_bootstrap + vertex_bootstrap),
-                            float(sum(state.rescale_count for state in combo) + edge_rescale + vertex_rescale),
+                            float(total_bootstrap),
+                            float(total_rescale),
                             assign_data,
-                            "candidate",
+                            state_source,
                             float(sum(getattr(state, "seed_bridge_count", 0.0) for state in combo)),
                         )
                     )
@@ -16190,7 +16660,7 @@ def _qbp_dp_solve_budget(
                 bootstrap_count = _finite_float(seed_anchor.get("bootstrap_count"), float(state.bootstrap_count))
                 rescale_count = _finite_float(seed_anchor.get("rescale_count"), float(state.rescale_count))
             elif (
-                str(getattr(state, "source", "")) == "candidate_seed_neighborhood"
+                str(getattr(state, "source", "")) == "candidate_seed_exact"
                 and isinstance(seed_anchor, dict)
             ):
                 anchor_cost = _finite_float(seed_anchor.get("cost_usec"), float("inf"))
@@ -17306,6 +17776,7 @@ def _budget_boundary_group_key(budget: dict[str, Any]) -> tuple[int, int, str, i
 def _apply_boundary_group_policy_overlays(
     hints: dict[str, Any],
     group_key: tuple[int, int, str, int],
+    task: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     policies = hints.get("boundary_group_policies")
     if not isinstance(policies, list) or not policies:
@@ -17315,6 +17786,8 @@ def _apply_boundary_group_policy_overlays(
         if not isinstance(item, dict):
             continue
         selector = item.get("selector", {})
+        if not _boundary_group_selector_matches_task(selector, task):
+            continue
         if not _boundary_group_selector_matches_key(selector, group_key):
             continue
         patch = item.get("policy", {})
@@ -17368,6 +17841,16 @@ def _apply_boundary_group_policy_overlays(
                 "mcts_prior_order",
                 "mcts_action_allowlist",
                 "mcts_action_blocklist",
+                "dp_probe_mode",
+                "dp_seed_exact_only",
+                "dp_disable_seed_exact_candidate",
+                "dp_seed_splice_output_only",
+                "dp_seed_neighborhood_radius",
+                "dp_max_combos_per_node",
+                "dp_max_incoming_options_per_combo",
+                "dp_max_level_candidates",
+                "dp_max_output_states_per_input",
+                "frontier_cap",
             }:
                 merged[key] = value
     return merged
@@ -17391,6 +17874,16 @@ def _boundary_group_action_patch(patch: dict[str, Any]) -> dict[str, Any]:
             "mcts_action_cap",
             "mcts_rollout_budget",
             "mcts_prior_order",
+            "dp_probe_mode",
+            "dp_seed_exact_only",
+            "dp_disable_seed_exact_candidate",
+            "dp_seed_splice_output_only",
+            "dp_seed_neighborhood_radius",
+            "dp_max_combos_per_node",
+            "dp_max_incoming_options_per_combo",
+            "dp_max_level_candidates",
+            "dp_max_output_states_per_input",
+            "frontier_cap",
         }:
             continue
         if key in _PATCHABLE_POLICY_KEYS or key in {

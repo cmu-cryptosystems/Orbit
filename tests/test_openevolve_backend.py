@@ -2640,8 +2640,12 @@ def test_strategy_discovery_includes_reference_anchor_probe_variants(
     )
     by_label = {str(item["label"]): item for item in variants}
 
+    assert "seed_bridge_candidate" in by_label
     assert "reference_anchor_neighborhood_frontier" in by_label
     assert "reference_anchor_forced_sparse" in by_label
+    bridge = by_label["seed_bridge_candidate"]["hints"]["boundary_group_policies"][0]["policy"]
+    assert bridge["dp_allow_seed_bridge_candidate"] is True
+    assert bridge["dp_probe_mode"] == "seed_bridge_candidate"
     forced = by_label["reference_anchor_forced_sparse"]["hints"]["boundary_group_policies"][0][
         "policy"
     ]
@@ -2749,7 +2753,7 @@ def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     )
     labels = [str(item["label"]) for item in variants]
 
-    assert labels[0].startswith("seed_bootstrap_")
+    assert labels[0] == "seed_bridge_candidate"
     assert "seed_bootstrap_remove_0" in labels
     assert "seed_bootstrap_shift_prev_0" in labels
     assert "reference_anchor_neighborhood_frontier" in labels
@@ -8300,6 +8304,82 @@ def test_qbp_dp_seed_bridge_probe_is_not_direct_valid(
     assert oe_backend._promotion_result_direct_valid(result) is False
     summary = result["diagnostics"]["boundary_group_summaries"][0]
     assert summary["selected_source_counts"] == {"reference_seed_bridge:qbp_dp": 1}
+
+
+def test_qbp_dp_seed_bridge_can_be_explicit_candidate(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}], params)
+    context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": context,
+        }
+    ]
+    monkeypatch.setattr(oe_backend, "_qbp_dp_prune_states", lambda *_args, **_kwargs: [])
+
+    result = oe_backend._evaluate_sampled_budget_tasks_dp_probe(
+        context,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "enable_seed_frontier_anchor": True,
+            "dp_allow_seed_bridge_candidate": True,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["fallback_selected_budgets"] == 0
+    assert result["candidate_qbp_coverage"] == 1.0
+    assert oe_backend._promotion_result_direct_valid(result) is True
+    summary = result["diagnostics"]["boundary_group_summaries"][0]
+    assert summary["candidate_complete"] is True
+    assert summary["seed_bridge_candidate_budgets"] == 1
+    assert summary["selected_source_counts"] == {"candidate:seed_bridge_qbp_dp": 1}
+
+
+def test_qbp_dp_seed_bridge_candidate_materializes_when_allowed(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    monkeypatch.setattr(oe_backend, "_qbp_dp_prune_states", lambda *_args, **_kwargs: [])
+
+    result = oe_backend._qbp_dp_solve_budget(
+        graph,
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        le,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "enable_seed_frontier_anchor": True,
+            "dp_allow_seed_bridge_candidate": True,
+        },
+        materialize=True,
+    )
+
+    assert result.valid is True
+    assert result.seed_bridge_count > 0
+    assert result.assign is not None
+    assert result.assign.check_assign()
 
 
 def test_qbp_dp_seed_guided_replay_matches_valid_seed(toy_cost_json: str):

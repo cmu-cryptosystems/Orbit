@@ -12223,6 +12223,49 @@ def _strategy_discovery_variants(
             "selection_objective": "cost",
         }
 
+    def seed_bridge_candidate_patch() -> dict[str, Any]:
+        return {
+            "dp_probe_mode": "seed_bridge_candidate",
+            "dp_seed_exact_only": False,
+            "dp_disable_seed_exact_candidate": False,
+            "dp_allow_seed_bridge_candidate": True,
+            "enable_seed_frontier_anchor": True,
+            "dp_seed_neighborhood_radius": 0,
+            "dp_max_combos_per_node": 1,
+            "dp_max_incoming_options_per_combo": 1,
+            "dp_max_level_candidates": 1,
+            "dp_max_output_states_per_input": 1,
+            "boundary_scale_policy": "waterline",
+            "scale_lattice": "waterline_sf",
+            "frontier_cap": 3,
+            "state_cap_per_node": 3,
+            "boundary_state_cap": 3,
+            "max_scale_candidates": 6,
+            "bootstrap_penalty": 35_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+            "selection_objective": "cost",
+        }
+
+    add(
+        "seed_bridge_candidate",
+        "seed_bridge_candidate",
+        {
+            "boundary_group_policies": [
+                {
+                    "selector": output_splice_selectors[0],
+                    "policy": seed_bridge_candidate_patch(),
+                }
+            ]
+        }
+        if output_splice_selectors[0]
+        else seed_bridge_candidate_patch(),
+        changed_keys=[
+            "boundary_group_policies",
+            "dp_allow_seed_bridge_candidate",
+            "dp_probe_mode",
+        ],
+    )
+
     for index in (0, 1):
         for label_suffix, mode in (
             ("remove", "remove_seed_bootstrap"),
@@ -12487,9 +12530,10 @@ def _strategy_discovery_variants(
             )
     if reference_anchor_probe_selected:
         dimension_priority = {
-            "seed_maintenance_perturbation": 0,
-            "reference_bootstrap_anchor_policy": 1,
-            "per_top_boundary_override": 2,
+            "seed_bridge_candidate": 0,
+            "seed_maintenance_perturbation": 1,
+            "reference_bootstrap_anchor_policy": 2,
+            "per_top_boundary_override": 3,
             "dp_probe_mode": 3,
             "multi_boundary_output_splice": 3,
             "boundary_scale_policy": 3,
@@ -12508,10 +12552,12 @@ def _strategy_discovery_variants(
         def reference_anchor_priority(item: dict[str, Any]) -> tuple[int, str]:
             label = str(item.get("label", ""))
             dimension = str(item.get("dimension", ""))
-            if label.startswith("seed_bootstrap_"):
+            if label == "seed_bridge_candidate":
                 return (0, label)
+            if label.startswith("seed_bootstrap_"):
+                return (1, label)
             if label.startswith("reference_anchor_"):
-                return (1, f"{reference_label_priority.get(label, 99):02d}:{label}")
+                return (2, f"{reference_label_priority.get(label, 99):02d}:{label}")
             if label.startswith("dp_output_splice"):
                 return (3, label)
             return (dimension_priority.get(dimension, 3), label)
@@ -13593,10 +13639,15 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                 group_key,
                 task,
             )
+            seed_bridge_as_candidate = _bool_hint(
+                group_eval_hints.get("dp_allow_seed_bridge_candidate"),
+                False,
+            )
             selected_results: list[_QBPDPBudgetResult] = []
             group_failure_traces: list[dict[str, Any]] = []
             reachable = 0
             seed_bridge_selected = 0
+            candidate_seed_bridge_selected = 0
             for budget in group_budgets:
                 total["requested_budgets"] += 1
                 result = _qbp_dp_solve_budget(
@@ -13613,8 +13664,13 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                     total["solved_budgets"] += 1
                     if float(getattr(result, "seed_bridge_count", 0.0) or 0.0) > 0:
                         seed_bridge_selected += 1
-                        total["fallback_solved_budgets"] += 1
-                        total["fallback_selected_budgets"] += 1
+                        if seed_bridge_as_candidate:
+                            candidate_seed_bridge_selected += 1
+                            total["candidate_solved_budgets"] += 1
+                            total["candidate_costs"].append(float(result.cost))
+                        else:
+                            total["fallback_solved_budgets"] += 1
+                            total["fallback_selected_budgets"] += 1
                     else:
                         total["candidate_solved_budgets"] += 1
                         total["candidate_costs"].append(float(result.cost))
@@ -13638,7 +13694,7 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             solved = len(selected_results)
             if requested > 0 and reachable > 0 and solved >= reachable:
                 total["solved_boundary_groups"] += 1
-                if seed_bridge_selected:
+                if seed_bridge_selected and not seed_bridge_as_candidate:
                     total["fallback_selected_boundary_groups"] += 1
                 else:
                     total["candidate_solved_boundary_groups"] += 1
@@ -13656,9 +13712,12 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             bootstraps = [float(item.bootstrap_count) for item in selected_results]
             rescales = [float(item.rescale_count) for item in selected_results]
             selected_source_counts = {}
-            if solved - seed_bridge_selected > 0:
-                selected_source_counts["candidate:qbp_dp"] = solved - seed_bridge_selected
-            if seed_bridge_selected:
+            direct_candidate_count = solved - seed_bridge_selected
+            if direct_candidate_count > 0:
+                selected_source_counts["candidate:qbp_dp"] = direct_candidate_count
+            if candidate_seed_bridge_selected:
+                selected_source_counts["candidate:seed_bridge_qbp_dp"] = candidate_seed_bridge_selected
+            if seed_bridge_selected and not seed_bridge_as_candidate:
                 selected_source_counts["reference_seed_bridge:qbp_dp"] = seed_bridge_selected
             seed_bridge = None
             if solved < reachable and group_failure_traces:
@@ -13689,10 +13748,18 @@ def _evaluate_sampled_budget_tasks_dp_probe(
                 "unreachable_budgets": int(max(0, requested - reachable)),
                 "solved_budgets": solved,
                 "candidate_solved_budgets": solved,
-                "fallback_selected_budgets": int(seed_bridge_selected),
+                "fallback_selected_budgets": int(
+                    seed_bridge_selected if not seed_bridge_as_candidate else 0
+                ),
                 "complete": bool(requested > 0 and reachable > 0 and solved >= reachable),
-                "candidate_complete": bool(requested > 0 and reachable > 0 and solved >= reachable and not seed_bridge_selected),
+                "candidate_complete": bool(
+                    requested > 0
+                    and reachable > 0
+                    and solved >= reachable
+                    and (not seed_bridge_selected or seed_bridge_as_candidate)
+                ),
                 "seed_bridge_selected_budgets": int(seed_bridge_selected),
+                "seed_bridge_candidate_budgets": int(candidate_seed_bridge_selected),
                 "selected_source_counts": selected_source_counts,
                 "unsolved_reason": reason,
                 "unreachable_input": bool(reachable <= 0),
@@ -17155,6 +17222,7 @@ def _qbp_dp_seed_anchor_data(
         "bootstrap_nodes": bootstrap_nodes,
         "bootstrap_count": float(_aggregate_counts([assign])["bootstrap"]),
         "rescale_count": float(_aggregate_counts([assign])["rescale"]),
+        "assign_data": assign.to_dict(),
         "attempts": attempts,
     }
     return cache[key]
@@ -17535,7 +17603,18 @@ def _qbp_dp_add_seed_anchor_state(
         return states
     if not params.is_decryptable_state(seed_state.level, seed_state.scale):
         return states
-    if any(_qbp_dp_state_key(state) == _qbp_dp_state_key(seed_state) for state in states):
+    allow_seed_bridge_candidate = _bool_hint(
+        hints.get("dp_allow_seed_bridge_candidate"),
+        False,
+    )
+    if any(
+        _qbp_dp_state_key(state) == _qbp_dp_state_key(seed_state)
+        and (
+            not allow_seed_bridge_candidate
+            or float(getattr(state, "seed_bridge_count", 0.0) or 0.0) > 0
+        )
+        for state in states
+    ):
         return states
     stats = _qbp_dp_cache_stats(hints)
     stats["seed_anchor_injected_states"] = int(stats.get("seed_anchor_injected_states", 0) or 0) + 1
@@ -18253,6 +18332,22 @@ def _qbp_dp_solve_budget(
     input_node = list(tdag.inputs)[0]
     output_node = list(tdag.outputs)[0]
     seed_anchor = _qbp_dp_seed_anchor_data(tdag, params, io_budget, le, hints)
+    allow_seed_bridge_candidate = _bool_hint(
+        hints.get("dp_allow_seed_bridge_candidate"),
+        False,
+    )
+
+    def budget_result_key(item: _QBPDPBudgetResult) -> tuple[int, float, float, float]:
+        return (
+            0
+            if allow_seed_bridge_candidate
+            or float(getattr(item, "seed_bridge_count", 0.0) or 0.0) <= 0
+            else 1,
+            float(item.cost),
+            float(item.bootstrap_count),
+            float(item.rescale_count),
+        )
+
     for fixed_main, main_cost in main_choices:
         trace = _qbp_dp_new_trace(io_budget, len(main_choices)) if _qbp_dp_trace_enabled(hints) else None
         if isinstance(trace, dict) and isinstance(seed_anchor, dict):
@@ -18403,34 +18498,59 @@ def _qbp_dp_solve_budget(
                 rescale_count = float(state.rescale_count)
             if materialize:
                 if float(getattr(state, "seed_bridge_count", 0.0) or 0.0) > 0:
+                    if not allow_seed_bridge_candidate or not isinstance(seed_anchor, dict):
+                        continue
+                    seed_assign_data = seed_anchor.get("assign_data")
+                    if not isinstance(seed_assign_data, dict):
+                        continue
+                    try:
+                        assign = Assign.from_dict(tdag, seed_assign_data)
+                        assign.check_assign()
+                        actual_cost = float(estimate_assign(assign, le) + main_cost)
+                        actual_counts = _aggregate_counts([assign])
+                        bootstrap_count = float(actual_counts["bootstrap"])
+                        rescale_count = float(actual_counts["rescale"])
+                    except Exception as exc:
+                        _qbp_dp_trace_reject(trace, "seed_bridge_materialization_invalid")
+                        if isinstance(trace, dict):
+                            failures = trace.setdefault("materialization_failures", [])
+                            if len(failures) < 16:
+                                failures.append(
+                                    {
+                                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                                        "source": "reference_seed_bridge",
+                                        "out_key": [int(out_key[0]), int(out_key[1])],
+                                    }
+                                )
+                        continue
+                elif state.assign_data is None:
                     continue
-                if state.assign_data is None:
-                    continue
-                try:
-                    assign = Assign.from_dict(tdag, state.assign_data)
-                    assign.check_assign()
-                    actual_cost = float(estimate_assign(assign, le) + main_cost)
-                    actual_counts = _aggregate_counts([assign])
-                    bootstrap_count = float(actual_counts["bootstrap"])
-                    rescale_count = float(actual_counts["rescale"])
-                except Exception as exc:
-                    _qbp_dp_trace_reject(trace, "materialization_invalid")
-                    if isinstance(trace, dict):
-                        failures = trace.setdefault("materialization_failures", [])
-                        if len(failures) < 16:
-                            failures.append(
-                                {
-                                    "error": f"{type(exc).__name__}: {str(exc)[:500]}",
-                                    "source": str(getattr(state, "source", "")),
-                                    "out_key": [int(out_key[0]), int(out_key[1])],
-                                    "state_level": int(state.level),
-                                    "state_scale": int(state.scale),
-                                    "state_cost_usec": float(state.cost),
-                                    "state_bootstrap_count": float(state.bootstrap_count),
-                                    "state_rescale_count": float(state.rescale_count),
-                                }
-                            )
-                    continue
+                else:
+                    try:
+                        assign = Assign.from_dict(tdag, state.assign_data)
+                        assign.check_assign()
+                        actual_cost = float(estimate_assign(assign, le) + main_cost)
+                        actual_counts = _aggregate_counts([assign])
+                        bootstrap_count = float(actual_counts["bootstrap"])
+                        rescale_count = float(actual_counts["rescale"])
+                    except Exception as exc:
+                        _qbp_dp_trace_reject(trace, "materialization_invalid")
+                        if isinstance(trace, dict):
+                            failures = trace.setdefault("materialization_failures", [])
+                            if len(failures) < 16:
+                                failures.append(
+                                    {
+                                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                                        "source": str(getattr(state, "source", "")),
+                                        "out_key": [int(out_key[0]), int(out_key[1])],
+                                        "state_level": int(state.level),
+                                        "state_scale": int(state.scale),
+                                        "state_cost_usec": float(state.cost),
+                                        "state_bootstrap_count": float(state.bootstrap_count),
+                                        "state_rescale_count": float(state.rescale_count),
+                                    }
+                                )
+                        continue
             item = _QBPDPBudgetResult(
                 True,
                 in_key,
@@ -18442,17 +18562,7 @@ def _qbp_dp_solve_budget(
                 trace=trace,
                 seed_bridge_count=float(getattr(state, "seed_bridge_count", 0.0) or 0.0),
             )
-            if best is None or (
-                1 if item.seed_bridge_count > 0 else 0,
-                item.cost,
-                item.bootstrap_count,
-                item.rescale_count,
-            ) < (
-                1 if best.seed_bridge_count > 0 else 0,
-                best.cost,
-                best.bootstrap_count,
-                best.rescale_count,
-            ):
+            if best is None or budget_result_key(item) < budget_result_key(best):
                 best = item
         _write_qbp_dp_progress_trace(trace, hints, stage="budget_done", node=str(output_node))
     return best or _QBPDPBudgetResult(

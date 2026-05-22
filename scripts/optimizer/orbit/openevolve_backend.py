@@ -10833,6 +10833,68 @@ def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]
     return selected, reference_cost
 
 
+def _micro_probe_budget_for_group(
+    group_key: tuple[int, int, str, int],
+    group_budgets: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not group_budgets:
+        return None
+    in_lvl = int(group_key[0])
+
+    def rank(budget: dict[str, Any]) -> tuple[int, int, int, int]:
+        out_lvl = _safe_int(budget.get("out_lvl"), -1)
+        exact = 1 if in_lvl >= 0 and out_lvl == in_lvl else 0
+        below_or_equal = 1 if in_lvl >= 0 and 0 <= out_lvl <= in_lvl else 0
+        closeness = -abs(out_lvl - in_lvl) if in_lvl >= 0 and out_lvl >= 0 else out_lvl
+        return (exact, below_or_equal, closeness, out_lvl)
+
+    return deepcopy(max(group_budgets, key=rank))
+
+
+def _strategy_discovery_micro_probe_tasks(
+    selected_probe_tasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a cheap one-output-level probe for each selected boundary group."""
+
+    micro_tasks: list[dict[str, Any]] = []
+    for task in selected_probe_tasks:
+        if not isinstance(task, dict):
+            continue
+        task_context = task.get("context")
+        if not isinstance(task_context, dict):
+            continue
+        budgets = [
+            item
+            for item in task_context.get("io_budgets", []) or []
+            if isinstance(item, dict)
+        ]
+        if not budgets:
+            continue
+        selected_group_keys = _sampled_task_group_keys(task)
+        selected_budgets: list[dict[str, Any]] = []
+        selected_groups: list[dict[str, Any]] = []
+        for group_key, group_budgets in _budget_boundary_groups(budgets).items():
+            key_string = _boundary_group_key_string(group_key)
+            if selected_group_keys and key_string not in selected_group_keys:
+                continue
+            micro_budget = _micro_probe_budget_for_group(group_key, group_budgets)
+            if micro_budget is None:
+                continue
+            selected_budgets.append(micro_budget)
+            selected_groups.append(_boundary_group_key_to_dict(group_key))
+        if not selected_budgets:
+            continue
+        micro_task = deepcopy(task)
+        micro_context = deepcopy(task_context)
+        micro_context["io_budgets"] = selected_budgets
+        micro_task["context"] = micro_context
+        micro_task["group_keys"] = selected_groups
+        micro_task["strategy_micro_probe"] = True
+        micro_task["strategy_micro_budget_count"] = len(selected_budgets)
+        micro_tasks.append(micro_task)
+    return micro_tasks
+
+
 def _promotion_fallback_probe_reference_cost(
     context: dict[str, Any],
     selected_task_count: int,
@@ -11289,6 +11351,26 @@ def _probe_seed_summary(
         "latency_usec": float(reference_latency_usec),
         "bootstrap_count": float(bootstrap),
         "rescale_count": float(rescale),
+        "group_keys": group_keys[:16],
+        "task_digest": _sampled_tasks_digest(selected_probe_tasks),
+    }
+
+
+def _probe_result_summary(
+    selected_probe_tasks: list[dict[str, Any]],
+    result: dict[str, Any],
+    reference_latency_usec: float,
+) -> dict[str, Any]:
+    group_keys: list[Any] = []
+    for task in selected_probe_tasks:
+        if isinstance(task, dict):
+            group_keys.extend(list(task.get("group_keys", []) or []))
+    return {
+        "selected_path_digest": str(result.get("sampled_selected_path_digest", "")),
+        "selected_source_counts": _selected_source_counts_from_result(result),
+        "latency_usec": float(reference_latency_usec),
+        "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
+        "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
         "group_keys": group_keys[:16],
         "task_digest": _sampled_tasks_digest(selected_probe_tasks),
     }
@@ -12139,16 +12221,16 @@ def _strategy_discovery_variants(
             )
     if reference_anchor_probe_selected:
         dimension_priority = {
-            "reference_bootstrap_anchor_policy": 0,
-            "per_top_boundary_override": 1,
-            "boundary_scale_policy": 2,
-            "scale_lattice": 2,
-            "boundary_state_cap": 2,
-            "beam_width": 2,
-            "bootstrap_penalty": 2,
-            "action_allowlist": 2,
-            "dp_probe_mode": 4,
-            "multi_boundary_output_splice": 4,
+            "per_top_boundary_override": 0,
+            "dp_probe_mode": 1,
+            "multi_boundary_output_splice": 1,
+            "reference_bootstrap_anchor_policy": 2,
+            "boundary_scale_policy": 3,
+            "scale_lattice": 3,
+            "boundary_state_cap": 3,
+            "beam_width": 3,
+            "bootstrap_penalty": 3,
+            "action_allowlist": 3,
         }
         reference_label_priority = {
             "reference_anchor_neighborhood_frontier": 0,
@@ -12160,9 +12242,9 @@ def _strategy_discovery_variants(
             label = str(item.get("label", ""))
             dimension = str(item.get("dimension", ""))
             if label.startswith("reference_anchor_"):
-                return (0, f"{reference_label_priority.get(label, 99):02d}:{label}")
+                return (2, f"{reference_label_priority.get(label, 99):02d}:{label}")
             if label.startswith("dp_output_splice"):
-                return (4, label)
+                return (1, label)
             return (dimension_priority.get(dimension, 3), label)
 
         variants.sort(key=reference_anchor_priority)
@@ -12428,6 +12510,47 @@ def _run_strategy_discovery_prepass(
     probe_context.setdefault("harness", {})["experience_probe"] = True
     probe_context.setdefault("harness", {})["strategy_discovery"] = True
     probe_context.setdefault("harness", {})["dp_trace_dir"] = str(discovery_dir)
+    reference_anchor_probe_selected = any(
+        isinstance(task, dict) and bool(task.get("reference_anchor_probe"))
+        for task in selected_probe_tasks
+    )
+    micro_probe_tasks = (
+        _strategy_discovery_micro_probe_tasks(selected_probe_tasks)
+        if reference_anchor_probe_selected and _use_qbp_dp_engine(params, initial_hints or {})
+        else []
+    )
+    micro_probe_context: dict[str, Any] | None = None
+    micro_seed_summary: dict[str, Any] | None = None
+    micro_reference_cost = float("inf")
+    if micro_probe_tasks:
+        micro_probe_context = deepcopy(context)
+        micro_probe_context["sampled_budget_tasks"] = deepcopy(micro_probe_tasks)
+        micro_probe_context.setdefault("harness", {})["experience_probe"] = True
+        micro_probe_context.setdefault("harness", {})["strategy_discovery"] = True
+        micro_probe_context.setdefault("harness", {})["strategy_micro_probe"] = True
+        micro_probe_context.setdefault("harness", {})["dp_trace_dir"] = str(discovery_dir)
+        seed_eval_hints = _compile_hints_for_eval_suite(
+            initial_hints or {},
+            params.openevolve_eval_suite,
+        )
+        seed_probe_hints = _dp_probe_lightweight_hints(
+            _promotion_probe_hints(seed_eval_hints, micro_probe_tasks)
+        )
+        seed_probe_hints["dp_trace_label"] = "strategy_micro_seed"
+        seed_probe = _evaluate_dp_probe_for_promotion(
+            micro_probe_context,
+            seed_probe_hints,
+            micro_probe_tasks,
+            timeout_sec=max(1, min(discovery_eval_timeout_sec, 10)),
+            materialize=False,
+        )
+        micro_reference_cost = _promotion_latency(seed_probe)
+        if _promotion_result_direct_valid(seed_probe) and math.isfinite(micro_reference_cost):
+            micro_seed_summary = _probe_result_summary(
+                micro_probe_tasks,
+                seed_probe,
+                micro_reference_cost,
+            )
     place_timeout = _candidate_place_timeout_sec(context)
     for index, variant in enumerate(variants):
         if (
@@ -12469,7 +12592,140 @@ def _run_strategy_discovery_prepass(
             }
             records.append(record)
             continue
+        micro_record: dict[str, Any] | None = None
         if _use_qbp_dp_engine(params, probe_hints):
+            if micro_probe_context is not None and micro_seed_summary is not None:
+                micro_hints = _dp_probe_lightweight_hints(probe_hints)
+                micro_hints["dp_trace_label"] = f"strategy_micro_{index}"
+                micro_result = _evaluate_dp_probe_for_promotion(
+                    micro_probe_context,
+                    micro_hints,
+                    micro_probe_tasks,
+                    timeout_sec=max(1, min(discovery_eval_timeout_sec, 10)),
+                    materialize=False,
+                )
+                micro_latency = _promotion_latency(micro_result)
+                micro_direct_valid = _promotion_result_direct_valid(micro_result)
+                micro_diff = _path_differential_summary(micro_seed_summary, micro_result)
+                micro_improved = bool(
+                    micro_direct_valid
+                    and math.isfinite(micro_latency)
+                    and micro_latency < micro_reference_cost
+                )
+                micro_path_changed = bool(micro_diff.get("selected_path_changed", False))
+                micro_record = {
+                    "stage": "strategy_micro_probe",
+                    "direct_valid": bool(micro_direct_valid),
+                    "valid": bool(micro_result.get("valid", False)),
+                    "latency_usec": micro_latency,
+                    "reference_latency_usec": micro_reference_cost,
+                    "latency_improved": micro_improved,
+                    "selected_path_digest": str(
+                        micro_result.get("sampled_selected_path_digest", "")
+                    ),
+                    "selected_source_counts": _selected_source_counts_from_result(
+                        micro_result
+                    ),
+                    "path_differential": micro_diff,
+                    "bootstrap_count": _finite_float(
+                        micro_result.get("bootstrap_count"), 0.0
+                    ),
+                    "rescale_count": _finite_float(micro_result.get("rescale_count"), 0.0),
+                    "timed_out": bool(micro_result.get("timed_out", False)),
+                    "dp_progress_trace_path": micro_result.get("dp_progress_trace_path"),
+                }
+                if not (micro_direct_valid and micro_improved):
+                    if not micro_direct_valid:
+                        reason = "micro_probe_not_direct_valid"
+                    elif micro_path_changed:
+                        reason = "micro_probe_changed_slower"
+                    else:
+                        reason = "micro_probe_seed_equivalent"
+                    record = {
+                        "index": index,
+                        "label": variant.get("label"),
+                        "dimension": variant.get("dimension"),
+                        "changed_keys": variant.get("changed_keys", []),
+                        "reason": reason,
+                        "probe_policy_digest": policy_digest,
+                        "direct_valid": False,
+                        "valid": bool(micro_result.get("valid", False)),
+                        "latency_usec": micro_latency,
+                        "reference_latency_usec": micro_reference_cost,
+                        "latency_improved": False,
+                        "selected_path_digest": str(
+                            micro_result.get("sampled_selected_path_digest", "")
+                        ),
+                        "selected_source_counts": _selected_source_counts_from_result(
+                            micro_result
+                        ),
+                        "path_differential": micro_diff,
+                        "micro_probe": micro_record,
+                        "bootstrap_count": _finite_float(
+                            micro_result.get("bootstrap_count"), 0.0
+                        ),
+                        "rescale_count": _finite_float(
+                            micro_result.get("rescale_count"), 0.0
+                        ),
+                        "timed_out": bool(micro_result.get("timed_out", False)),
+                        "policy_summary": _compact_policy_summary(micro_hints),
+                    }
+                    records.append(record)
+                    path_rows.append(
+                        {
+                            "label": record["label"],
+                            "dimension": record["dimension"],
+                            "collapse_reason": micro_diff["collapse_reason"],
+                            "selected_path_changed": micro_diff["selected_path_changed"],
+                            "selected_source_counts_changed": micro_diff[
+                                "selected_source_counts_changed"
+                            ],
+                            "latency_delta_usec": micro_diff["latency_delta_usec"],
+                            "selected_path_digest": record["selected_path_digest"],
+                            "path_source_digest": _promotion_path_source_digest(micro_result),
+                            "micro_probe": True,
+                        }
+                    )
+                    if micro_path_changed:
+                        path_moving_codes.append(
+                            _strategy_discovery_program_source(
+                                str(variant.get("label", "strategy")),
+                                micro_hints,
+                            )
+                        )
+                    partial_summary = {
+                        "enabled": True,
+                        "variant_count": len(variants),
+                        "evaluated_count": len(records),
+                        "path_moving_count": sum(
+                            1
+                            for item in records
+                            if item.get("path_differential", {}).get(
+                                "selected_path_changed"
+                            )
+                        ),
+                        "latency_improved_count": sum(
+                            1 for item in records if item.get("latency_improved")
+                        ),
+                        "skip_policy_digest_count": len(skip_policy_digests),
+                        "path_moving_code_count": len(path_moving_codes),
+                        "timed_out": False,
+                        "stopped_after_improved": False,
+                        "stop_after_improved": stop_after_improved,
+                        "timeout_sec": discovery_timeout_sec,
+                        "eval_timeout_sec": discovery_eval_timeout_sec,
+                        "micro_probe_enabled": True,
+                        "micro_probe_task_count": len(micro_probe_tasks),
+                        "micro_probe_reference_latency_usec": micro_reference_cost,
+                        "records": records,
+                    }
+                    _write_strategy_discovery_artifacts(
+                        discovery_dir,
+                        partial_summary,
+                        path_rows,
+                        _strategy_discovery_examples(records),
+                    )
+                    continue
             result = _evaluate_dp_probe_for_promotion(
                 probe_context,
                 probe_hints,
@@ -12559,6 +12815,8 @@ def _run_strategy_discovery_prepass(
             record["reason"] = diff["collapse_reason"]
         else:
             record["reason"] = "latency_improved"
+        if micro_record is not None:
+            record["micro_probe"] = micro_record
         records.append(record)
         path_rows.append(
             {
@@ -13972,9 +14230,13 @@ def _run_sampled_promotion_pass(
             continue
         seen_path_source_digests.add(path_source_digest)
         materialized_probe_result: dict[str, Any] | None = None
+        probe_latency_improved = (
+            math.isfinite(probe_latency) and probe_latency < probe_reference_cost
+        )
         if (
             _use_qbp_dp_engine(params, active_probe_hints)
             and bool(path_diff.get("selected_path_changed", False))
+            and probe_latency_improved
         ):
             print(
                 "OpenEvolve compile harness: sampled promotion "

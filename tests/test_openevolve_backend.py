@@ -2659,7 +2659,7 @@ def test_strategy_discovery_includes_reference_anchor_probe_variants(
 def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     toy_cost_json: str, monkeypatch
 ):
-    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "4")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "12")
     params = _params(
         toy_cost_json,
         openevolve_search_mode="bootstrap-mcts",
@@ -2710,11 +2710,13 @@ def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     labels = [str(item["label"]) for item in variants]
 
     assert labels[:3] == [
-        "reference_anchor_neighborhood_frontier",
-        "reference_anchor_neighborhood_dense",
-        "reference_anchor_forced_sparse",
+        "dp_output_splice_frontier",
+        "dp_output_splice_low",
+        "dp_output_splice_waterline",
     ]
-    assert all(not label.startswith("dp_output_splice") for label in labels[:3])
+    assert labels.index("reference_anchor_neighborhood_frontier") > labels.index(
+        "dp_output_splice_waterline"
+    )
 
 
 def test_strategy_discovery_examples_mark_promotable_status():
@@ -6766,6 +6768,246 @@ def test_reference_anchor_probe_reconstructs_group_keys_when_metrics_lack_groups
     ]
 
 
+def test_strategy_discovery_micro_probe_keeps_one_output_per_group(
+    toy_cost_json: str,
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    graph = Tdag(params, "micro_probe_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node("out", op="add", weight=1, op_descr={}, comment="")
+    graph.add_edge("arg0", "out")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"out"}
+    task = {
+        "index": 5,
+        "reference_anchor_probe": True,
+        "group_keys": [
+            {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0},
+            {"in_lvl": 16, "in_scl": 51, "maino_v": "", "main_dag_size": 0},
+        ],
+        "context": build_context(
+            graph,
+            [
+                {"in_lvl": 8, "in_scl": 120, "out_lvl": 1},
+                {"in_lvl": 8, "in_scl": 120, "out_lvl": 8},
+                {"in_lvl": 8, "in_scl": 120, "out_lvl": 16},
+                {"in_lvl": 16, "in_scl": 51, "out_lvl": 1},
+                {"in_lvl": 16, "in_scl": 51, "out_lvl": 4},
+                {"in_lvl": 16, "in_scl": 51, "out_lvl": 16},
+            ],
+            params,
+        ),
+    }
+
+    micro_tasks = oe_backend._strategy_discovery_micro_probe_tasks([task])
+
+    assert len(micro_tasks) == 1
+    budgets = micro_tasks[0]["context"]["io_budgets"]
+    assert len(budgets) == 2
+    assert {(item["in_lvl"], item["in_scl"], item["out_lvl"]) for item in budgets} == {
+        (8, 120, 8),
+        (16, 51, 16),
+    }
+    assert micro_tasks[0]["strategy_micro_budget_count"] == 2
+    assert micro_tasks[0]["group_keys"] == task["group_keys"]
+
+
+def test_strategy_discovery_micro_probe_skips_full_seed_equivalent(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "1")
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    task = {
+        "index": 0,
+        "reference_anchor_probe": True,
+        "group_keys": [
+            {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+        ],
+        "context": build_context(
+            graph,
+            [
+                {"in_lvl": 16, "in_scl": 40, "out_lvl": 1},
+                {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+            ],
+            params,
+        ),
+    }
+    context = build_compile_context(graph, params)
+    monkeypatch.setattr(
+        oe_backend,
+        "_strategy_discovery_variants",
+        lambda *_args, **_kwargs: [
+            {
+                "label": "same_micro",
+                "dimension": "boundary_scale_policy",
+                "changed_keys": ["boundary_scale_policy"],
+                "hints": {
+                    "strategy": "bootstrap_mcts",
+                    "qbp_engine": "dp",
+                    "boundary_scale_policy": "frontier",
+                },
+            }
+        ],
+    )
+    calls = []
+
+    def fake_dp_probe(_context, _hints, selected_tasks, **kwargs):
+        calls.append(
+            {
+                "budget_count": sum(
+                    len(task["context"]["io_budgets"]) for task in selected_tasks
+                ),
+                "materialize": bool(kwargs.get("materialize", False)),
+            }
+        )
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 100.0,
+            "objective_cost_usec": 100.0,
+            "bootstrap_count": 1.0,
+            "rescale_count": 2.0,
+            "sampled_selected_path_digest": "seed-micro",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
+
+    discovery = oe_backend._run_strategy_discovery_prepass(
+        tmp_path,
+        context,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        params,
+        [task],
+        200.0,
+        eval_timeout_sec=10,
+        total_timeout_sec=30,
+        started_at=time.monotonic(),
+    )
+
+    assert len(calls) == 2
+    assert all(item["budget_count"] == 1 for item in calls)
+    assert calls[0]["materialize"] is False
+    assert calls[1]["materialize"] is False
+    assert discovery["records"][0]["reason"] == "micro_probe_seed_equivalent"
+    assert discovery["summary"]["latency_improved_count"] == 0
+
+
+def test_strategy_discovery_micro_probe_keeps_slower_path_as_example(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "1")
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    task = {
+        "index": 0,
+        "reference_anchor_probe": True,
+        "group_keys": [
+            {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+        ],
+        "context": build_context(
+            graph,
+            [
+                {"in_lvl": 16, "in_scl": 40, "out_lvl": 1},
+                {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+            ],
+            params,
+        ),
+    }
+    context = build_compile_context(graph, params)
+    monkeypatch.setattr(
+        oe_backend,
+        "_strategy_discovery_variants",
+        lambda *_args, **_kwargs: [
+            {
+                "label": "slower_path",
+                "dimension": "dp_probe_mode",
+                "changed_keys": ["dp_probe_mode"],
+                "hints": {
+                    "strategy": "bootstrap_mcts",
+                    "qbp_engine": "dp",
+                    "dp_probe_mode": "output_splice",
+                },
+            }
+        ],
+    )
+    calls = []
+
+    def fake_dp_probe(_context, _hints, selected_tasks, **kwargs):
+        calls.append(
+            {
+                "budget_count": sum(
+                    len(task["context"]["io_budgets"]) for task in selected_tasks
+                ),
+                "materialize": bool(kwargs.get("materialize", False)),
+            }
+        )
+        idx = len(calls)
+        digest = "seed-micro" if idx == 1 else "slower-micro"
+        latency = 100.0 if idx == 1 else 150.0
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": latency,
+            "objective_cost_usec": latency,
+            "bootstrap_count": 2.0,
+            "rescale_count": 3.0,
+            "sampled_selected_path_digest": digest,
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
+
+    discovery = oe_backend._run_strategy_discovery_prepass(
+        tmp_path,
+        context,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        params,
+        [task],
+        200.0,
+        eval_timeout_sec=10,
+        total_timeout_sec=30,
+        started_at=time.monotonic(),
+    )
+
+    assert len(calls) == 2
+    assert all(item["budget_count"] == 1 for item in calls)
+    assert discovery["records"][0]["reason"] == "micro_probe_changed_slower"
+    assert discovery["records"][0]["path_differential"]["selected_path_changed"] is True
+    assert discovery["summary"]["path_moving_count"] == 1
+    assert discovery["summary"]["latency_improved_count"] == 0
+    assert discovery["path_moving_codes"]
+
+
 def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)
@@ -8135,6 +8377,22 @@ def test_dp_promotion_rejects_seed_equivalent_without_materialization(
             "summary": {"latency_improved_count": 0, "path_moving_count": 0},
         },
     )
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda context, initial_hints, params, selected, reference, timeout_sec=0: (
+            selected,
+            100.0,
+            {
+                "valid": True,
+                "sampled_dp_latency_usec": 100.0,
+                "sampled_selected_path_digest": "seed",
+                "bootstrap_count": 0.0,
+                "rescale_count": 0.0,
+                "diagnostics": {"selected_source_counts": {"seed:qbp_dp": 1}},
+            },
+        ),
+    )
     calls = []
 
     def fake_dp_probe(*_args, **_kwargs):
@@ -8190,6 +8448,134 @@ def test_dp_promotion_rejects_seed_equivalent_without_materialization(
     assert summary["qbp_engine"] == "dp"
     assert summary["records"][0]["reason"] == "dp_seed_equivalent"
     assert (tmp_path / "sampled_promotion" / "dp_probe_summary.json").is_file()
+
+
+def test_dp_promotion_rejects_slower_changed_probe_without_materialization(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_toy_pdag(params), params)
+    task_context = build_context(
+        _toy_pdag(params),
+        [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}],
+        params,
+    )
+    task_context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": task_context,
+            "seed_metrics": {
+                "selected_path_digest": "seed",
+                "sampled_dp_latency_usec": 100.0,
+                "bootstrap_count": 0.0,
+                "rescale_count": 0.0,
+            },
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'strategy': 'bootstrap_mcts', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "skip_policy_digests": set(),
+            "examples": [],
+            "summary": {"latency_improved_count": 0, "path_moving_count": 0},
+        },
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda context, initial_hints, params, selected, reference, timeout_sec=0: (
+            selected,
+            100.0,
+            {
+                "valid": True,
+                "sampled_dp_latency_usec": 100.0,
+                "sampled_selected_path_digest": "seed",
+                "bootstrap_count": 0.0,
+                "rescale_count": 0.0,
+                "diagnostics": {"selected_source_counts": {"seed:qbp_dp": 1}},
+            },
+        ),
+    )
+    calls = []
+
+    def fake_dp_probe(*_args, **kwargs):
+        calls.append(bool(kwargs.get("materialize", False)))
+        if kwargs.get("materialize", False):
+            raise AssertionError("slower DP probe should not materialize")
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 110.0,
+            "objective_cost_usec": 110.0,
+            "bootstrap_count": 0.0,
+            "rescale_count": 0.0,
+            "sampled_selected_path_digest": "changed-slower",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "candidate_solved_boundary_groups": 1,
+                "selected_source_counts": {"candidate:qbp_dp": 1},
+                "sampled_task_metrics": [
+                    {
+                        "selected_path_digest": "changed-slower",
+                        "sampled_dp_latency_usec": 110.0,
+                        "bootstrap_count": 0.0,
+                        "rescale_count": 0.0,
+                        "boundary_group_count": 1,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fake_dp_probe)
+    monkeypatch.setattr(
+        oe_backend,
+        "_evaluate_sampled_budget_tasks_for_promotion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("slower DP probe should not run sampled replay")
+        ),
+    )
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+
+    assert selected is None
+    assert calls
+    assert all(call is False for call in calls)
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["records"][0]["reason"] == "dp_changed_slower"
 
 
 def test_dp_promotion_selects_materialized_latency_improvement(

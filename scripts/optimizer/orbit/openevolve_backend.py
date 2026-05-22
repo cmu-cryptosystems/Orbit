@@ -12658,6 +12658,8 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             "transition_misses": 0,
             "output_state_hits": 0,
             "output_state_misses": 0,
+            "incoming_option_hits": 0,
+            "incoming_option_misses": 0,
             "online_prune_count": 0,
             "seed_anchor_injected_states": 0,
             "seed_neighborhood_candidate_states": 0,
@@ -15318,6 +15320,8 @@ def _qbp_dp_cache_stats(hints: dict[str, Any]) -> dict[str, int]:
             "transition_misses": 0,
             "output_state_hits": 0,
             "output_state_misses": 0,
+            "incoming_option_hits": 0,
+            "incoming_option_misses": 0,
             "online_prune_count": 0,
             "seed_anchor_injected_states": 0,
             "seed_neighborhood_candidate_states": 0,
@@ -15649,12 +15653,14 @@ def _qbp_dp_prune_states(
         selected.append(state)
         selected_keys.add(key)
 
+    protected_sources = {
+        "candidate_seed_exact",
+        "candidate_seed_neighborhood",
+        "candidate_seed_output_splice",
+        "reference_seed_bridge",
+    }
     for state in unique:
-        if str(getattr(state, "source", "")) in {
-            "candidate_seed_exact",
-            "candidate_seed_neighborhood",
-            "candidate_seed_output_splice",
-        }:
+        if str(getattr(state, "source", "")) in protected_sources:
             add_state(state)
 
     for bucket in buckets.values():
@@ -15665,12 +15671,37 @@ def _qbp_dp_prune_states(
     high_scale = max(unique, key=lambda item: (int(item.scale), -float(item.cost), int(item.level)))
     add_state(high_level)
     add_state(high_scale)
+    protected_keys = {_qbp_dp_state_key(state) for state in selected}
 
     for state in unique:
         if len(selected) >= global_cap:
             break
         add_state(state)
-    return sorted(selected, key=_qbp_dp_state_select_key)[:global_cap]
+    ordered = sorted(selected, key=_qbp_dp_state_select_key)
+    if len(ordered) <= global_cap:
+        return ordered
+    kept = ordered[:global_cap]
+    kept_keys = {_qbp_dp_state_key(state) for state in kept}
+    missing_protected = [
+        state
+        for state in selected
+        if _qbp_dp_state_key(state) in protected_keys
+        and _qbp_dp_state_key(state) not in kept_keys
+    ]
+    for state in sorted(missing_protected, key=_qbp_dp_state_select_key):
+        if not kept:
+            kept.append(state)
+            continue
+        replaced = False
+        for idx in range(len(kept) - 1, -1, -1):
+            if str(getattr(kept[idx], "source", "")) not in protected_sources:
+                kept[idx] = state
+                replaced = True
+                break
+        if not replaced and len(kept) < global_cap:
+            kept.append(state)
+        kept_keys = {_qbp_dp_state_key(item) for item in kept}
+    return sorted(kept, key=_qbp_dp_state_select_key)[:global_cap]
 
 
 def _qbp_dp_main_qbp_choices(io_budget: dict[str, Any]) -> list[tuple[tuple[int, int] | None, float]]:
@@ -15874,6 +15905,25 @@ def _qbp_dp_output_states_cached(
     return output_cache[key]
 
 
+def _qbp_dp_incoming_policy_cache_key(policy: dict[str, Any], params: Params) -> str:
+    payload = {
+        key: policy.get(key)
+        for key in (
+            "scale_lattice",
+            "max_scale_candidates",
+            "max_scale",
+            "scale_floor_bits",
+            "boundary_scale_policy",
+            "preferred_boundary_scale",
+            "preferred_output_scale",
+        )
+        if key in policy
+    }
+    payload.setdefault("default_max_scale", _max_scale(params))
+    payload.setdefault("default_scale_candidates", 32)
+    return _hint_digest(payload)
+
+
 def _qbp_dp_incoming_options(
     tdag: Tdag,
     node: str,
@@ -15967,6 +16017,82 @@ def _qbp_dp_incoming_options(
                 if lower <= node_scale <= max_scale:
                     options.append((node_scale, {p0: int(s0), p1: int(s1)}, node_scale))
     return options
+
+
+def _qbp_dp_incoming_options_cached(
+    tdag: Tdag,
+    node: str,
+    pred_states: list[tuple[str, _QBPDPState]],
+    params: Params,
+    policy: dict[str, Any],
+    node_scale_hint: int | None,
+    edge_scale_hints: dict[str, int],
+    extra_input_scales: list[int] | None,
+    extra_edge_scales: dict[str, int] | None,
+    hints: dict[str, Any],
+) -> list[tuple[int, dict[str, int], int]]:
+    cache = _qbp_dp_internal_cache(hints)
+    stats = _qbp_dp_cache_stats(hints)
+    incoming_cache = cache.setdefault("incoming_options", {})
+    key = (
+        str(node),
+        tuple(
+            (
+                str(pred),
+                int(state.level),
+                int(state.scale),
+                str(tdag.nodes[pred].get("op", "")),
+            )
+            for pred, state in pred_states
+        ),
+        int(node_scale_hint) if node_scale_hint is not None else None,
+        tuple(sorted((str(k), int(v)) for k, v in edge_scale_hints.items())),
+        tuple(sorted(int(value) for value in (extra_input_scales or []))),
+        tuple(sorted((str(k), int(v)) for k, v in dict(extra_edge_scales or {}).items())),
+        _qbp_dp_incoming_policy_cache_key(policy, params),
+    )
+    if key in incoming_cache:
+        stats["incoming_option_hits"] = int(stats.get("incoming_option_hits", 0) or 0) + 1
+        pred_name_map = {str(pred): pred for pred, _state in pred_states}
+        return [
+            (
+                int(input_scale),
+                {
+                    pred_name_map.get(str(pred), str(pred)): int(scale)
+                    for pred, scale in dict(edge_scales).items()
+                },
+                int(node_scale),
+            )
+            for input_scale, edge_scales, node_scale in incoming_cache[key]
+        ]
+    stats["incoming_option_misses"] = int(stats.get("incoming_option_misses", 0) or 0) + 1
+    options = _qbp_dp_incoming_options(
+        tdag,
+        node,
+        pred_states,
+        params,
+        policy,
+        node_scale_hint,
+        edge_scale_hints,
+        extra_input_scales,
+        extra_edge_scales,
+    )
+    incoming_cache[key] = [
+        (int(input_scale), {str(pred): int(scale) for pred, scale in edge_scales.items()}, int(node_scale))
+        for input_scale, edge_scales, node_scale in options
+    ]
+    pred_name_map = {str(pred): pred for pred, _state in pred_states}
+    return [
+        (
+            int(input_scale),
+            {
+                pred_name_map.get(str(pred), str(pred)): int(scale)
+                for pred, scale in dict(edge_scales).items()
+            },
+            int(node_scale),
+        )
+        for input_scale, edge_scales, node_scale in incoming_cache[key]
+    ]
 
 
 def _qbp_dp_add_assignment_for_transition(
@@ -16706,7 +16832,7 @@ def _qbp_dp_node_states(
             break
         combo_count += 1
         pred_states = list(zip(preds, combo))
-        incoming_options = _qbp_dp_incoming_options(
+        incoming_options = _qbp_dp_incoming_options_cached(
             tdag,
             node,
             pred_states,
@@ -16716,6 +16842,7 @@ def _qbp_dp_node_states(
             edge_scale_hints,
             seed_input_scales,
             seed_edge_targets,
+            hints,
         )
         unique_options: dict[tuple[int, tuple[tuple[str, int], ...], int], tuple[int, dict[str, int], int]] = {}
         for input_scale, edge_scales, node_scale in incoming_options:

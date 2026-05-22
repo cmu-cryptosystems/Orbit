@@ -7356,11 +7356,38 @@ def test_qbp_dp_transition_and_output_state_caches(toy_cost_json: str):
         hints,
         [40],
     )
+    pred_states = [("arg0", oe_backend._QBPDPState(16, 40, 0.0, 0.0, 0.0))]
+    incoming_first = oe_backend._qbp_dp_incoming_options_cached(
+        graph,
+        "0",
+        pred_states,
+        params,
+        policy,
+        None,
+        {},
+        [40],
+        {},
+        hints,
+    )
+    incoming_second = oe_backend._qbp_dp_incoming_options_cached(
+        graph,
+        "0",
+        pred_states,
+        params,
+        policy,
+        None,
+        {},
+        [40],
+        {},
+        hints,
+    )
 
     assert states_first == states_second
+    assert incoming_first == incoming_second
     stats = oe_backend._qbp_dp_cache_stats(hints)
     assert stats["transition_hits"] >= 1
     assert stats["output_state_hits"] >= 1
+    assert stats["incoming_option_hits"] >= 1
 
 
 def test_qbp_dp_bucketed_prune_preserves_high_boundary_state(toy_cost_json: str):

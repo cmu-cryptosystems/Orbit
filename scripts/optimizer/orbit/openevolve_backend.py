@@ -11338,7 +11338,6 @@ def _strategy_discovery_program_source(label: str, hints: dict[str, Any]) -> str
 
 
 def _bounded_retry_probe_hints(hints: dict[str, Any]) -> dict[str, Any]:
-    retry = deepcopy(hints)
     tight = {
         "max_scale_candidates": 24,
         "state_cap_per_node": 16,
@@ -11356,7 +11355,15 @@ def _bounded_retry_probe_hints(hints: dict[str, Any]) -> dict[str, Any]:
                 updated[key] = min(limit, _int_hint(updated.get(key), limit))
         return updated
 
-    retry = clamp_policy(retry)
+    def recursive_clamp(value: Any) -> Any:
+        if isinstance(value, dict):
+            updated = clamp_policy(value)
+            return {key: recursive_clamp(child) for key, child in updated.items()}
+        if isinstance(value, list):
+            return [recursive_clamp(item) for item in value]
+        return value
+
+    retry = recursive_clamp(deepcopy(hints))
     retry["mcts_action_allowlist"] = list(retry.get("mcts_action_allowlist", []) or [])[:2]
     retry["mcts_action_cap"] = min(2, max(1, len(retry["mcts_action_allowlist"]) or 1))
     if isinstance(retry.get("mcts_action_presets"), dict):

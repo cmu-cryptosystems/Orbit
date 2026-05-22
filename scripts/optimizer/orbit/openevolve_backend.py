@@ -2522,6 +2522,21 @@ def _merge_cached_compile_context(
         harness["sampled_seed_baseline"] = dict(sampled_seed)
     if cached.get("sampled_budget_tasks") and params.openevolve_eval_suite != "polybert-full":
         context["sampled_budget_tasks"] = cached["sampled_budget_tasks"]
+        metrics = None
+        if isinstance(cached_harness.get("sampled_task_seed_metrics"), list):
+            metrics = cached_harness.get("sampled_task_seed_metrics")
+        elif isinstance(sampled_seed, dict) and isinstance(
+            sampled_seed.get("sampled_task_seed_metrics"), list
+        ):
+            metrics = sampled_seed.get("sampled_task_seed_metrics")
+        elif isinstance(reference.get("sampled_task_seed_metrics"), list):
+            metrics = reference.get("sampled_task_seed_metrics")
+        if isinstance(metrics, list):
+            harness["sampled_task_seed_metrics"] = deepcopy(metrics)
+            _annotate_sampled_budget_tasks_with_seed_metrics(
+                context["sampled_budget_tasks"],
+                harness["sampled_task_seed_metrics"],
+            )
     if isinstance(cached.get("placement_profile"), list):
         context["placement_profile"] = cached["placement_profile"]
     if isinstance(cached.get("unit_hotspots"), list):
@@ -2531,6 +2546,56 @@ def _merge_cached_compile_context(
             harness[key] = deepcopy(cached_harness[key])
         elif isinstance(sampled_seed, dict) and key in sampled_seed:
             harness[key] = deepcopy(sampled_seed[key])
+    if isinstance(harness.get("sampled_task_seed_metrics"), list):
+        harness["top_costly_boundary_groups"] = _top_costly_boundary_groups_from_task_metrics(
+            harness["sampled_task_seed_metrics"]
+        )
+
+
+def _ensure_sampled_seed_metadata(
+    context: dict[str, Any],
+    initial_hints: dict[str, Any],
+    params: Params,
+) -> bool:
+    if params.openevolve_eval_suite == "polybert-full":
+        return False
+    if not context.get("sampled_budget_tasks"):
+        return False
+    harness = context.setdefault("harness", {})
+    metrics = harness.get("sampled_task_seed_metrics")
+    if isinstance(metrics, list) and metrics:
+        _annotate_sampled_budget_tasks_with_seed_metrics(
+            context["sampled_budget_tasks"], metrics
+        )
+        if "top_costly_boundary_groups" not in harness:
+            harness["top_costly_boundary_groups"] = _top_costly_boundary_groups_from_task_metrics(
+                metrics
+            )
+        return False
+    sampled_reference = _evaluate_sampled_budget_tasks(
+        context,
+        _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
+        suppress_output=True,
+    )
+    sampled_baseline = _placement_baseline_from_result(sampled_reference)
+    sampled_baseline["source"] = "sampled_seed_metadata"
+    sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
+    harness["sampled_seed_baseline"] = sampled_baseline
+    harness["seed_baseline"] = dict(sampled_baseline)
+    metrics = list(sampled_baseline.get("sampled_task_seed_metrics", []) or [])
+    if metrics:
+        harness["sampled_task_seed_metrics"] = metrics
+        _annotate_sampled_budget_tasks_with_seed_metrics(
+            context["sampled_budget_tasks"], metrics
+        )
+        harness["top_costly_boundary_groups"] = _top_costly_boundary_groups_from_task_metrics(
+            metrics
+        )
+    harness["unsolved_boundary_groups"] = dict(
+        sampled_baseline.get("unsolved_boundary_groups", {}) or {}
+    )
+    context["reference"] = dict(sampled_baseline)
+    return True
 
 
 def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> dict[str, Any]:
@@ -2633,6 +2698,8 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         _merge_cached_compile_context(context, cached_context, params)
         _set_context_cache_paths(context, params, stable_context_path)
         record_harness_timing("merge_cached_context")
+        if _ensure_sampled_seed_metadata(context, initial_hints, params):
+            record_harness_timing("sampled_seed_metadata")
     else:
         print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
         context_collection_hints = _context_collection_seed_hints(initial_hints, params)
@@ -2670,6 +2737,14 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
                 sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
                 harness = context.setdefault("harness", {})
                 harness["sampled_seed_baseline"] = sampled_baseline
+                if sampled_baseline.get("sampled_task_seed_metrics"):
+                    harness["sampled_task_seed_metrics"] = list(
+                        sampled_baseline.get("sampled_task_seed_metrics", [])
+                    )
+                    _annotate_sampled_budget_tasks_with_seed_metrics(
+                        context["sampled_budget_tasks"],
+                        harness["sampled_task_seed_metrics"],
+                    )
                 harness["top_costly_boundary_groups"] = list(
                     sampled_baseline.get("top_costly_boundary_groups", []) or []
                 )[:8]
@@ -5011,6 +5086,181 @@ def _sampled_task_group_keys(task: dict[str, Any]) -> set[str]:
     return {_boundary_group_key_string(key) for key in grouped}
 
 
+def _sampled_task_metric_summary(
+    *,
+    task_position: int,
+    task: dict[str, Any],
+    diagnostics: dict[str, Any],
+    costs: list[float],
+) -> dict[str, Any]:
+    boundary_groups = [
+        item
+        for item in diagnostics.get("boundary_group_summaries", []) or []
+        if isinstance(item, dict)
+    ]
+    group_summary = _boundary_group_count_summary(boundary_groups)
+    path_proxy = _sampled_path_proxy_from_boundary_groups(boundary_groups, costs)
+    scored_groups = _scored_boundary_group_count(diagnostics)
+    unsolved = _boundary_group_unsolved_summary(boundary_groups)
+    top_costly = _boundary_group_top_cost_summary(boundary_groups, limit=8)
+    return {
+        "task_position": int(task_position),
+        "task_index": _safe_int(task.get("index"), task_position),
+        "kind": str(task.get("kind", "normal")),
+        "group_keys": list(task.get("group_keys", []) or []),
+        "requested_budgets": int(diagnostics.get("requested_budgets", 0) or 0),
+        "solved_budgets": int(diagnostics.get("solved_budgets", 0) or 0),
+        "requested_boundary_groups": int(
+            diagnostics.get("requested_boundary_groups", 0) or 0
+        ),
+        "reachable_boundary_groups": int(scored_groups),
+        "solved_boundary_groups": int(diagnostics.get("solved_boundary_groups", 0) or 0),
+        "candidate_solved_boundary_groups": int(
+            diagnostics.get("candidate_solved_boundary_groups", 0) or 0
+        ),
+        "fallback_selected_groups": int(
+            diagnostics.get("fallback_selected_boundary_groups", 0) or 0
+        ),
+        "invalid_boundary_groups": int(diagnostics.get("invalid_boundary_groups", 0) or 0),
+        "unreachable_boundary_groups": int(
+            diagnostics.get("unreachable_boundary_groups", 0) or 0
+        ),
+        "sampled_dp_latency_usec": float(path_proxy["sampled_dp_latency_usec"]),
+        "total_frontier_cost_usec": float(group_summary["frontier_total_cost_usec"]),
+        "bootstrap_count": float(group_summary["frontier_total_bootstrap"]),
+        "rescale_count": float(group_summary["frontier_total_rescale"]),
+        "avg_bootstrap": float(group_summary["frontier_bootstrap"]),
+        "avg_rescale": float(group_summary["frontier_rescale"]),
+        "selected_path_digest": str(path_proxy["sampled_selected_path_digest"]),
+        "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
+        "top_costly_boundary_groups": top_costly,
+        "unsolved_boundary_groups": unsolved,
+    }
+
+
+def _sampled_task_metrics_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics = result.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        metrics = diagnostics.get("sampled_task_metrics")
+        if isinstance(metrics, list):
+            return [item for item in metrics if isinstance(item, dict)]
+    metrics = result.get("sampled_task_seed_metrics")
+    if isinstance(metrics, list):
+        return [item for item in metrics if isinstance(item, dict)]
+    return []
+
+
+def _top_costly_boundary_groups_from_task_metrics(
+    metrics: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for metric in metrics:
+        task_position = _safe_int(metric.get("task_position"), -1)
+        task_index = _safe_int(metric.get("task_index"), task_position)
+        for item in metric.get("top_costly_boundary_groups", []) or []:
+            if not isinstance(item, dict):
+                continue
+            updated = dict(item)
+            updated["task_position"] = task_position
+            updated["task_index"] = task_index
+            groups.append(updated)
+    groups.sort(
+        key=lambda item: (
+            _finite_float(item.get("min_cost_usec"), 0.0),
+            _finite_float(item.get("max_cost_usec"), 0.0),
+        ),
+        reverse=True,
+    )
+    return groups[: max(0, int(limit))]
+
+
+def _annotate_sampled_budget_tasks_with_seed_metrics(
+    tasks: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+) -> None:
+    by_position = {
+        _safe_int(item.get("task_position"), -1): item
+        for item in metrics
+        if isinstance(item, dict)
+    }
+    by_index = {
+        _safe_int(item.get("task_index"), -1): item
+        for item in metrics
+        if isinstance(item, dict)
+    }
+    for position, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        task_index = _safe_int(task.get("index"), position)
+        metric = by_position.get(position) or by_index.get(task_index)
+        if metric is not None:
+            task["seed_metrics"] = metric
+
+
+def _task_seed_metric_latency(metric: dict[str, Any]) -> float:
+    for key in ("sampled_dp_latency_usec", "objective_cost_usec", "total_frontier_cost_usec"):
+        value = _finite_float(metric.get(key), float("inf"))
+        if math.isfinite(value) and value > 0:
+            return float(value)
+    return float("inf")
+
+
+def _promotion_probe_tasks_from_seed_metrics(
+    context: dict[str, Any],
+) -> tuple[list[dict[str, Any]], float] | None:
+    tasks = [
+        task
+        for task in context.get("sampled_budget_tasks", []) or []
+        if isinstance(task, dict) and isinstance(task.get("context"), dict)
+    ]
+    if not tasks:
+        return None
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    metrics = harness.get("sampled_task_seed_metrics")
+    if not isinstance(metrics, list):
+        reference = context.get("reference", {})
+        if isinstance(reference, dict):
+            metrics = reference.get("sampled_task_seed_metrics")
+    if not isinstance(metrics, list):
+        return None
+    usable = [
+        item
+        for item in metrics
+        if isinstance(item, dict) and math.isfinite(_task_seed_metric_latency(item))
+    ]
+    if not usable:
+        return None
+    usable.sort(key=_task_seed_metric_latency, reverse=True)
+    selected: list[dict[str, Any]] = []
+    selected_cost = 0.0
+    seen_positions: set[int] = set()
+    limit = _promotion_probe_limit()
+    for metric in usable:
+        position = _safe_int(metric.get("task_position"), -1)
+        task_index = _safe_int(metric.get("task_index"), position)
+        if position < 0 or position >= len(tasks):
+            position = next(
+                (
+                    idx
+                    for idx, task in enumerate(tasks)
+                    if _safe_int(task.get("index"), idx) == task_index
+                ),
+                -1,
+            )
+        if position < 0 or position >= len(tasks) or position in seen_positions:
+            continue
+        selected.append(tasks[position])
+        seen_positions.add(position)
+        selected_cost += _task_seed_metric_latency(metric)
+        if len(selected) >= limit:
+            break
+    if not selected or selected_cost <= 0:
+        return None
+    return selected, float(selected_cost)
+
+
 def _experience_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
     tasks = [
         task
@@ -6461,6 +6711,7 @@ def _sampled_progress_compile_result(
         "rescale_locations": locations["rescale"],
         "bottleneck_summary": _bottleneck_summary(locations),
         "diagnostics": diagnostics,
+        "sampled_task_seed_metrics": list(diagnostics.get("sampled_task_metrics", [])),
         "sampled_budget_tasks": sampled_budget_tasks or [],
         "log_tail": log_buffer.getvalue()[-3000:],
     }
@@ -6770,6 +7021,7 @@ def _evaluate_sampled_budget_tasks(
         "mcts_action_invalid_counts": {},
         "mcts_action_duplicate_skips": {},
         "boundary_group_summaries": [],
+        "sampled_task_metrics": [],
         "sampled_task_count": 0,
         "sampled_task_cache_hits": 0,
         "sampled_task_cache_misses": 0,
@@ -6835,17 +7087,25 @@ def _evaluate_sampled_budget_tasks(
                 raw_results = [_run_sampled_task_payload(payload) for payload in payloads]
             task_results = [decode_task_payload(payload) for payload in raw_results]
             total["sampled_task_parallelism"] = workers
-            for (
+            for task_position, (task, (
                 task_context,
                 task_tdag,
                 task_params,
                 task_diag,
                 task_assignments,
                 task_costs,
-            ) in task_results:
+            )) in enumerate(zip(tasks, task_results)):
                 if not task_diag:
                     continue
                 total["sampled_task_count"] += 1
+                total["sampled_task_metrics"].append(
+                    _sampled_task_metric_summary(
+                        task_position=task_position,
+                        task=task,
+                        diagnostics=task_diag,
+                        costs=task_costs,
+                    )
+                )
                 task_timing = task_diag.get("sampled_task_timing_sec", {})
                 if isinstance(task_timing, dict):
                     normalized_timing = {
@@ -7046,6 +7306,7 @@ def _evaluate_sampled_budget_tasks(
             "rescale_locations": locations["rescale"],
             "bottleneck_summary": _bottleneck_summary(locations),
             "diagnostics": total,
+            "sampled_task_seed_metrics": list(total.get("sampled_task_metrics", [])),
             "sampled_budget_tasks": [],
             "log_tail": log_buffer.getvalue()[-3000:],
         }
@@ -7139,6 +7400,7 @@ def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
         diagnostics = {}
     scored_groups = _scored_boundary_group_count(diagnostics)
     boundary_group_summaries = diagnostics.get("boundary_group_summaries", [])
+    sampled_task_metrics = _sampled_task_metrics_from_result(result)
     return {
         "valid": bool(result.get("valid", False)),
         "final_latency_usec": _finite_float(result.get("final_latency_usec"), float("inf")),
@@ -7186,7 +7448,9 @@ def _placement_baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "top_costly_boundary_groups": _boundary_group_top_cost_summary(
             boundary_group_summaries
-        ),
+        )
+        or _top_costly_boundary_groups_from_task_metrics(sampled_task_metrics),
+        "sampled_task_seed_metrics": sampled_task_metrics,
     }
 
 
@@ -10262,6 +10526,9 @@ def _promotion_probe_limit() -> int:
 
 
 def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
+    from_metrics = _promotion_probe_tasks_from_seed_metrics(context)
+    if from_metrics is not None:
+        return from_metrics
     old_value = os.environ.get("ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS")
     os.environ["ORBIT_OPENEVOLVE_EXPERIENCE_PROBE_TASKS"] = str(_promotion_probe_limit())
     try:
@@ -10401,6 +10668,33 @@ def _promotion_record_summary(
     }
 
 
+def _promotion_effective_probe_digest(result: dict[str, Any]) -> str:
+    diagnostics = result.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return _hint_digest(
+        {
+            "selected_path_digest": str(result.get("sampled_selected_path_digest", "")),
+            "candidate_qbp_coverage": _digest_float(
+                _finite_float(result.get("candidate_qbp_coverage"), 0.0)
+            ),
+            "boundary_group_validity": _digest_float(
+                _finite_float(result.get("boundary_group_validity"), 0.0)
+            ),
+            "latency_usec": _digest_float(_promotion_latency(result)),
+            "bootstrap_count": _digest_float(
+                _finite_float(result.get("bootstrap_count"), 0.0)
+            ),
+            "rescale_count": _digest_float(
+                _finite_float(result.get("rescale_count"), 0.0)
+            ),
+            "selected_source_counts": dict(
+                diagnostics.get("selected_source_counts", {}) or {}
+            ),
+        }
+    )
+
+
 def _promotion_complexity_reasons(hints: dict[str, Any]) -> list[str]:
     limits = _sampled_policy_limits(False)
     max_seen = {key: 0 for key in limits}
@@ -10436,24 +10730,24 @@ def _promotion_complexity_reasons(hints: dict[str, Any]) -> list[str]:
 
 def _promotion_probe_limits() -> dict[str, int]:
     return {
-        "max_scale_candidates": 16,
-        "state_cap_per_node": 8,
-        "beam_width": 4,
-        "boundary_state_cap": 4,
-        "mcts_rollout_budget": 3,
-        "mcts_action_cap": 2,
-        "mcts_max_repair_bootstraps": 8,
+        "max_scale_candidates": 48,
+        "state_cap_per_node": 32,
+        "beam_width": 8,
+        "boundary_state_cap": 8,
+        "mcts_rollout_budget": 6,
+        "mcts_action_cap": 3,
+        "mcts_max_repair_bootstraps": 12,
     }
 
 
 def _clamp_promotion_probe_patch(policy: dict[str, Any]) -> dict[str, Any]:
     clamped = dict(policy)
     defaults = {
-        "max_scale_candidates": 16,
-        "state_cap_per_node": 8,
-        "beam_width": 4,
-        "boundary_state_cap": 4,
-        "mcts_rollout_budget": 3,
+        "max_scale_candidates": 32,
+        "state_cap_per_node": 24,
+        "beam_width": 6,
+        "boundary_state_cap": 6,
+        "mcts_rollout_budget": 4,
         "mcts_action_cap": 2,
         "mcts_max_repair_bootstraps": 8,
     }
@@ -10482,7 +10776,18 @@ def _clamp_promotion_probe_items(value: Any) -> Any:
 
 
 def _clamp_promotion_probe_presets(value: Any) -> Any:
-    allowed = {"budget_fulfillment_beam", "wide_boundary_cost_beam"}
+    allowed = {
+        "budget_fulfillment_beam",
+        "wide_boundary_cost_beam",
+        "dense_boundary_cost_beam",
+        "reference_boundary_cost_beam",
+        "nonlinear_phase_boundary_beam",
+        "profile_waterline_repair",
+        "tuneinsight_avgcase_cost_beam",
+        "tuneinsight_deferred_bootstrap_beam",
+        "component_budget_repair",
+        "latency_mcts_repair",
+    }
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for name, preset in value.items():
@@ -10506,6 +10811,54 @@ def _clamp_promotion_probe_presets(value: Any) -> Any:
             if isinstance(item, dict) and str(item.get("name", "")) in allowed
         ]
     return value
+
+
+def _promotion_probe_action_names(hints: dict[str, Any], limit: int = 3) -> list[str]:
+    scored: list[tuple[float, int, str]] = []
+    raw_actions = hints.get("mcts_actions")
+    if isinstance(raw_actions, list):
+        for idx, item in enumerate(raw_actions):
+            if not isinstance(item, dict) or item.get("name") is None:
+                continue
+            scored.append(
+                (
+                    _finite_float(item.get("prior"), 0.0),
+                    -idx,
+                    str(item.get("name")),
+                )
+            )
+    presets = hints.get("mcts_action_presets")
+    if isinstance(presets, dict):
+        for idx, (name, item) in enumerate(presets.items()):
+            prior = (
+                _finite_float(item.get("prior"), 0.0)
+                if isinstance(item, dict)
+                else 0.0
+            )
+            scored.append((prior, -idx, str(name)))
+    elif isinstance(presets, list):
+        for idx, item in enumerate(presets):
+            if not isinstance(item, dict) or item.get("name") is None:
+                continue
+            scored.append(
+                (
+                    _finite_float(item.get("prior"), 0.0),
+                    -idx,
+                    str(item.get("name")),
+                )
+            )
+    seen: set[str] = set()
+    names: list[str] = []
+    for _prior, _idx, name in sorted(scored, reverse=True):
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if len(names) >= limit:
+            break
+    if not names:
+        names = ["budget_fulfillment_beam", "wide_boundary_cost_beam"]
+    return names
 
 
 def _boundary_group_selector_matches_sampled_tasks(
@@ -10544,18 +10897,24 @@ def _promotion_probe_hints(
     probe.pop("portfolio", None)
     probe["allow_seed_fallback"] = True
     probe["budget_aggressive"] = False
-    probe["mcts_action_allowlist"] = ["budget_fulfillment_beam", "wide_boundary_cost_beam"]
-    probe["mcts_action_cap"] = 2
-    probe["mcts_rollout_budget"] = 3
-    probe["mcts_max_repair_bootstraps"] = min(
-        8,
-        _int_hint(probe.get("mcts_max_repair_bootstraps"), 8),
-    )
-    probe = _clamp_promotion_probe_patch(probe)
     probe["mcts_action_presets"] = _clamp_promotion_probe_presets(
         probe.get("mcts_action_presets")
     )
     probe["mcts_actions"] = _clamp_promotion_probe_items(probe.get("mcts_actions"))
+    probe["mcts_action_allowlist"] = _promotion_probe_action_names(probe, limit=3)
+    probe["mcts_action_cap"] = min(
+        3,
+        max(
+            len(probe["mcts_action_allowlist"]),
+            _int_hint(probe.get("mcts_action_cap"), 2),
+        ),
+    )
+    probe["mcts_rollout_budget"] = min(6, max(3, _int_hint(probe.get("mcts_rollout_budget"), 3)))
+    probe["mcts_max_repair_bootstraps"] = min(
+        12,
+        _int_hint(probe.get("mcts_max_repair_bootstraps"), 8),
+    )
+    probe = _clamp_promotion_probe_patch(probe)
     policies = []
     for item in probe.get("boundary_group_policies", []) or []:
         if not isinstance(item, dict):
@@ -10728,10 +11087,16 @@ def _run_sampled_promotion_pass(
         return None
 
     full_reference_cost = _promotion_reference_latency(context)
-    codes = _discover_finalist_codes(output_dir, best_code, limit)
+    discovery_limit = min(128, max(limit, limit * 4))
+    codes = _discover_finalist_codes(output_dir, best_code, discovery_limit)
     records: list[dict[str, Any]] = []
     best: tuple[float, float, float, int, dict[str, Any], dict[str, Any], str] | None = None
     seen: set[str] = set()
+    seen_policy_digests: set[str] = set()
+    seen_effective_digests: set[str] = set()
+    duplicate_policy_count = 0
+    duplicate_effective_count = 0
+    probe_evaluated_count = 0
     timed_out = False
 
     _write_promotion_progress(
@@ -10740,12 +11105,14 @@ def _run_sampled_promotion_pass(
         timeout_sec=timeout_sec,
         current_stage="start",
         current_index=None,
-        total_candidates=len(codes),
-        records=records,
-        selected=False,
+            total_candidates=min(limit, len(codes)),
+            records=records,
+            selected=False,
     )
 
     for index, code in enumerate(codes):
+        if len(seen_effective_digests) >= limit:
+            break
         if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
             timed_out = True
             records.append(
@@ -10771,7 +11138,7 @@ def _run_sampled_promotion_pass(
             timeout_sec=timeout_sec,
             current_stage="static",
             current_index=index,
-            total_candidates=len(codes),
+            total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
@@ -10792,7 +11159,7 @@ def _run_sampled_promotion_pass(
                 timeout_sec=timeout_sec,
                 current_stage="static_rejected",
                 current_index=index,
-                total_candidates=len(codes),
+                total_candidates=min(limit, len(codes)),
                 records=records,
                 selected=best is not None,
             )
@@ -10814,7 +11181,7 @@ def _run_sampled_promotion_pass(
                 timeout_sec=timeout_sec,
                 current_stage="static_rejected",
                 current_index=index,
-                total_candidates=len(codes),
+                total_candidates=min(limit, len(codes)),
                 records=records,
                 selected=best is not None,
             )
@@ -10838,12 +11205,37 @@ def _run_sampled_promotion_pass(
                 timeout_sec=timeout_sec,
                 current_stage="static_rejected",
                 current_index=index,
-                total_candidates=len(codes),
+                total_candidates=min(limit, len(codes)),
                 records=records,
                 selected=best is not None,
             )
             continue
         probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
+        policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
+        if policy_digest in seen_policy_digests:
+            duplicate_policy_count += 1
+            records.append(
+                _promotion_record_summary(
+                    index=index,
+                    stage="static",
+                    hints=probe_hints,
+                    reason="duplicate_probe_policy_digest",
+                    code_digest=code_digest,
+                )
+            )
+            _write_promotion_progress(
+                promotion_dir,
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                current_stage="static_rejected",
+                current_index=index,
+                total_candidates=min(limit, len(codes)),
+                records=records,
+                selected=best is not None,
+            )
+            continue
+        seen_policy_digests.add(policy_digest)
+        probe_evaluated_count += 1
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True
@@ -10858,7 +11250,7 @@ def _run_sampled_promotion_pass(
             timeout_sec=timeout_sec,
             current_stage="probe_qbp",
             current_index=index,
-            total_candidates=len(codes),
+            total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
@@ -10878,6 +11270,9 @@ def _run_sampled_promotion_pass(
         )
         probe_record["reference_latency_usec"] = probe_reference_cost
         probe_record["full_policy_summary"] = _compact_policy_summary(eval_hints)
+        probe_record["probe_policy_digest"] = policy_digest
+        effective_digest = _promotion_effective_probe_digest(probe_result)
+        probe_record["probe_effective_digest"] = effective_digest
         records.append(probe_record)
         _write_promotion_progress(
             promotion_dir,
@@ -10885,13 +11280,18 @@ def _run_sampled_promotion_pass(
             timeout_sec=timeout_sec,
             current_stage="probe_qbp_done",
             current_index=index,
-            total_candidates=len(codes),
+            total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
         if not _promotion_result_direct_valid(probe_result):
             probe_record["reason"] = "probe_not_direct_valid"
             continue
+        if effective_digest in seen_effective_digests:
+            duplicate_effective_count += 1
+            probe_record["reason"] = "duplicate_probe_effective_path"
+            continue
+        seen_effective_digests.add(effective_digest)
         if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
             probe_record["reason"] = "probe_not_latency_improved"
             continue
@@ -10917,7 +11317,7 @@ def _run_sampled_promotion_pass(
             timeout_sec=timeout_sec,
             current_stage="sampled_qbp",
             current_index=index,
-            total_candidates=len(codes),
+            total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
@@ -10944,7 +11344,7 @@ def _run_sampled_promotion_pass(
             timeout_sec=timeout_sec,
             current_stage="sampled_qbp_done",
             current_index=index,
-            total_candidates=len(codes),
+            total_candidates=min(limit, len(codes)),
             records=records,
             selected=best is not None,
         )
@@ -10969,6 +11369,11 @@ def _run_sampled_promotion_pass(
     summary = {
         "candidate_count": len(codes),
         "evaluated_count": len(seen),
+        "probe_evaluated_count": probe_evaluated_count,
+        "duplicate_policy_count": duplicate_policy_count,
+        "duplicate_effective_path_count": duplicate_effective_count,
+        "distinct_probe_policy_count": len(seen_policy_digests),
+        "distinct_probe_effective_path_count": len(seen_effective_digests),
         "probe_task_count": len(selected_probe_tasks),
         "probe_reference_latency_usec": probe_reference_cost,
         "sampled_reference_latency_usec": full_reference_cost,

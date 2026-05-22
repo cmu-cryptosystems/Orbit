@@ -3753,15 +3753,18 @@ def test_promotion_probe_hints_are_lightweight_and_targeted(toy_cost_json: str):
 
     assert probe["mcts_action_cap"] == 2
     assert probe["mcts_rollout_budget"] == 3
-    assert set(probe["mcts_action_presets"]) == {"budget_fulfillment_beam"}
+    assert set(probe["mcts_action_presets"]) == {
+        "budget_fulfillment_beam",
+        "dense_boundary_cost_beam",
+    }
     preset = probe["mcts_action_presets"]["budget_fulfillment_beam"]["policy"]
-    assert preset["boundary_state_cap"] <= 4
-    assert preset["max_scale_candidates"] <= 16
-    assert preset["beam_width"] <= 4
-    assert preset["state_cap_per_node"] <= 8
+    assert preset["boundary_state_cap"] <= 8
+    assert preset["max_scale_candidates"] <= 48
+    assert preset["beam_width"] <= 8
+    assert preset["state_cap_per_node"] <= 32
     assert len(probe["boundary_group_policies"]) == 1
     assert probe["boundary_group_policies"][0]["selector"]["in_lvl"] == -1
-    assert probe["boundary_group_policies"][0]["policy"]["max_scale_candidates"] <= 16
+    assert probe["boundary_group_policies"][0]["policy"]["max_scale_candidates"] <= 48
     assert probe["unit_policies"] == []
 
 
@@ -6022,7 +6025,16 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: codes)
 
     def fake_hints(code, _context):
-        return {"marker": "fast" if "fast" in code else "slow"}
+        marker = "fast" if "fast" in code else "slow"
+        return {
+            "marker": marker,
+            "mcts_action_presets": {
+                "budget_fulfillment_beam": {
+                    "prior": 0.8 if marker == "fast" else 0.4,
+                    "policy": {"selection_objective": "cost"},
+                }
+            },
+        }
 
     def fake_static(_context, _hints):
         return {"valid": True, "reasons": []}
@@ -6349,6 +6361,189 @@ def test_sampled_promotion_runs_without_top_cost_groups(
     summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
     assert summary["probe_reference_latency_usec"] == 100.0
     assert summary["selected_latency_usec"] == 95.0
+
+
+def test_promotion_probe_reference_uses_same_seed_task_metrics(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": idx,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": scale, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": scale}]},
+        }
+        for idx, scale in enumerate((40, 41))
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {"task_position": 0, "task_index": 0, "sampled_dp_latency_usec": 50.0},
+        {"task_position": 1, "task_index": 1, "sampled_dp_latency_usec": 250.0},
+    ]
+
+    selected, reference = oe_backend._promotion_probe_tasks(context)
+
+    assert reference == 250.0
+    assert len(selected) == 1
+    assert selected[0]["index"] == 1
+
+
+def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    metrics = [
+        {
+            "task_position": 0,
+            "task_index": 3,
+            "top_costly_boundary_groups": [
+                {
+                    "group_key": {
+                        "in_lvl": -1,
+                        "in_scl": 40,
+                        "maino_v": "",
+                        "main_dag_size": 3,
+                    },
+                    "min_cost_usec": 200.0,
+                    "max_cost_usec": 250.0,
+                }
+            ],
+        }
+    ]
+    context["sampled_budget_tasks"] = [{"index": 3, "context": {}, "group_keys": []}]
+    cached = {
+        "reference": {"valid": True},
+        "sampled_budget_tasks": context["sampled_budget_tasks"],
+        "harness": {"sampled_task_seed_metrics": metrics},
+    }
+
+    oe_backend._merge_cached_compile_context(context, cached, params)
+
+    top = context["harness"]["top_costly_boundary_groups"]
+    assert top[0]["task_position"] == 0
+    assert top[0]["task_index"] == 3
+    assert top[0]["min_cost_usec"] == 200.0
+    assert context["sampled_budget_tasks"][0]["seed_metrics"]["task_index"] == 3
+
+
+def test_promotion_probe_clamp_preserves_dense_and_tuneinsight_actions():
+    hints = {
+        "mcts_action_presets": {
+            "dense_boundary_cost_beam": {
+                "prior": 0.9,
+                "policy": {
+                    "beam_width": 20,
+                    "max_scale_candidates": 96,
+                    "selection_objective": "cost",
+                },
+            },
+            "tuneinsight_avgcase_cost_beam": {
+                "prior": 0.8,
+                "policy": {
+                    "beam_width": 12,
+                    "max_scale_candidates": 80,
+                    "selection_objective": "cost",
+                },
+            },
+        },
+        "mcts_action_cap": 8,
+    }
+
+    probe = oe_backend._promotion_probe_hints(hints, [])
+
+    assert "dense_boundary_cost_beam" in probe["mcts_action_presets"]
+    assert "tuneinsight_avgcase_cost_beam" in probe["mcts_action_presets"]
+    assert probe["mcts_action_allowlist"][:2] == [
+        "dense_boundary_cost_beam",
+        "tuneinsight_avgcase_cost_beam",
+    ]
+    assert (
+        probe["mcts_action_presets"]["dense_boundary_cost_beam"]["policy"][
+            "max_scale_candidates"
+        ]
+        == 48
+    )
+
+
+def test_sampled_promotion_dedupes_path_equivalent_candidates(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {"task_position": 0, "task_index": 0, "sampled_dp_latency_usec": 100.0}
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    codes = [
+        f"def place(context):\n    return {{'marker': 'm{idx}'}}\n"
+        for idx in range(3)
+    ]
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_CANDIDATES", "2")
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: codes)
+
+    def fake_hints(code, _context):
+        marker = code.split("'marker': 'm")[1][0]
+        return {
+            "marker": marker,
+            "mcts_action_presets": {
+                "budget_fulfillment_beam": {
+                    "prior": 0.4 + 0.1 * int(marker),
+                    "policy": {"selection_objective": "cost"},
+                }
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_hints_from_code", fake_hints)
+    monkeypatch.setattr(oe_backend, "_static_validate_hints", lambda *_args: {"valid": True, "reasons": []})
+
+    def fake_eval(_context, hints, *, timeout_sec):
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 90.0 if hints["marker"] == "2" else 120.0,
+            "objective_cost_usec": 90.0 if hints["marker"] == "2" else 120.0,
+            "bootstrap_count": 1.0 if hints["marker"] == "2" else 2.0,
+            "rescale_count": 3.0,
+            "sampled_selected_path_digest": "same" if hints["marker"] != "2" else "better",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "selected_source_counts": {"x": 1 if hints["marker"] != "2" else 2},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fake_eval)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        codes[0],
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert selected["marker"] == "2"
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["selected"] is True
+    assert summary["duplicate_effective_path_count"] == 1
+    reasons = [record.get("reason") for record in summary["records"]]
+    assert "duplicate_probe_effective_path" in reasons
 
 
 def test_qbp_manager_openevolve_backend_does_not_import_ilp_solvers(

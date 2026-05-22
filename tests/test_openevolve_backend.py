@@ -6994,7 +6994,9 @@ def test_qbp_dp_probe_preserves_complete_boundary_group(toy_cost_json: str):
     assert summary["selected_source_counts"] == {"candidate:qbp_dp": 3}
 
 
-def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
+def test_qbp_dp_promotion_probe_honors_timeout(
+    monkeypatch, toy_cost_json: str, tmp_path: Path
+):
     params = _params(
         toy_cost_json,
         openevolve_iterations=1,
@@ -7003,13 +7005,31 @@ def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
     )
 
     def slow_dp_probe(_context, _hints, *, selected_tasks=None):
+        trace_path = Path(_hints["dp_trace_path"])
+        trace_path.write_text(
+            json.dumps(
+                {
+                    "boundary_key": {"in_lvl": 16, "in_scl": 40},
+                    "requested_output_level": 16,
+                    "main_choice_count": 1,
+                    "first_empty_node": None,
+                    "node_frontiers": [{"node": "mul0", "candidate_count_after_prune": 1}],
+                    "rejected_transition_reasons": {},
+                    "last_stage": "node_complete",
+                    "last_node": "mul0",
+                    "elapsed_sec": 0.25,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         time.sleep(5)
         return {"valid": True}
 
     monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_dp_probe", slow_dp_probe)
 
     result = oe_backend._evaluate_promotion_probe(
-        {"sampled_budget_tasks": []},
+        {"sampled_budget_tasks": [], "harness": {"dp_trace_dir": str(tmp_path)}},
         {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
         params,
         [],
@@ -7019,6 +7039,45 @@ def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
     assert result["valid"] is False
     assert result["timed_out"] is True
     assert result["timeout_phase"] == "dp_table_probe"
+    assert result["dp_progress_trace_path"]
+    assert result["dp_progress_trace"]["last_node"] == "mul0"
+
+
+def test_qbp_dp_progress_trace_file_is_written(toy_cost_json: str, tmp_path: Path):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}], params)
+    context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": context,
+        }
+    ]
+    trace_path = tmp_path / "dp_progress_trace.json"
+
+    result = oe_backend._evaluate_sampled_budget_tasks_dp_probe(
+        context,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "dp_trace_path": str(trace_path),
+        },
+    )
+
+    assert result["dp_table_probe"] is True
+    assert trace_path.is_file()
+    payload = json.loads(trace_path.read_text())
+    assert payload["node_frontiers"]
+    assert payload["last_stage"] in {"budget_done", "budget_output_states", "node_complete"}
 
 
 def test_qbp_dp_bucketed_prune_preserves_high_boundary_state(toy_cost_json: str):
@@ -7108,6 +7167,75 @@ def test_qbp_dp_probe_records_failure_trace_and_seed_bridge(
     assert first["first_empty_node"]["node"] == "0"
     assert first["reference_seed_bridge"]["valid"] is True
     assert first["reference_seed_bridge"]["winner_selectable"] is False
+
+
+def test_qbp_dp_seed_guided_replay_matches_valid_seed(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {"in_lvl": 16, "in_scl": 40, "out_lvl": 16}
+    attempt = oe_backend._solve_one_budget_attempt(
+        graph,
+        params,
+        budget,
+        le,
+        "reference_seed_bridge_latency_beam",
+        oe_backend._budget_fulfillment_beam_policy(),
+    )
+
+    replay = oe_backend._qbp_dp_seed_guided_replay(
+        graph,
+        params,
+        budget,
+        le,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        attempt,
+    )
+
+    assert replay["valid"] is True
+    assert replay["winner_selectable"] is False
+    assert replay["checked_node_count"] == len(graph.nodes)
+
+
+def test_qbp_dp_seed_guided_replay_reports_missing_scale_candidate(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {"in_lvl": 16, "in_scl": 40, "out_lvl": 16}
+    attempt = oe_backend._solve_one_budget_attempt(
+        graph,
+        params,
+        budget,
+        le,
+        "reference_seed_bridge_latency_beam",
+        oe_backend._budget_fulfillment_beam_policy(),
+    )
+    monkeypatch.setattr(oe_backend, "_qbp_dp_incoming_options", lambda *_args, **_kwargs: [])
+
+    replay = oe_backend._qbp_dp_seed_guided_replay(
+        graph,
+        params,
+        budget,
+        le,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        attempt,
+    )
+
+    assert replay["valid"] is False
+    assert replay["winner_selectable"] is False
+    assert replay["first_mismatch"]["reason"] == "seed_incoming_scales_missing_from_dp_candidates"
 
 
 def test_dp_failure_trace_artifacts_are_written(tmp_path: Path):

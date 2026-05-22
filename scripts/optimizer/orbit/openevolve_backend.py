@@ -10762,6 +10762,9 @@ def _promotion_record_summary(
         "timeout_sec": result.get("timeout_sec") if result else None,
         "error": str(result.get("error", ""))[:500] if result else "",
         "worker_exitcode": result.get("worker_exitcode") if result else None,
+        "worker_kill_summary": result.get("worker_kill_summary") if result else None,
+        "dp_progress_trace_path": result.get("dp_progress_trace_path") if result else None,
+        "dp_progress_trace": result.get("dp_progress_trace") if result else None,
         "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
         "policy_summary": _compact_policy_summary(hints or {}),
     }
@@ -11681,6 +11684,7 @@ def _run_strategy_discovery_prepass(
     probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
     probe_context.setdefault("harness", {})["experience_probe"] = True
     probe_context.setdefault("harness", {})["strategy_discovery"] = True
+    probe_context.setdefault("harness", {})["dp_trace_dir"] = str(discovery_dir)
     place_timeout = _candidate_place_timeout_sec(context)
     for index, variant in enumerate(variants):
         if (
@@ -12042,6 +12046,14 @@ def _evaluate_sampled_budget_tasks_dp_probe(
     eval_suite = str(context.get("harness", {}).get("eval_suite", "polybert-sampled"))
     eval_hints = dict(_compile_hints_for_eval_suite(hints, eval_suite))
     eval_hints["dp_trace"] = True
+    for trace_key in (
+        "dp_trace_path",
+        "dp_wall_time_budget_sec",
+        "dp_trace_candidate_digest",
+        "dp_trace_label",
+    ):
+        if trace_key in hints:
+            eval_hints[trace_key] = hints[trace_key]
     tasks = selected_tasks
     if tasks is None:
         tasks = [
@@ -12415,17 +12427,37 @@ def _evaluate_dp_probe_for_promotion(
     probe_context = deepcopy(context)
     probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
     probe_context.setdefault("harness", {})["dp_table_probe"] = True
+    trace_dir = probe_context.get("harness", {}).get("dp_trace_dir")
+    trace_path: Path | None = None
+    probe_hints = dict(hints)
+    if trace_dir:
+        trace_digest = _hint_digest(
+            {
+                "policy": _policy_effect_payload(probe_hints),
+                "tasks": _sampled_tasks_digest(selected_probe_tasks),
+                "time_ns": time.time_ns(),
+            }
+        )[:16]
+        trace_path = Path(str(trace_dir)) / f"dp_progress_trace_{trace_digest}.json"
+        probe_hints["dp_trace_path"] = str(trace_path)
+        probe_hints["dp_trace_candidate_digest"] = trace_digest
+        if timeout_sec > 1 and "dp_wall_time_budget_sec" not in probe_hints:
+            probe_hints["dp_wall_time_budget_sec"] = max(1.0, float(timeout_sec) - 0.5)
     if timeout_sec <= 0:
-        return _evaluate_sampled_budget_tasks_dp_probe(
+        result = _evaluate_sampled_budget_tasks_dp_probe(
             probe_context,
-            hints,
+            probe_hints,
             selected_tasks=probe_context["sampled_budget_tasks"],
         )
+        if trace_path is not None and "dp_progress_trace_path" not in result:
+            result["dp_progress_trace_path"] = str(trace_path)
+            result["dp_progress_trace"] = _load_dp_progress_trace(trace_path)
+        return result
     ctx = _mp_context()
     result_queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
         target=_promotion_dp_probe_worker,
-        args=(result_queue, probe_context, hints, selected_probe_tasks),
+        args=(result_queue, probe_context, probe_hints, selected_probe_tasks),
     )
     proc.start()
     deadline = time.time() + float(timeout_sec)
@@ -12445,6 +12477,7 @@ def _evaluate_dp_probe_for_promotion(
             payload = None
     if payload is None and proc.is_alive():
         kill_summary = _terminate_promotion_process(proc)
+        progress_trace = _load_dp_progress_trace(trace_path)
         return {
             "valid": False,
             "timed_out": True,
@@ -12453,6 +12486,8 @@ def _evaluate_dp_probe_for_promotion(
             "last_timing_phase": "dp_table_probe",
             "dp_table_probe": True,
             "worker_kill_summary": kill_summary,
+            "dp_progress_trace_path": str(trace_path) if trace_path is not None else None,
+            "dp_progress_trace": progress_trace,
             "error": f"promotion DP probe timed out after {timeout_sec}s",
         }
     proc.join(5)
@@ -12462,9 +12497,22 @@ def _evaluate_dp_probe_for_promotion(
             "dp_table_probe": True,
             "error": f"promotion DP probe worker exited with code {proc.exitcode}",
             "worker_exitcode": proc.exitcode,
+            "dp_progress_trace_path": str(trace_path) if trace_path is not None else None,
+            "dp_progress_trace": _load_dp_progress_trace(trace_path),
         }
     result = payload.get("result") if isinstance(payload, dict) else None
-    return result if isinstance(result, dict) else {"valid": False, "dp_table_probe": True, "error": "promotion DP probe worker returned no result"}
+    if isinstance(result, dict):
+        if trace_path is not None:
+            result.setdefault("dp_progress_trace_path", str(trace_path))
+            result.setdefault("dp_progress_trace", _load_dp_progress_trace(trace_path))
+        return result
+    return {
+        "valid": False,
+        "dp_table_probe": True,
+        "error": "promotion DP probe worker returned no result",
+        "dp_progress_trace_path": str(trace_path) if trace_path is not None else None,
+        "dp_progress_trace": _load_dp_progress_trace(trace_path),
+    }
 
 
 def _run_sampled_promotion_pass(
@@ -12484,6 +12532,8 @@ def _run_sampled_promotion_pass(
         return None
     promotion_dir = root / "sampled_promotion"
     promotion_dir.mkdir(parents=True, exist_ok=True)
+    context = deepcopy(context)
+    context.setdefault("harness", {})["dp_trace_dir"] = str(promotion_dir)
     started_at = time.monotonic()
     timeout_sec = _promotion_timeout_sec(params)
     eval_timeout_sec = _promotion_eval_timeout_sec(params)
@@ -13009,6 +13059,11 @@ def _run_sampled_promotion_pass(
                                 "path_source_digest",
                                 "dp_failure_trace_paths",
                                 "dp_failure_summaries",
+                                "dp_progress_trace_path",
+                                "dp_progress_trace",
+                                "worker_kill_summary",
+                                "timed_out",
+                                "timeout_sec",
                             )
                         }
                         for record in records
@@ -14387,6 +14442,10 @@ def _qbp_dp_trace_enabled(hints: dict[str, Any]) -> bool:
     return bool(hints.get("dp_trace", False))
 
 
+class _QBPDPProgressTimeout(TimeoutError):
+    pass
+
+
 def _qbp_dp_new_trace(io_budget: dict[str, Any], main_choice_count: int) -> dict[str, Any]:
     return {
         "boundary_key": {
@@ -14400,6 +14459,9 @@ def _qbp_dp_new_trace(io_budget: dict[str, Any], main_choice_count: int) -> dict
         "first_empty_node": None,
         "node_frontiers": [],
         "rejected_transition_reasons": {},
+        "started_at_unix": time.time(),
+        "_started_at_monotonic": time.monotonic(),
+        "last_stage": "start",
     }
 
 
@@ -14464,7 +14526,101 @@ def _qbp_dp_trace_compact(trace: dict[str, Any] | None) -> dict[str, Any] | None
         "node_frontier_count": len(nodes),
         "node_frontiers_tail": nodes[-12:],
         "reference_seed_bridge": trace.get("reference_seed_bridge"),
+        "last_stage": trace.get("last_stage"),
+        "last_node": trace.get("last_node"),
+        "elapsed_sec": trace.get("elapsed_sec"),
+        "progress_timeout": bool(trace.get("progress_timeout", False)),
+        "progress_trace_path": trace.get("progress_trace_path"),
     }
+
+
+def _qbp_dp_trace_path(hints: dict[str, Any]) -> Path | None:
+    raw = hints.get("dp_trace_path")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return Path(text) if text else None
+
+
+def _qbp_dp_trace_payload(trace: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(trace)
+    payload.pop("_started_at_monotonic", None)
+    return payload
+
+
+def _write_qbp_dp_progress_trace(
+    trace: dict[str, Any] | None,
+    hints: dict[str, Any],
+    *,
+    stage: str,
+    node: str | None = None,
+) -> None:
+    if not isinstance(trace, dict):
+        return
+    trace["last_stage"] = str(stage)
+    if node is not None:
+        trace["last_node"] = str(node)
+    started = _finite_float(trace.get("_started_at_monotonic"), time.monotonic())
+    trace["elapsed_sec"] = max(0.0, time.monotonic() - started)
+    path = _qbp_dp_trace_path(hints)
+    if path is None:
+        return
+    trace["progress_trace_path"] = str(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(_qbp_dp_trace_payload(trace), indent=2, sort_keys=True, default=str)
+            + "\n",
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except Exception:
+        pass
+
+
+def _qbp_dp_progress_timeout_exceeded(
+    trace: dict[str, Any] | None,
+    hints: dict[str, Any],
+) -> bool:
+    if not isinstance(trace, dict):
+        return False
+    budget = _finite_float(hints.get("dp_wall_time_budget_sec"), 0.0)
+    if budget <= 0:
+        return False
+    started = _finite_float(trace.get("_started_at_monotonic"), time.monotonic())
+    return time.monotonic() - started >= budget
+
+
+def _qbp_dp_checkpoint_progress(
+    trace: dict[str, Any] | None,
+    hints: dict[str, Any],
+    *,
+    stage: str,
+    node: str | None = None,
+) -> None:
+    _write_qbp_dp_progress_trace(trace, hints, stage=stage, node=node)
+    if _qbp_dp_progress_timeout_exceeded(trace, hints):
+        if isinstance(trace, dict):
+            trace["progress_timeout"] = True
+            _write_qbp_dp_progress_trace(trace, hints, stage="progress_timeout", node=node)
+        raise _QBPDPProgressTimeout("qbp-dp progress wall-time budget exceeded")
+
+
+def _load_dp_progress_trace(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    compact = _qbp_dp_trace_compact(payload)
+    if compact is None:
+        return None
+    compact["path"] = str(path)
+    return compact
 
 
 def _qbp_dp_scale_band(scale: int, params: Params | None) -> int:
@@ -14943,6 +15099,7 @@ def _qbp_dp_node_states(
         pruned_count=len(pruned),
         rejection_counts=rejection_counts,
     )
+    _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))
     return pruned
 
 
@@ -14963,6 +15120,7 @@ def _qbp_dp_solve_budget(
     output_node = list(tdag.outputs)[0]
     for fixed_main, main_cost in main_choices:
         trace = _qbp_dp_new_trace(io_budget, len(main_choices)) if _qbp_dp_trace_enabled(hints) else None
+        _write_qbp_dp_progress_trace(trace, hints, stage="budget_start")
         fixed_inputs = {}
         if fixed_main is not None and io_budget.get("maino_v"):
             fixed_inputs[str(io_budget["maino_v"])] = fixed_main
@@ -14983,6 +15141,7 @@ def _qbp_dp_solve_budget(
                         pruned_count=1,
                         rejection_counts=Counter(),
                     )
+                    _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))
                     continue
                 if node in tdag.inputs or tdag.in_degree(node) == 0:
                     states_by_node[node] = [
@@ -15006,6 +15165,7 @@ def _qbp_dp_solve_budget(
                         pruned_count=1,
                         rejection_counts=Counter(),
                     )
+                    _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))
                     continue
                 pred_lists = [states_by_node.get(pred, []) for pred in tdag.predecessors(node)]
                 if any(not states for states in pred_lists):
@@ -15022,6 +15182,7 @@ def _qbp_dp_solve_budget(
                         pruned_count=0,
                         rejection_counts=rejection_counts,
                     )
+                    _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))
                     continue
                 states_by_node[node] = _qbp_dp_node_states(
                     tdag,
@@ -15035,9 +15196,25 @@ def _qbp_dp_solve_budget(
                     trace=trace,
                 )
             output_states = states_by_node.get(output_node, [])
+            _qbp_dp_checkpoint_progress(trace, hints, stage="budget_output_states", node=str(output_node))
+        except _QBPDPProgressTimeout as exc:
+            if isinstance(trace, dict):
+                trace["exception"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                _write_qbp_dp_progress_trace(trace, hints, stage="progress_timeout")
+            return _QBPDPBudgetResult(
+                False,
+                (-1, -1),
+                None,
+                float("inf"),
+                0.0,
+                0.0,
+                reason="qbp-dp progress timeout",
+                trace=trace,
+            )
         except Exception as exc:
             if isinstance(trace, dict):
                 trace["exception"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                _write_qbp_dp_progress_trace(trace, hints, stage="exception")
             return _QBPDPBudgetResult(False, (-1, -1), None, float("inf"), 0.0, 0.0, reason=str(exc)[:240], trace=trace)
         if isinstance(trace, dict) and (best_trace is None or trace.get("first_empty_node")):
             best_trace = trace
@@ -15075,6 +15252,7 @@ def _qbp_dp_solve_budget(
                 best.rescale_count,
             ):
                 best = item
+        _write_qbp_dp_progress_trace(trace, hints, stage="budget_done", node=str(output_node))
     return best or _QBPDPBudgetResult(
         False,
         (-1, -1),
@@ -15085,6 +15263,214 @@ def _qbp_dp_solve_budget(
         reason="qbp-dp found no feasible boundary state",
         trace=best_trace,
     )
+
+
+def _qbp_dp_seed_guided_replay(
+    pdag: Tdag,
+    params: Params,
+    io_budget: dict[str, Any],
+    le: LatencyEstimator,
+    hints: dict[str, Any],
+    attempt: _BudgetAttempt,
+) -> dict[str, Any]:
+    """Diagnostic replay of a valid seed assignment against DP candidate generators."""
+
+    assign = attempt.assign
+
+    def mismatch(
+        reason: str,
+        *,
+        node: str | None = None,
+        edge: tuple[str, str] | None = None,
+        details: dict[str, Any] | None = None,
+        checked_node_count: int = 0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": "seed_guided_dp_replay",
+            "valid": False,
+            "winner_selectable": False,
+            "seed_source": attempt.source,
+            "cost_usec": float(attempt.actual_cost or attempt.cost),
+            "checked_node_count": int(checked_node_count),
+            "first_mismatch": {
+                "reason": reason,
+            },
+        }
+        if node is not None:
+            payload["first_mismatch"]["node"] = str(node)
+            payload["first_mismatch"]["op"] = str(pdag.nodes[node].get("op", ""))
+        if edge is not None:
+            payload["first_mismatch"]["edge"] = [str(edge[0]), str(edge[1])]
+        if details:
+            payload["first_mismatch"].update(details)
+        return payload
+
+    try:
+        assign.check_assign()
+    except Exception as exc:
+        return mismatch(
+            "seed_assignment_check_failed",
+            details={"error": f"{type(exc).__name__}: {str(exc)[:240]}"},
+        )
+
+    node_level_hints = _int_map(hints.get("preferred_node_levels", {}))
+    node_scale_hints = _int_map(hints.get("preferred_node_scales", {}))
+    edge_scale_hints = _int_map(hints.get("preferred_edge_scales", {}))
+    checked = 0
+    for node in nx.topological_sort(pdag):
+        checked += 1
+        op = str(pdag.nodes[node].get("op", ""))
+        if node not in assign.v_lvl_out or node not in assign.v_scl_out:
+            return mismatch("missing_seed_output_state", node=str(node), checked_node_count=checked)
+        if op == "constant":
+            continue
+        try:
+            v_in_level, v_in_scale = assign.get_v_in_lvl_scl(node)
+        except Exception as exc:
+            return mismatch(
+                "seed_input_state_not_deducible",
+                node=str(node),
+                checked_node_count=checked,
+                details={"error": f"{type(exc).__name__}: {str(exc)[:240]}"},
+            )
+        v_out_level = int(assign.v_lvl_out[node])
+        v_out_scale = int(assign.v_scl_out[node])
+        if not params.is_decryptable_state(v_in_level, v_in_scale):
+            return mismatch(
+                "seed_input_state_not_decryptable",
+                node=str(node),
+                checked_node_count=checked,
+                details={"level": int(v_in_level), "scale": int(v_in_scale)},
+            )
+        if not params.is_decryptable_state(v_out_level, v_out_scale):
+            return mismatch(
+                "seed_output_state_not_decryptable",
+                node=str(node),
+                checked_node_count=checked,
+                details={"level": v_out_level, "scale": v_out_scale},
+            )
+        if _qbp_dp_transition_metrics(params, le, v_in_level, v_in_scale, v_out_level, v_out_scale) is None:
+            return mismatch(
+                "seed_vertex_transition_invalid_for_dp",
+                node=str(node),
+                checked_node_count=checked,
+                details={
+                    "in_level": int(v_in_level),
+                    "in_scale": int(v_in_scale),
+                    "out_level": v_out_level,
+                    "out_scale": v_out_scale,
+                },
+            )
+        node_hints = _policy_hints_for_node(
+            hints,
+            list(hints.get("unit_policies", []) or []),
+            str(node),
+            dict(pdag.nodes[node]),
+        )
+        policy = _policy_options(node_hints, params)
+        output_candidates = set(
+            _qbp_dp_output_states(
+                pdag,
+                node,
+                params,
+                io_budget,
+                policy,
+                int(v_in_level),
+                int(v_in_scale),
+                node_level_hints.get(node),
+                node_scale_hints.get(node),
+            )
+        )
+        if (v_out_level, v_out_scale) not in output_candidates:
+            return mismatch(
+                "seed_output_state_missing_from_dp_candidates",
+                node=str(node),
+                checked_node_count=checked,
+                details={
+                    "seed_output_state": [v_out_level, v_out_scale],
+                    "candidate_count": len(output_candidates),
+                    "candidate_preview": [list(item) for item in sorted(output_candidates)[:12]],
+                },
+            )
+
+        preds = list(pdag.predecessors(node))
+        if not preds:
+            continue
+        pred_states: list[tuple[str, _QBPDPState]] = []
+        target_edge_scales: dict[str, int] = {}
+        for pred in preds:
+            pred_level = int(assign.v_lvl_out[pred])
+            pred_scale = int(assign.v_scl_out[pred])
+            pred_states.append((pred, _QBPDPState(pred_level, pred_scale, 0.0, 0.0, 0.0)))
+            if pdag.nodes[pred].get("op") == "constant":
+                target_edge_scales[pred] = int(params.Csw)
+                continue
+            edge = (pred, node)
+            if edge not in assign.e_lvl_out or edge not in assign.e_scl_out:
+                return mismatch(
+                    "missing_seed_edge_state",
+                    node=str(node),
+                    edge=edge,
+                    checked_node_count=checked,
+                )
+            edge_level = int(assign.e_lvl_out[edge])
+            edge_scale = int(assign.e_scl_out[edge])
+            target_edge_scales[pred] = edge_scale
+            if _qbp_dp_transition_metrics(params, le, pred_level, pred_scale, edge_level, edge_scale) is None:
+                return mismatch(
+                    "seed_edge_transition_invalid_for_dp",
+                    node=str(node),
+                    edge=edge,
+                    checked_node_count=checked,
+                    details={
+                        "pred_output_state": [pred_level, pred_scale],
+                        "edge_output_state": [edge_level, edge_scale],
+                    },
+                )
+        incoming_options = _qbp_dp_incoming_options(
+            pdag,
+            node,
+            pred_states,
+            params,
+            policy,
+            node_scale_hints.get(node),
+            edge_scale_hints,
+        )
+        incoming_match = any(
+            int(input_scale) == int(v_in_scale)
+            and all(int(edge_scales.get(pred, -1)) == int(target_edge_scales[pred]) for pred in target_edge_scales)
+            for input_scale, edge_scales, _node_scale in incoming_options
+        )
+        if not incoming_match:
+            return mismatch(
+                "seed_incoming_scales_missing_from_dp_candidates",
+                node=str(node),
+                checked_node_count=checked,
+                details={
+                    "seed_input_scale": int(v_in_scale),
+                    "seed_edge_scales": {str(pred): int(scale) for pred, scale in target_edge_scales.items()},
+                    "incoming_option_count": len(incoming_options),
+                    "incoming_option_preview": [
+                        {
+                            "input_scale": int(input_scale),
+                            "edge_scales": {str(pred): int(scale) for pred, scale in edge_scales.items()},
+                            "node_scale": int(node_scale),
+                        }
+                        for input_scale, edge_scales, node_scale in incoming_options[:12]
+                    ],
+                },
+            )
+
+    return {
+        "kind": "seed_guided_dp_replay",
+        "valid": True,
+        "winner_selectable": False,
+        "seed_source": attempt.source,
+        "cost_usec": float(attempt.actual_cost or attempt.cost),
+        "checked_node_count": int(checked),
+        "out_key": list(attempt.out_key),
+        "in_key": list(attempt.in_key),
+    }
 
 
 def _qbp_dp_seed_bridge_summary(
@@ -15137,6 +15523,7 @@ def _qbp_dp_seed_bridge_summary(
             "winner_selectable": False,
             "attempts": attempts,
         }
+    guided_replay = _qbp_dp_seed_guided_replay(pdag, params, io_budget, le, hints, best)
     return {
         "kind": "reference_seed_bridge",
         "valid": True,
@@ -15147,6 +15534,7 @@ def _qbp_dp_seed_bridge_summary(
         "out_key": list(best.out_key),
         "bootstrap_count": float(_aggregate_counts([best.assign])["bootstrap"]),
         "rescale_count": float(_aggregate_counts([best.assign])["rescale"]),
+        "seed_guided_replay": guided_replay,
         "attempts": attempts,
     }
 

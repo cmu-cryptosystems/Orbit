@@ -14528,6 +14528,7 @@ def _qbp_dp_trace_compact(trace: dict[str, Any] | None) -> dict[str, Any] | None
         "reference_seed_bridge": trace.get("reference_seed_bridge"),
         "last_stage": trace.get("last_stage"),
         "last_node": trace.get("last_node"),
+        "active_node_progress": trace.get("active_node_progress"),
         "elapsed_sec": trace.get("elapsed_sec"),
         "progress_timeout": bool(trace.get("progress_timeout", False)),
         "progress_trace_path": trace.get("progress_trace_path"),
@@ -14977,6 +14978,18 @@ def _qbp_dp_node_states(
     rejection_counts: Counter[str] = Counter()
     combo_count = 0
     incoming_option_count = 0
+    if isinstance(trace, dict):
+        trace["active_node_progress"] = {
+            "node": str(node),
+            "op": str(tdag.nodes[node].get("op", "")),
+            "phase": "start",
+            "pred_state_counts": [len(states) for states in pred_state_lists],
+            "combo_count": 0,
+            "incoming_option_count": 0,
+            "candidate_count_before_prune": 0,
+        }
+    _qbp_dp_checkpoint_progress(trace, hints, stage="node_start", node=str(node))
+    progress_interval = max(1, min(64, _int_hint(hints.get("dp_trace_progress_interval"), 16)))
     for combo in itertools.product(*[states[:state_cap] for states in pred_state_lists]):
         combo_count += 1
         pred_states = list(zip(preds, combo))
@@ -14992,7 +15005,33 @@ def _qbp_dp_node_states(
         incoming_option_count += len(incoming_options)
         if not incoming_options:
             rejection_counts["incoming_options_empty"] += 1
-        for input_scale, edge_scales, node_scale in incoming_options:
+        if isinstance(trace, dict):
+            trace["active_node_progress"] = {
+                "node": str(node),
+                "op": str(tdag.nodes[node].get("op", "")),
+                "phase": "incoming_options",
+                "pred_state_counts": [len(states) for states in pred_state_lists],
+                "combo_count": int(combo_count),
+                "incoming_option_count": int(incoming_option_count),
+                "candidate_count_before_prune": len(candidate_states),
+                "latest_incoming_options": len(incoming_options),
+            }
+        _qbp_dp_checkpoint_progress(trace, hints, stage="node_combo", node=str(node))
+        for option_index, (input_scale, edge_scales, node_scale) in enumerate(incoming_options):
+            if option_index == 0 or (option_index + 1) % progress_interval == 0:
+                if isinstance(trace, dict):
+                    trace["active_node_progress"] = {
+                        "node": str(node),
+                        "op": str(tdag.nodes[node].get("op", "")),
+                        "phase": "incoming_option",
+                        "pred_state_counts": [len(states) for states in pred_state_lists],
+                        "combo_count": int(combo_count),
+                        "incoming_option_index": int(option_index),
+                        "incoming_option_count": int(incoming_option_count),
+                        "candidate_count_before_prune": len(candidate_states),
+                        "rejection_counts": dict(rejection_counts),
+                    }
+                _qbp_dp_checkpoint_progress(trace, hints, stage="node_incoming_option", node=str(node))
             for input_level in _qbp_dp_level_candidates(params, node_level_hints.get(node), policy):
                 edge_cost = 0.0
                 edge_bootstrap = 0.0
@@ -15099,6 +15138,18 @@ def _qbp_dp_node_states(
         pruned_count=len(pruned),
         rejection_counts=rejection_counts,
     )
+    if isinstance(trace, dict):
+        trace["active_node_progress"] = {
+            "node": str(node),
+            "op": str(tdag.nodes[node].get("op", "")),
+            "phase": "complete",
+            "pred_state_counts": [len(states) for states in pred_state_lists],
+            "combo_count": int(combo_count),
+            "incoming_option_count": int(incoming_option_count),
+            "candidate_count_before_prune": len(candidate_states),
+            "candidate_count_after_prune": len(pruned),
+            "rejection_counts": dict(rejection_counts),
+        }
     _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))
     return pruned
 
@@ -15171,6 +15222,13 @@ def _qbp_dp_solve_budget(
                 if any(not states for states in pred_lists):
                     states_by_node[node] = []
                     rejection_counts = Counter({"missing_predecessor_frontier": 1})
+                    if isinstance(trace, dict):
+                        trace["active_node_progress"] = {
+                            "node": str(node),
+                            "op": str(op),
+                            "phase": "missing_predecessor_frontier",
+                            "pred_state_counts": [len(states) for states in pred_lists],
+                        }
                     _qbp_dp_trace_node(
                         trace,
                         node=str(node),

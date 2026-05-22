@@ -7277,6 +7277,39 @@ def test_qbp_dp_output_splice_fast_path_skips_generic_output_frontier(
     assert result.trace["active_node_progress"]["phase"] == "output_splice_fast_path"
 
 
+def test_qbp_dp_output_splice_materializes_constant_bias_seed_path(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _constant_bias_pdag(params)
+    le = LatencyEstimator(params)
+
+    result = oe_backend._qbp_dp_solve_budget(
+        graph,
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        le,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "enable_seed_frontier_anchor": True,
+            "dp_probe_mode": "output_splice",
+            "dp_seed_splice_output_only": True,
+            "dp_seed_exact_only": False,
+            "dp_max_output_states_per_input": 4,
+        },
+        materialize=True,
+    )
+
+    assert result.valid is True
+    assert result.assign is not None
+    assert result.assign.check_assign()
+    assert result.assign.v_scl_out["bias"] == result.assign.v_scl_in["add"]
+
+
 def test_qbp_dp_transition_and_output_state_caches(toy_cost_json: str):
     params = _params(
         toy_cost_json,

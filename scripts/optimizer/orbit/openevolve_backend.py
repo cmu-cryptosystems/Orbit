@@ -10863,6 +10863,8 @@ def _promotion_probe_result_from_discovery_record(record: dict[str, Any]) -> dic
     }
     return {
         "valid": bool(record.get("direct_valid", False)),
+        "dp_table_probe": True,
+        "dp_materialized_probe": bool(record.get("dp_materialized_probe", False)),
         "boundary_group_validity": 1.0 if record.get("direct_valid", False) else 0.0,
         "candidate_qbp_coverage": 1.0 if record.get("direct_valid", False) else 0.0,
         "fallback_selected_budgets": 0,
@@ -12156,13 +12158,22 @@ def _run_strategy_discovery_prepass(
             }
             records.append(record)
             continue
-        result = _evaluate_promotion_probe(
-            probe_context,
-            probe_hints,
-            params,
-            selected_probe_tasks,
-            timeout_sec=discovery_eval_timeout_sec,
-        )
+        if _use_qbp_dp_engine(params, probe_hints):
+            result = _evaluate_dp_probe_for_promotion(
+                probe_context,
+                probe_hints,
+                selected_probe_tasks,
+                timeout_sec=discovery_eval_timeout_sec,
+                materialize=True,
+            )
+        else:
+            result = _evaluate_promotion_probe(
+                probe_context,
+                probe_hints,
+                params,
+                selected_probe_tasks,
+                timeout_sec=discovery_eval_timeout_sec,
+            )
         retry_summary: dict[str, Any] | None = None
         active_hints = probe_hints
         if (
@@ -12216,6 +12227,7 @@ def _run_strategy_discovery_prepass(
             "path_differential": diff,
             "bootstrap_count": _finite_float(result.get("bootstrap_count"), 0.0),
             "rescale_count": _finite_float(result.get("rescale_count"), 0.0),
+            "dp_materialized_probe": bool(result.get("dp_materialized_probe", False)),
             "timed_out": bool(result.get("timed_out", False)),
             "timeout_context": _promotion_timeout_context(
                 active_hints,
@@ -13646,45 +13658,11 @@ def _run_sampled_promotion_pass(
             probe_record["reason"] = "duplicate_probe_path_source"
             continue
         seen_path_source_digests.add(path_source_digest)
-        if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
-            probe_record["reason"] = (
-                _dp_probe_reason(path_diff, True, False)
-                if _use_qbp_dp_engine(params, active_probe_hints)
-                else "probe_not_latency_improved"
-            )
-            continue
-        probe_record["reason"] = (
-            _dp_probe_reason(path_diff, True, True)
-            if _use_qbp_dp_engine(params, active_probe_hints)
-            else "probe_latency_improved"
-        )
-
-        if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
-            timed_out = True
-            records.append(
-                {
-                    "index": index,
-                    "stage": "timeout",
-                    "reason": f"promotion timeout before sampled replay after {timeout_sec}s",
-                }
-            )
-            break
-        print(
-            "OpenEvolve compile harness: sampled promotion "
-            f"candidate {len(seen)}/{len(codes)} sampled_qbp timeout={eval_timeout_sec}s.",
-            flush=True,
-        )
-        _write_promotion_progress(
-            promotion_dir,
-            started_at=started_at,
-            timeout_sec=timeout_sec,
-            current_stage="sampled_qbp",
-            current_index=index,
-            total_candidates=min(limit, len(codes)),
-            records=records,
-            selected=best is not None,
-        )
-        if _use_qbp_dp_engine(params, active_probe_hints):
+        materialized_probe_result: dict[str, Any] | None = None
+        if (
+            _use_qbp_dp_engine(params, active_probe_hints)
+            and bool(path_diff.get("selected_path_changed", False))
+        ):
             print(
                 "OpenEvolve compile harness: sampled promotion "
                 f"candidate {len(seen)}/{len(codes)} materialized DP probe "
@@ -13725,15 +13703,83 @@ def _run_sampled_promotion_pass(
                 selected=best is not None,
             )
             if not _promotion_result_direct_valid(materialized_probe_result):
+                probe_record["reason"] = _dp_probe_reason(
+                    path_diff,
+                    True,
+                    math.isfinite(probe_latency) and probe_latency < probe_reference_cost,
+                )
                 materialized_probe_record["reason"] = "materialized_probe_not_direct_valid"
                 continue
-            if not (
-                math.isfinite(materialized_probe_latency)
-                and materialized_probe_latency < probe_reference_cost
-            ):
-                materialized_probe_record["reason"] = "materialized_probe_not_latency_improved"
+            if not math.isfinite(materialized_probe_latency):
+                materialized_probe_record["reason"] = "materialized_probe_invalid_latency"
                 continue
-            materialized_probe_record["reason"] = "materialized_probe_latency_improved"
+            materialized_probe_record["reason"] = (
+                "materialized_probe_latency_improved"
+                if materialized_probe_latency < probe_reference_cost
+                else "materialized_probe_not_latency_improved"
+            )
+            probe_result = materialized_probe_result
+            probe_latency = materialized_probe_latency
+            path_diff = _path_differential_summary(seed_probe_summary, probe_result)
+        if not (math.isfinite(probe_latency) and probe_latency < probe_reference_cost):
+            probe_record["reason"] = (
+                _dp_probe_reason(path_diff, True, False)
+                if _use_qbp_dp_engine(params, active_probe_hints)
+                else "probe_not_latency_improved"
+            )
+            continue
+        probe_record["reason"] = (
+            _dp_probe_reason(path_diff, True, True)
+            if _use_qbp_dp_engine(params, active_probe_hints)
+            else "probe_latency_improved"
+        )
+
+        if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
+            timed_out = True
+            records.append(
+                {
+                    "index": index,
+                    "stage": "timeout",
+                    "reason": f"promotion timeout before sampled replay after {timeout_sec}s",
+                }
+            )
+            break
+        print(
+            "OpenEvolve compile harness: sampled promotion "
+            f"candidate {len(seen)}/{len(codes)} sampled_qbp timeout={eval_timeout_sec}s.",
+            flush=True,
+        )
+        _write_promotion_progress(
+            promotion_dir,
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            current_stage="sampled_qbp",
+            current_index=index,
+            total_candidates=min(limit, len(codes)),
+            records=records,
+            selected=best is not None,
+        )
+        if _use_qbp_dp_engine(params, active_probe_hints):
+            if materialized_probe_result is None:
+                materialized_probe_result = _evaluate_dp_probe_for_promotion(
+                    context,
+                    active_probe_hints,
+                    selected_probe_tasks,
+                    timeout_sec=eval_timeout_sec,
+                    materialize=True,
+                )
+                if not _promotion_result_direct_valid(materialized_probe_result):
+                    full_record = _promotion_record_summary(
+                        index=index,
+                        stage="sampled_dp_materialize_probe",
+                        hints=active_probe_hints,
+                        result=materialized_probe_result,
+                        reason="materialized_probe_not_direct_valid",
+                        code_digest=code_digest,
+                    )
+                    full_record["reference_latency_usec"] = probe_reference_cost
+                    records.append(full_record)
+                    continue
             full_result = _sampled_delta_replay_result(
                 context,
                 active_probe_hints,
@@ -15451,6 +15497,7 @@ def _qbp_dp_trace_compact(trace: dict[str, Any] | None) -> dict[str, Any] | None
         "last_node": trace.get("last_node"),
         "active_node_progress": trace.get("active_node_progress"),
         "qbp_dp_cache_stats": trace.get("qbp_dp_cache_stats", {}),
+        "materialization_failures": list(trace.get("materialization_failures", []) or [])[:8],
         "elapsed_sec": trace.get("elapsed_sec"),
         "progress_timeout": bool(trace.get("progress_timeout", False)),
         "progress_trace_path": trace.get("progress_trace_path"),
@@ -16155,6 +16202,18 @@ def _qbp_dp_seed_exact_state(
     edge_rescale = 0.0
     for pred, states in zip(preds, pred_state_lists):
         pred_key = str(pred)
+        if tdag.nodes[pred].get("op") == "constant":
+            if not states:
+                return None
+            chosen = min(states, key=_qbp_dp_state_select_key)
+            chosen_states.append(chosen)
+            edge_levels[pred] = int(input_level)
+            edge_scales[pred] = (
+                int(params.Csw)
+                if tdag.nodes[node].get("op") == "mul"
+                else int(input_scale)
+            )
+            continue
         pred_target = _qbp_dp_seed_tuple(
             node_outputs.get(pred_key) if isinstance(node_outputs, dict) else None
         )
@@ -16177,10 +16236,6 @@ def _qbp_dp_seed_exact_state(
         if chosen is None:
             return None
         chosen_states.append(chosen)
-        if tdag.nodes[pred].get("op") == "constant":
-            edge_levels[pred] = int(input_level)
-            edge_scales[pred] = int(params.Csw) if tdag.nodes[node].get("op") == "mul" else int(input_scale)
-            continue
         edge_state = _qbp_dp_seed_tuple(
             edge_outputs.get(pred_key) if isinstance(edge_outputs, dict) else None
         )
@@ -17093,8 +17148,26 @@ def _qbp_dp_solve_budget(
                     assign = Assign.from_dict(tdag, state.assign_data)
                     assign.check_assign()
                     actual_cost = float(estimate_assign(assign, le) + main_cost)
+                    actual_counts = _aggregate_counts([assign])
+                    bootstrap_count = float(actual_counts["bootstrap"])
+                    rescale_count = float(actual_counts["rescale"])
                 except Exception as exc:
                     _qbp_dp_trace_reject(trace, "materialization_invalid")
+                    if isinstance(trace, dict):
+                        failures = trace.setdefault("materialization_failures", [])
+                        if len(failures) < 16:
+                            failures.append(
+                                {
+                                    "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                                    "source": str(getattr(state, "source", "")),
+                                    "out_key": [int(out_key[0]), int(out_key[1])],
+                                    "state_level": int(state.level),
+                                    "state_scale": int(state.scale),
+                                    "state_cost_usec": float(state.cost),
+                                    "state_bootstrap_count": float(state.bootstrap_count),
+                                    "state_rescale_count": float(state.rescale_count),
+                                }
+                            )
                     continue
             item = _QBPDPBudgetResult(
                 True,
@@ -17270,7 +17343,11 @@ def _qbp_dp_seed_guided_replay(
             pred_scale = int(assign.v_scl_out[pred])
             pred_states.append((pred, _QBPDPState(pred_level, pred_scale, 0.0, 0.0, 0.0)))
             if pdag.nodes[pred].get("op") == "constant":
-                target_edge_scales[pred] = int(params.Csw)
+                target_edge_scales[pred] = (
+                    int(params.Csw)
+                    if pdag.nodes[node].get("op") == "mul"
+                    else int(v_is)
+                )
                 continue
             edge = (pred, node)
             if edge not in assign.e_lvl_out or edge not in assign.e_scl_out:

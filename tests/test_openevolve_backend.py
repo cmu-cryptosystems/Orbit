@@ -7021,6 +7021,120 @@ def test_qbp_dp_promotion_probe_honors_timeout(monkeypatch, toy_cost_json: str):
     assert result["timeout_phase"] == "dp_table_probe"
 
 
+def test_qbp_dp_bucketed_prune_preserves_high_boundary_state(toy_cost_json: str):
+    params = _params(toy_cost_json)
+    low_cost = oe_backend._QBPDPState(4, 40, 1.0, 0.0, 0.0)
+    cheaper_same_key = oe_backend._QBPDPState(4, 40, 0.5, 0.0, 0.0)
+    high_level = oe_backend._QBPDPState(16, 40, 100.0, 0.0, 6.0)
+    high_scale = oe_backend._QBPDPState(4, 80, 120.0, 1.0, 0.0)
+
+    pruned = oe_backend._qbp_dp_prune_states(
+        [low_cost, cheaper_same_key, high_level, high_scale],
+        1,
+        params,
+    )
+
+    keys = {(state.level, state.scale, state.cost) for state in pruned}
+    assert (16, 40, 100.0) in keys
+    assert (4, 80, 120.0) in keys
+    assert (4, 40, 0.5) in keys
+    assert (4, 40, 1.0) not in keys
+
+
+def test_qbp_dp_probe_records_failure_trace_and_seed_bridge(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    context = build_context(graph, [{"in_lvl": 16, "in_scl": 40, "out_lvl": 16}], params)
+    context["harness"] = {"eval_suite": "polybert-sampled"}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+            ],
+            "context": context,
+        }
+    ]
+
+    trace = {
+        "boundary_key": {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+        "requested_output_level": 16,
+        "first_empty_node": {"node": "0", "op": "mul"},
+        "rejected_transition_reasons": {"output_transition_invalid": 3},
+        "node_frontiers": [{"node": "0", "candidate_count_after_prune": 0}],
+    }
+
+    def fake_solve(*_args, **_kwargs):
+        return oe_backend._QBPDPBudgetResult(
+            False,
+            (-1, -1),
+            None,
+            float("inf"),
+            0.0,
+            0.0,
+            reason="fake incomplete",
+            trace=trace,
+        )
+
+    monkeypatch.setattr(oe_backend, "_qbp_dp_solve_budget", fake_solve)
+    monkeypatch.setattr(
+        oe_backend,
+        "_qbp_dp_seed_bridge_summary",
+        lambda *_args, **_kwargs: {
+            "kind": "reference_seed_bridge",
+            "valid": True,
+            "winner_selectable": False,
+            "cost_usec": 123.0,
+        },
+    )
+
+    result = oe_backend._evaluate_sampled_budget_tasks_dp_probe(
+        context,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+    )
+
+    assert result["valid"] is False
+    assert result["candidate_qbp_coverage"] == 0.0
+    failures = result["diagnostics"]["dp_failure_summaries"]
+    assert failures
+    first = failures[0]["traces"][0]
+    assert first["first_empty_node"]["node"] == "0"
+    assert first["reference_seed_bridge"]["valid"] is True
+    assert first["reference_seed_bridge"]["winner_selectable"] is False
+
+
+def test_dp_failure_trace_artifacts_are_written(tmp_path: Path):
+    result = {
+        "diagnostics": {
+            "dp_failure_summaries": [
+                {
+                    "task_index": 0,
+                    "group_key": {"in_lvl": 16, "in_scl": 40},
+                    "traces": [
+                        {
+                            "first_empty_node": {"node": "mul0"},
+                            "rejected_transition_reasons": {"incoming_options_empty": 1},
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    paths = oe_backend._write_dp_failure_trace_artifacts(tmp_path, 7, result)
+
+    assert len(paths) == 1
+    payload = json.loads(Path(paths[0]).read_text())
+    assert payload["traces"][0]["first_empty_node"]["node"] == "mul0"
+
+
 def test_qbp_dp_promotion_probe_uses_lightweight_frontier():
     hints = {
         "strategy": "bootstrap_mcts",

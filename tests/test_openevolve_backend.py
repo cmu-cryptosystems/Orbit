@@ -2606,6 +2606,7 @@ def test_bootstrap_mcts_context_collection_uses_fast_seed(toy_cost_json: str):
     assert hints is not initial
     assert hints["context_collection_seed"] is True
     assert hints["strategy"] == "bootstrap_mcts"
+    assert hints["qbp_engine"] == "mcts"
     assert hints["policy_bank_lightweight"] is True
     assert hints["budget_aggressive"] is True
     assert hints["mcts_rollout_budget"] == 4

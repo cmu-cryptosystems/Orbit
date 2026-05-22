@@ -10727,6 +10727,7 @@ def _context_collection_seed_hints(
         hints.update(
             {
                 "context_collection_seed": True,
+                "qbp_engine": "mcts",
                 "policy_bank_lightweight": True,
                 "budget_aggressive": True,
                 "allow_seed_fallback": True,

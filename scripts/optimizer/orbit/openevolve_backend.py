@@ -10530,6 +10530,24 @@ def _strategy_discovery_limit() -> int:
     return max(0, min(64, value))
 
 
+def _strategy_discovery_timeout_sec(promotion_timeout_sec: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_TIMEOUT_SEC", "").strip()
+    try:
+        value = int(raw) if raw else min(120, max(30, promotion_timeout_sec // 3))
+    except ValueError:
+        value = min(120, max(30, promotion_timeout_sec // 3))
+    return max(0, min(max(0, promotion_timeout_sec), value))
+
+
+def _strategy_discovery_eval_timeout_sec(promotion_eval_timeout_sec: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_EVAL_TIMEOUT_SEC", "").strip()
+    try:
+        value = int(raw) if raw else min(15, max(5, promotion_eval_timeout_sec // 3))
+    except ValueError:
+        value = min(15, max(5, promotion_eval_timeout_sec // 3))
+    return max(0, min(max(0, promotion_eval_timeout_sec), value))
+
+
 def _promotion_bounded_retry_enabled() -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_BOUNDED_RETRY", "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -11433,6 +11451,26 @@ def _strategy_discovery_examples(records: list[dict[str, Any]]) -> list[dict[str
     return examples
 
 
+def _write_strategy_discovery_artifacts(
+    discovery_dir: Path,
+    summary: dict[str, Any],
+    path_rows: list[dict[str, Any]],
+    examples: list[dict[str, Any]],
+) -> None:
+    (discovery_dir / "strategy_table.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (discovery_dir / "path_delta_table.json").write_text(
+        json.dumps(path_rows, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (discovery_dir / "prompt_examples.json").write_text(
+        json.dumps(examples, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _run_strategy_discovery_prepass(
     promotion_dir: Path,
     context: dict[str, Any],
@@ -11447,6 +11485,9 @@ def _run_strategy_discovery_prepass(
 ) -> dict[str, Any]:
     discovery_dir = promotion_dir / "strategy_discovery"
     discovery_dir.mkdir(parents=True, exist_ok=True)
+    discovery_started_at = time.monotonic()
+    discovery_timeout_sec = _strategy_discovery_timeout_sec(total_timeout_sec)
+    discovery_eval_timeout_sec = _strategy_discovery_eval_timeout_sec(eval_timeout_sec)
     seed_summary = _probe_seed_summary(selected_probe_tasks, probe_reference_cost)
     has_seed_hints = bool(initial_hints)
     variants = (
@@ -11466,12 +11507,10 @@ def _run_strategy_discovery_prepass(
             "records": [],
             "path_moving_code_count": 0,
             "skip_policy_digest_count": 0,
+            "timeout_sec": discovery_timeout_sec,
+            "eval_timeout_sec": discovery_eval_timeout_sec,
         }
-        (discovery_dir / "strategy_table.json").write_text(
-            json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
-            encoding="utf-8",
-        )
-        (discovery_dir / "path_delta_table.json").write_text("[]\n", encoding="utf-8")
+        _write_strategy_discovery_artifacts(discovery_dir, summary, [], [])
         return {
             "records": records,
             "path_moving_codes": path_moving_codes,
@@ -11486,14 +11525,17 @@ def _run_strategy_discovery_prepass(
     probe_context.setdefault("harness", {})["strategy_discovery"] = True
     place_timeout = _candidate_place_timeout_sec(context)
     for index, variant in enumerate(variants):
-        if total_timeout_sec > 0 and time.monotonic() - started_at >= total_timeout_sec:
+        if (
+            discovery_timeout_sec > 0
+            and time.monotonic() - discovery_started_at >= discovery_timeout_sec
+        ):
             timed_out = True
             records.append(
                 {
                     "index": index,
                     "label": variant.get("label"),
                     "dimension": variant.get("dimension"),
-                    "reason": f"strategy discovery timeout after {total_timeout_sec}s",
+                    "reason": f"strategy discovery timeout after {discovery_timeout_sec}s",
                 }
             )
             break
@@ -11525,7 +11567,7 @@ def _run_strategy_discovery_prepass(
         result = _evaluate_sampled_budget_tasks_for_promotion(
             probe_context,
             probe_hints,
-            timeout_sec=eval_timeout_sec,
+            timeout_sec=discovery_eval_timeout_sec,
         )
         retry_summary: dict[str, Any] | None = None
         active_hints = probe_hints
@@ -11534,7 +11576,10 @@ def _run_strategy_discovery_prepass(
             retry_result = _evaluate_sampled_budget_tasks_for_promotion(
                 probe_context,
                 retry_hints,
-                timeout_sec=min(eval_timeout_sec, max(10, eval_timeout_sec // 2 if eval_timeout_sec else 0)),
+                timeout_sec=min(
+                    discovery_eval_timeout_sec,
+                    max(5, discovery_eval_timeout_sec // 2 if discovery_eval_timeout_sec else 0),
+                ),
             )
             retry_summary = {
                 "attempted": True,
@@ -11608,6 +11653,27 @@ def _run_strategy_discovery_prepass(
             path_moving_codes.append(
                 _strategy_discovery_program_source(str(variant.get("label", "strategy")), active_hints)
             )
+        partial_summary = {
+            "enabled": True,
+            "variant_count": len(variants),
+            "evaluated_count": len(records),
+            "path_moving_count": sum(
+                1 for item in records if item.get("path_differential", {}).get("selected_path_changed")
+            ),
+            "latency_improved_count": sum(1 for item in records if item.get("latency_improved")),
+            "skip_policy_digest_count": len(skip_policy_digests),
+            "path_moving_code_count": len(path_moving_codes),
+            "timed_out": False,
+            "timeout_sec": discovery_timeout_sec,
+            "eval_timeout_sec": discovery_eval_timeout_sec,
+            "records": records,
+        }
+        _write_strategy_discovery_artifacts(
+            discovery_dir,
+            partial_summary,
+            path_rows,
+            _strategy_discovery_examples(records),
+        )
     summary = {
         "enabled": True,
         "variant_count": len(variants),
@@ -11619,21 +11685,13 @@ def _run_strategy_discovery_prepass(
         "skip_policy_digest_count": len(skip_policy_digests),
         "path_moving_code_count": len(path_moving_codes),
         "timed_out": timed_out,
+        "timeout_sec": discovery_timeout_sec,
+        "eval_timeout_sec": discovery_eval_timeout_sec,
+        "elapsed_sec": round(time.monotonic() - discovery_started_at, 6),
         "records": records,
     }
-    (discovery_dir / "strategy_table.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
-    (discovery_dir / "path_delta_table.json").write_text(
-        json.dumps(path_rows, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
     examples = _strategy_discovery_examples(records)
-    (discovery_dir / "prompt_examples.json").write_text(
-        json.dumps(examples, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    _write_strategy_discovery_artifacts(discovery_dir, summary, path_rows, examples)
     return {
         "records": records,
         "path_moving_codes": path_moving_codes[:16],

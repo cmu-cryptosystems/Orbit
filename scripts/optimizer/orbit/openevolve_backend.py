@@ -11496,6 +11496,13 @@ def _run_strategy_discovery_prepass(
         policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
         complexity_reasons = _promotion_complexity_reasons(probe_hints)
         if complexity_reasons:
+            bounded = _bounded_retry_probe_hints(probe_hints)
+            bounded_reasons = _promotion_complexity_reasons(bounded)
+            if not bounded_reasons:
+                probe_hints = bounded
+                policy_digest = _hint_digest(_policy_effect_payload(probe_hints))
+                complexity_reasons = []
+        if complexity_reasons:
             record = {
                 "index": index,
                 "label": variant.get("label"),
@@ -11909,6 +11916,12 @@ def _run_sampled_promotion_pass(
         eval_hints = _compile_hints_for_eval_suite(hints, params.openevolve_eval_suite)
         probe_hints = _promotion_probe_hints(eval_hints, selected_probe_tasks)
         complexity_reasons = _promotion_complexity_reasons(probe_hints)
+        if complexity_reasons:
+            bounded = _bounded_retry_probe_hints(probe_hints)
+            bounded_reasons = _promotion_complexity_reasons(bounded)
+            if not bounded_reasons:
+                probe_hints = bounded
+                complexity_reasons = []
         if complexity_reasons:
             records.append(
                 _promotion_record_summary(

@@ -12,6 +12,7 @@ import hashlib
 import queue as queue_module
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 import traceback
@@ -12299,6 +12300,55 @@ def _evaluate_sampled_budget_tasks_dp_probe(
     }
 
 
+def _promotion_child_pids(pid: int) -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-P", str(int(pid))],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        try:
+            child = int(line.strip())
+        except ValueError:
+            continue
+        pids.append(child)
+        pids.extend(_promotion_child_pids(child))
+    return pids
+
+
+def _terminate_promotion_process(proc: multiprocessing.Process) -> dict[str, Any]:
+    root_pid = int(proc.pid or -1)
+    killed: list[int] = []
+    for sig, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        pids = list(dict.fromkeys(_promotion_child_pids(root_pid) + [root_pid]))
+        for pid in reversed(pids):
+            if pid <= 0:
+                continue
+            try:
+                os.kill(pid, sig)
+                killed.append(pid)
+            except OSError:
+                pass
+        if sig == signal.SIGTERM and hasattr(os, "killpg") and root_pid > 0:
+            try:
+                os.killpg(root_pid, sig)
+            except OSError:
+                pass
+        proc.join(grace)
+        if not proc.is_alive():
+            break
+    return {
+        "root_pid": root_pid,
+        "killed_pids": sorted(set(killed)),
+        "alive_after_kill": bool(proc.is_alive()),
+    }
+
+
 def _evaluate_sampled_budget_tasks_for_promotion(
     sampled_context: dict[str, Any],
     hints: dict[str, Any],
@@ -12334,29 +12384,14 @@ def _evaluate_sampled_budget_tasks_for_promotion(
         except queue_module.Empty:
             payload = None
     if payload is None and proc.is_alive():
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                proc.terminate()
-        else:
-            proc.terminate()
-        proc.join(5)
-        if proc.is_alive() and hasattr(proc, "kill"):
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-            else:
-                proc.kill()
-            proc.join(5)
+        kill_summary = _terminate_promotion_process(proc)
         return {
             "valid": False,
             "timed_out": True,
             "timeout_sec": int(timeout_sec),
             "timeout_phase": "qbp_solve",
             "last_timing_phase": "qbp_solve",
+            "worker_kill_summary": kill_summary,
             "error": f"promotion QBP evaluation timed out after {timeout_sec}s",
         }
     proc.join(5)
@@ -12409,23 +12444,7 @@ def _evaluate_dp_probe_for_promotion(
         except queue_module.Empty:
             payload = None
     if payload is None and proc.is_alive():
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                proc.terminate()
-        else:
-            proc.terminate()
-        proc.join(5)
-        if proc.is_alive() and hasattr(proc, "kill"):
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-            else:
-                proc.kill()
-            proc.join(5)
+        kill_summary = _terminate_promotion_process(proc)
         return {
             "valid": False,
             "timed_out": True,
@@ -12433,6 +12452,7 @@ def _evaluate_dp_probe_for_promotion(
             "timeout_phase": "dp_table_probe",
             "last_timing_phase": "dp_table_probe",
             "dp_table_probe": True,
+            "worker_kill_summary": kill_summary,
             "error": f"promotion DP probe timed out after {timeout_sec}s",
         }
     proc.join(5)

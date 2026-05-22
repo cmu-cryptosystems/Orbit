@@ -11980,9 +11980,12 @@ def _evaluate_sampled_budget_tasks_dp_probe(
             for item in task_context.get("io_budgets", [])
             if isinstance(item, dict)
         ]
+        selected_group_keys = _sampled_task_group_keys(task) if isinstance(task, dict) else set()
         task_group_summaries: list[dict[str, Any]] = []
         total["sampled_task_count"] += 1
         for group_key, group_budgets in _budget_boundary_groups(budgets).items():
+            if selected_group_keys and _boundary_group_key_string(group_key) not in selected_group_keys:
+                continue
             selected_results: list[_QBPDPBudgetResult] = []
             reachable = 0
             for budget in group_budgets:

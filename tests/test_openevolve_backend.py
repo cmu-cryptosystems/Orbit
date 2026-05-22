@@ -6926,6 +6926,7 @@ def test_qbp_dp_probe_preserves_complete_boundary_group(toy_cost_json: str):
         {"in_lvl": 16, "in_scl": 40, "out_lvl": out_lvl}
         for out_lvl in (14, 15, 16)
     ]
+    budgets.append({"in_lvl": 15, "in_scl": 40, "out_lvl": 15})
     context = build_context(graph, budgets, params)
     context["harness"] = {"eval_suite": "polybert-sampled"}
     context["sampled_budget_tasks"] = [
@@ -6945,6 +6946,7 @@ def test_qbp_dp_probe_preserves_complete_boundary_group(toy_cost_json: str):
     assert result["valid"]
     assert result["boundary_group_validity"] == 1.0
     assert result["candidate_qbp_coverage"] == 1.0
+    assert result["diagnostics"]["requested_boundary_groups"] == 1
     summary = result["diagnostics"]["boundary_group_summaries"][0]
     assert summary["requested_output_levels"] == [14, 15, 16]
     assert summary["candidate_complete"] is True

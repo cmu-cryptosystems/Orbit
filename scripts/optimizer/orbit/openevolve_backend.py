@@ -11652,6 +11652,78 @@ def _strategy_discovery_variants(
     if not output_splice_selectors:
         output_splice_selectors.append({})
 
+    reference_patterns = _reference_bootstrap_patterns_from_context(context)
+
+    def reference_anchor_nodes_for_tasks(limit: int = 12) -> list[str]:
+        if not reference_patterns or not selected_probe_tasks:
+            return []
+        anchors: list[str] = []
+        seen: set[str] = set()
+        policy = {
+            "bootstrap_anchor_selector": "reference_bootstrap_locations",
+            "bootstrap_anchor_include_patterns": reference_patterns,
+            "bootstrap_anchor_count": max(limit, min(64, len(reference_patterns) * 2)),
+        }
+        for task in selected_probe_tasks:
+            task_context = task.get("context") if isinstance(task, dict) else None
+            if not isinstance(task_context, dict):
+                continue
+            try:
+                task_tdag = tdag_from_context(task_context)
+                task_anchors = _reference_bootstrap_anchor_nodes(
+                    task_tdag,
+                    max(limit, min(64, len(reference_patterns) * 2)),
+                    policy,
+                )
+            except Exception:
+                task_anchors = []
+            for node in task_anchors:
+                if node in seen:
+                    continue
+                seen.add(node)
+                anchors.append(node)
+                if len(anchors) >= limit:
+                    return anchors
+        return anchors
+
+    reference_anchor_nodes = reference_anchor_nodes_for_tasks()
+
+    def reference_probe_patch(
+        boundary_policy: str,
+        scale_lattice: str,
+        *,
+        force: bool,
+        radius: int,
+    ) -> dict[str, Any]:
+        patch = {
+            "dp_probe_mode": "force_node_splice" if force else "seed_neighborhood",
+            "dp_seed_exact_only": False,
+            "dp_force_nodes_only": bool(force),
+            "dp_disable_seed_exact_candidate": bool(force),
+            "enable_seed_frontier_anchor": True,
+            "dp_seed_neighborhood_radius": int(radius),
+            "dp_max_combos_per_node": 1 if force else 2,
+            "dp_max_incoming_options_per_combo": 2 if force else 4,
+            "dp_max_level_candidates": 3,
+            "dp_max_output_states_per_input": 4 if force else 5,
+            "boundary_scale_policy": boundary_policy,
+            "scale_lattice": scale_lattice,
+            "frontier_cap": 4 if force else 8,
+            "state_cap_per_node": 4 if force else 8,
+            "boundary_state_cap": 4 if force else 6,
+            "max_scale_candidates": 12 if force else 24,
+            "bootstrap_penalty": 35_000_000.0,
+            "selection_bootstrap_penalty": 0.0,
+            "selection_objective": "cost",
+            "bootstrap_anchor_selector": "reference_bootstrap_locations",
+            "bootstrap_anchor_include_patterns": reference_patterns,
+            "bootstrap_anchor_count": max(4, min(32, len(reference_patterns))),
+            "force_bootstrap_anchors": bool(force),
+        }
+        if force and reference_anchor_nodes:
+            patch["force_bootstrap_nodes"] = reference_anchor_nodes[:1]
+        return patch
+
     def output_splice_patch(boundary_policy: str, scale_lattice: str) -> dict[str, Any]:
         return {
             "dp_probe_mode": "output_splice",
@@ -11745,6 +11817,42 @@ def _strategy_discovery_variants(
                 changed_keys=[
                     "boundary_group_policies",
                     "dp_probe_mode",
+                    "boundary_scale_policy",
+                    "scale_lattice",
+            ],
+        )
+    if reference_patterns:
+        reference_specs = (
+            ("reference_anchor_forced_sparse", "frontier", "waterline_sf", True, 1),
+            ("reference_anchor_neighborhood_frontier", "frontier", "waterline_sf", False, 1),
+            ("reference_anchor_neighborhood_dense", "frontier", "dense", False, 2),
+        )
+        for label, boundary_policy, scale_lattice, force, radius in reference_specs:
+            patch = reference_probe_patch(
+                boundary_policy,
+                scale_lattice,
+                force=force,
+                radius=radius,
+            )
+            add(
+                label,
+                "reference_bootstrap_anchor_policy",
+                {
+                    "boundary_group_policies": [
+                        {
+                            "selector": output_splice_selectors[0],
+                            "policy": patch,
+                        }
+                    ]
+                }
+                if output_splice_selectors[0]
+                else patch,
+                changed_keys=[
+                    "boundary_group_policies",
+                    "dp_probe_mode",
+                    "bootstrap_anchor_selector",
+                    "bootstrap_anchor_include_patterns",
+                    "force_bootstrap_nodes",
                     "boundary_scale_policy",
                     "scale_lattice",
                 ],
@@ -11966,6 +12074,10 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
         "bounded_neighborhood",
         "bounded-neighborhood",
         "neighborhood",
+        "force_node_splice",
+        "force-node-splice",
+        "anchor_splice",
+        "anchor-splice",
         "output_splice",
         "output-splice",
         "terminal_splice",
@@ -11985,6 +12097,12 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
             result.setdefault("dp_max_combos_per_node", 1)
             result.setdefault("dp_max_incoming_options_per_combo", 4)
             result.setdefault("dp_max_output_states_per_input", 6)
+        elif mode in {"force_node_splice", "force-node-splice", "anchor_splice", "anchor-splice"}:
+            result["dp_force_nodes_only"] = True
+            result.setdefault("dp_disable_seed_exact_candidate", True)
+            result.setdefault("dp_max_combos_per_node", 1)
+            result.setdefault("dp_max_incoming_options_per_combo", 2)
+            result.setdefault("dp_max_output_states_per_input", 4)
         else:
             result.setdefault("dp_max_combos_per_node", 2)
             result.setdefault("dp_max_incoming_options_per_combo", 3)
@@ -12029,10 +12147,13 @@ def _strategy_discovery_examples(records: list[dict[str, Any]]) -> list[dict[str
                 "dimension": item.get("dimension"),
                 "direct_valid": bool(item.get("direct_valid")),
                 "latency_improved": bool(item.get("latency_improved")),
+                "promotable": bool(item.get("direct_valid")) and bool(item.get("latency_improved")),
+                "reason": item.get("reason"),
                 "collapse_reason": diff.get("collapse_reason"),
                 "selected_path_digest": item.get("selected_path_digest", ""),
                 "reference_latency_usec": item.get("reference_latency_usec"),
                 "latency_usec": item.get("latency_usec"),
+                "latency_delta_usec": diff.get("latency_delta_usec"),
                 "selected_source_counts": item.get("selected_source_counts", {}),
                 "changed_keys": item.get("changed_keys", []),
             }
@@ -16651,6 +16772,11 @@ def _qbp_dp_node_states(
     seed_edge_targets: dict[str, int] = {
         str(k): int(v) for k, v in dict(seed_edge_scales).items()
     }
+    force_bootstrap_node = (
+        str(node) in policy.get("force_bootstrap_nodes", set())
+        and not policy.get("forbid_bootstrap", False)
+    )
+    force_nodes_only = _bool_hint(hints.get("dp_force_nodes_only"), False)
     online_prune_limit = max(state_cap * 8, 64)
     if isinstance(trace, dict):
         trace["active_node_progress"] = {
@@ -16679,7 +16805,24 @@ def _qbp_dp_node_states(
     )
     if seed_exact_state is None and output_splice_only and node not in tdag.outputs:
         seed_exact_state = _qbp_dp_seed_candidate_state(seed_anchor, str(node))
+    if force_bootstrap_node and seed_exact_state is not None:
+        seed_input_tuple = _qbp_dp_seed_tuple(seed_node_inputs.get(str(node)))
+        seed_output_tuple_for_check = _qbp_dp_seed_tuple(seed_node_outputs.get(str(node)))
+        if (
+            seed_input_tuple is not None
+            and seed_output_tuple_for_check is not None
+            and params.check_res(
+                int(seed_input_tuple[0]),
+                int(seed_input_tuple[1]),
+                int(seed_output_tuple_for_check[0]),
+                int(seed_output_tuple_for_check[1]),
+            )
+        ):
+            seed_exact_state = None
+            rejection_counts["forced_anchor_seed_exact_no_bootstrap"] += 1
     seed_exact_disabled_requested = _bool_hint(hints.get("dp_disable_seed_exact_candidate"), False)
+    if force_nodes_only:
+        seed_exact_disabled_requested = bool(force_bootstrap_node)
     seed_exact_disabled = seed_exact_disabled_requested and not (
         _bool_hint(hints.get("dp_seed_splice_output_only"), False)
         and node not in tdag.outputs
@@ -16744,6 +16887,7 @@ def _qbp_dp_node_states(
         and (
             _bool_hint(hints.get("dp_seed_exact_only"), False)
             or (output_splice_only and node not in tdag.outputs)
+            or (force_nodes_only and not force_bootstrap_node)
         )
     ):
         pruned = _qbp_dp_prune_states(candidate_states, state_cap, params)
@@ -16992,6 +17136,14 @@ def _qbp_dp_node_states(
                     )
                     if metrics is None:
                         rejection_counts["output_transition_invalid"] += 1
+                        continue
+                    if force_bootstrap_node and params.check_res(
+                        input_level,
+                        node_scale,
+                        output_level,
+                        output_scale,
+                    ):
+                        rejection_counts["forced_anchor_no_bootstrap_transition"] += 1
                         continue
                     vertex_cost, vertex_bootstrap, vertex_rescale = metrics
                     op_cost = _qbp_dp_op_cost(tdag, node, input_level, le)

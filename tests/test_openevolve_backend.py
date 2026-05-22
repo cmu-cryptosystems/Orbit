@@ -2589,6 +2589,96 @@ def test_reference_json_adds_reference_boundary_action(toy_cost_json: str):
     assert anchors == ["seed"]
 
 
+def test_strategy_discovery_includes_reference_anchor_probe_variants(
+    toy_cost_json: str,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = Tdag(params, "reference_probe_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "seed",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    graph.add_edge("arg0", "seed")
+    graph.inputs = {"arg0"}
+    graph.outputs = {"seed"}
+    task_context = build_context(
+        graph,
+        [{"in_lvl": params.lvl_ub, "in_scl": params.Sw, "out_lvl": params.lvl_ub}],
+        params,
+    )
+    context = build_compile_context(graph, params)
+    context.setdefault("harness", {})["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+    selected_tasks = [
+        {
+            "index": 0,
+            "group_keys": [
+                {
+                    "in_lvl": params.lvl_ub,
+                    "in_scl": params.Sw,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": task_context,
+        }
+    ]
+
+    variants = oe_backend._strategy_discovery_variants(
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        context,
+        selected_tasks,
+    )
+    by_label = {str(item["label"]): item for item in variants}
+
+    assert "reference_anchor_neighborhood_frontier" in by_label
+    assert "reference_anchor_forced_sparse" in by_label
+    forced = by_label["reference_anchor_forced_sparse"]["hints"]["boundary_group_policies"][0][
+        "policy"
+    ]
+    assert forced["bootstrap_anchor_selector"] == "reference_bootstrap_locations"
+    assert "inv_sqrt_seed" in forced["bootstrap_anchor_include_patterns"]
+    assert forced["force_bootstrap_nodes"] == ["seed"]
+    assert forced["dp_probe_mode"] == "force_node_splice"
+    assert forced["dp_force_nodes_only"] is True
+    assert forced["dp_seed_exact_only"] is False
+
+
+def test_strategy_discovery_examples_mark_promotable_status():
+    examples = oe_backend._strategy_discovery_examples(
+        [
+            {
+                "label": "changed_faster",
+                "dimension": "reference_bootstrap_anchor_policy",
+                "direct_valid": True,
+                "latency_improved": True,
+                "reason": "latency_improved",
+                "reference_latency_usec": 100.0,
+                "latency_usec": 90.0,
+                "path_differential": {
+                    "selected_path_changed": True,
+                    "collapse_reason": "changed_faster",
+                    "latency_delta_usec": -10.0,
+                },
+                "changed_keys": ["force_bootstrap_nodes"],
+            }
+        ]
+    )
+
+    assert examples[0]["promotable"] is True
+    assert examples[0]["reason"] == "latency_improved"
+    assert examples[0]["latency_delta_usec"] == -10.0
+
+
 def test_policy_bank_does_not_inject_model_specific_bootstrap_targets(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_search_mode="bootstrap-mcts")
     context = build_compile_context(_mul_chain_pdag(params, length=4), params)

@@ -5395,6 +5395,143 @@ def _task_reference_anchor_summary(
     }
 
 
+def _node_matches_reference_patterns(attrs: dict[str, Any], patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+    text = (
+        f"{_node_location(attrs)};{_node_scope(attrs)};"
+        f"{_node_op_tag(attrs)};{attrs.get('comment', '')}"
+    ).lower()
+    return any(pattern and pattern in text for pattern in patterns)
+
+
+def _reference_anchor_seed_group_candidates(
+    task: dict[str, Any],
+    context: dict[str, Any],
+    metric_groups: list[dict[str, Any]],
+    *,
+    cap: int,
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
+    """Rank probe boundary groups by overlap with reference bootstrap locations.
+
+    A task may contain nodes that match the Gurobi/reference MLIR bootstrap
+    locations, while the highest-cost boundary group in that task exercises a
+    seed route that never reaches those matched maintenance nodes.  This helper
+    uses the current seed route for each boundary group as a cheap routing
+    witness, then selects groups whose seed bootstrap nodes overlap the
+    reference locations.  The selected groups are still evaluated normally by
+    QBP-DP; this only chooses better probes.
+    """
+
+    patterns = _reference_bootstrap_patterns_from_context(context)
+    if not patterns or cap <= 0:
+        return [], 0.0, {"reference_anchor_group_count": 0}
+    task_context = task.get("context") if isinstance(task, dict) else None
+    if not isinstance(task_context, dict):
+        return [], 0.0, {"reference_anchor_group_count": 0}
+    try:
+        task_tdag = tdag_from_context(task_context)
+        task_params = task_tdag.params
+        task_le = LatencyEstimator(task_params)
+        budgets = [
+            _io_budget_from_json(item)
+            for item in task_context.get("io_budgets", [])
+            if isinstance(item, dict)
+        ]
+        groups = _budget_boundary_groups(budgets)
+    except Exception as exc:
+        return [], 0.0, {
+            "reference_anchor_group_count": 0,
+            "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+    metric_cost_by_key: dict[str, float] = {}
+    for item in metric_groups:
+        if not isinstance(item, dict) or not isinstance(item.get("group_key"), dict):
+            continue
+        key = _boundary_group_key_from_dict(item["group_key"])
+        metric_cost_by_key[key] = max(
+            metric_cost_by_key.get(key, 0.0),
+            _finite_float(item.get("min_cost_usec"), 0.0),
+        )
+    scan_cap = max(
+        cap,
+        min(
+            128,
+            _int_hint(os.environ.get("ORBIT_OPENEVOLVE_REFERENCE_GROUP_SCAN_CAP"), 32),
+        ),
+    )
+    explicit_keys = _sampled_task_group_keys(task)
+    sorted_groups = sorted(
+        groups.items(),
+        key=lambda item: (
+            0 if not explicit_keys or _boundary_group_key_string(item[0]) in explicit_keys else 1,
+            -metric_cost_by_key.get(_boundary_group_key_string(item[0]), 0.0),
+            _boundary_group_key_string(item[0]),
+        ),
+    )[:scan_cap]
+    scored: list[tuple[int, float, str, dict[str, Any], list[str]]] = []
+    hints: dict[str, Any] = {
+        "enable_seed_frontier_anchor": True,
+        "_qbp_dp_internal_cache": {"stats": {}},
+    }
+    for group_key, group_budgets in sorted_groups:
+        matched_nodes: list[str] = []
+        matched_locations: list[str] = []
+        for budget in group_budgets[: max(1, min(3, len(group_budgets)))]:
+            seed_anchor = _qbp_dp_seed_anchor_data(
+                task_tdag,
+                task_params,
+                budget,
+                task_le,
+                hints,
+            )
+            if not isinstance(seed_anchor, dict) or not seed_anchor.get("valid"):
+                continue
+            for node in seed_anchor.get("bootstrap_nodes", []) or []:
+                node_key = str(node)
+                if node_key not in task_tdag.nodes:
+                    continue
+                attrs = dict(task_tdag.nodes[node_key])
+                if not _node_matches_reference_patterns(attrs, patterns):
+                    continue
+                if node_key not in matched_nodes:
+                    matched_nodes.append(node_key)
+                location = _node_location(attrs)
+                if location and location not in matched_locations:
+                    matched_locations.append(location)
+        if not matched_nodes:
+            continue
+        key_string = _boundary_group_key_string(group_key)
+        cost = metric_cost_by_key.get(key_string, 0.0)
+        if cost <= 0:
+            cost = _finite_float(task.get("seed_metrics", {}).get("sampled_dp_latency_usec"), 0.0)
+        scored.append(
+            (
+                len(matched_nodes),
+                float(cost),
+                key_string,
+                _boundary_group_key_to_dict(group_key),
+                matched_locations[:8],
+            )
+        )
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    selected = [deepcopy(item[3]) for item in scored[:cap]]
+    selected_keys = {_boundary_group_key_from_dict(item) for item in selected}
+    total_cost = sum(
+        metric_cost_by_key.get(key, 0.0)
+        for key in selected_keys
+    )
+    summary = {
+        "reference_anchor_group_count": len(scored),
+        "selected_reference_anchor_group_count": len(selected),
+        "selected_reference_anchor_locations": [
+            {"group_key": item[2], "locations": item[4]}
+            for item in scored[:cap]
+        ],
+    }
+    return selected, float(total_cost), summary
+
+
 def _metric_task_position(
     metric: dict[str, Any],
     tasks: list[dict[str, Any]],
@@ -5418,6 +5555,7 @@ def _metric_selected_probe_task(
     task: dict[str, Any],
     *,
     use_reference_task_groups: bool,
+    context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], float]:
     selected_task = deepcopy(task)
     task_latency = _task_seed_metric_latency(metric)
@@ -5459,6 +5597,21 @@ def _metric_selected_probe_task(
         if group_keys:
             selected_task["group_keys"] = deepcopy(group_keys)
             selected_task["reference_anchor_probe_group_cap"] = cap
+            if context is not None:
+                ref_group_keys, ref_group_cost, ref_group_summary = (
+                    _reference_anchor_seed_group_candidates(
+                        task,
+                        context,
+                        metric_groups,
+                        cap=cap,
+                    )
+                )
+                if ref_group_keys:
+                    selected_task["group_keys"] = deepcopy(ref_group_keys)
+                    selected_task["reference_anchor_probe_group_source"] = "seed_route_reference_overlap"
+                    selected_task["reference_anchor_group_summary"] = ref_group_summary
+                    if ref_group_cost > 0:
+                        group_cost = ref_group_cost
             return selected_task, group_cost
     if metric_groups:
         group = metric_groups[0]
@@ -5525,6 +5678,7 @@ def _promotion_probe_tasks_from_seed_metrics(
             metric,
             tasks[position],
             use_reference_task_groups=bool(reference_summary),
+            context=context,
         )
         if reference_summary:
             selected_task["reference_anchor_probe"] = True
@@ -10801,6 +10955,17 @@ def _promotion_eval_timeout_sec(params: Params) -> int:
     return max(0, min(3_600, value))
 
 
+def _promotion_long_retry_timeout_sec(current_timeout_sec: int) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_LONG_RETRY_TIMEOUT_SEC", "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(3_600, value if value > current_timeout_sec else 0))
+
+
 def _strategy_discovery_enabled() -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY", "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -13824,6 +13989,30 @@ def _evaluate_dp_probe_for_promotion(
     if payload is None and proc.is_alive():
         kill_summary = _terminate_promotion_process(proc)
         progress_trace = _load_dp_progress_trace(trace_path)
+        long_retry = None
+        long_retry_timeout = _promotion_long_retry_timeout_sec(int(timeout_sec))
+        if (
+            long_retry_timeout > int(timeout_sec)
+            and not _bool_hint(probe_hints.get("_dp_long_timeout_retry"), False)
+        ):
+            retry_hints = dict(hints)
+            retry_hints["_dp_long_timeout_retry"] = True
+            retry_hints["dp_trace_label"] = "long_timeout_retry"
+            retry_hints.pop("dp_trace_path", None)
+            long_retry = _evaluate_dp_probe_for_promotion(
+                context,
+                retry_hints,
+                selected_probe_tasks,
+                timeout_sec=long_retry_timeout,
+                materialize=materialize,
+            )
+            if isinstance(long_retry, dict):
+                long_retry["long_retry_from_timeout"] = True
+                long_retry["long_retry_timeout_sec"] = long_retry_timeout
+                long_retry["original_timeout_sec"] = int(timeout_sec)
+                long_retry["original_timeout_trace"] = progress_trace
+                if not bool(long_retry.get("timed_out", False)):
+                    return long_retry
         bounded_retry = None
         if not _bool_hint(probe_hints.get("dp_seed_exact_only"), False):
             retry_hints = dict(hints)
@@ -13863,6 +14052,8 @@ def _evaluate_dp_probe_for_promotion(
             "worker_kill_summary": kill_summary,
             "dp_progress_trace_path": str(trace_path) if trace_path is not None else None,
             "dp_progress_trace": progress_trace,
+            "long_retry": long_retry,
+            "long_retry_timeout_sec": long_retry_timeout,
             "bounded_retry": bounded_retry,
             "error": f"promotion DP probe timed out after {timeout_sec}s",
         }
@@ -14208,7 +14399,8 @@ def _run_sampled_promotion_pass(
         else:
             print(
                 "OpenEvolve compile harness: sampled promotion "
-                f"candidate {len(seen)}/{len(codes)} {probe_stage_name} timeout={eval_timeout_sec}s.",
+                f"candidate {len(seen)}/{len(codes)} {probe_stage_name} "
+                f"timeout_limit={eval_timeout_sec}s.",
                 flush=True,
             )
             _write_promotion_progress(
@@ -14361,7 +14553,7 @@ def _run_sampled_promotion_pass(
             print(
                 "OpenEvolve compile harness: sampled promotion "
                 f"candidate {len(seen)}/{len(codes)} materialized DP probe "
-                f"timeout={eval_timeout_sec}s.",
+                f"timeout_limit={eval_timeout_sec}s.",
                 flush=True,
             )
             materialized_probe_result = _evaluate_dp_probe_for_promotion(
@@ -14441,7 +14633,8 @@ def _run_sampled_promotion_pass(
             break
         print(
             "OpenEvolve compile harness: sampled promotion "
-            f"candidate {len(seen)}/{len(codes)} sampled_qbp timeout={eval_timeout_sec}s.",
+            f"candidate {len(seen)}/{len(codes)} sampled_qbp "
+            f"timeout_limit={eval_timeout_sec}s.",
             flush=True,
         )
         _write_promotion_progress(

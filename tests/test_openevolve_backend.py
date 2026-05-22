@@ -6790,6 +6790,69 @@ def test_promotion_probe_prefers_reference_anchor_task_over_plain_top_cost(
     assert selected[0]["group_keys"] == [reference_groups[0]]
 
 
+def test_reference_anchor_probe_prefers_group_whose_seed_route_matches_reference(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    graph = Tdag(params, "reference_group_probe_graph")
+    graph.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    graph.add_node(
+        "anchor",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    graph.add_node("other", op="mul", weight=1, op_descr={"single": 1, "double": 0}, comment="")
+    graph.add_edges_from([("arg0", "anchor"), ("arg0", "other")])
+    graph.inputs = {"arg0"}
+    graph.outputs = {"anchor"}
+    context = build_compile_context(graph, params)
+    context["harness"]["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+    group_high_cost = {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0}
+    group_reference = {"in_lvl": -1, "in_scl": 41, "maino_v": "", "main_dag_size": 0}
+    task = {
+        "index": 0,
+        "context": build_context(
+            graph,
+            [
+                {"in_lvl": -1, "in_scl": 40, "out_lvl": params.lvl_ub},
+                {"in_lvl": -1, "in_scl": 41, "out_lvl": params.lvl_ub},
+            ],
+            params,
+        ),
+    }
+    metric = {
+        "task_position": 0,
+        "task_index": 0,
+        "sampled_dp_latency_usec": 1000.0,
+        "top_costly_boundary_groups": [
+            {"group_key": group_high_cost, "min_cost_usec": 900.0},
+            {"group_key": group_reference, "min_cost_usec": 100.0},
+        ],
+    }
+
+    def fake_seed_anchor(_tdag, _params, budget, _le, _hints):
+        node = "anchor" if int(budget.get("in_scl", 0)) == 41 else "other"
+        return {"valid": True, "bootstrap_nodes": [node]}
+
+    monkeypatch.setattr(oe_backend, "_qbp_dp_seed_anchor_data", fake_seed_anchor)
+
+    selected, group_cost = oe_backend._metric_selected_probe_task(
+        metric,
+        task,
+        use_reference_task_groups=True,
+        context=context,
+    )
+
+    assert selected["group_keys"] == [group_reference]
+    assert selected["reference_anchor_probe_group_source"] == "seed_route_reference_overlap"
+    assert group_cost == 100.0
+
+
 def test_reference_anchor_probe_reconstructs_group_keys_when_metrics_lack_groups(
     toy_cost_json: str,
     monkeypatch,
@@ -7799,6 +7862,56 @@ def test_qbp_dp_promotion_probe_honors_timeout(
     assert result["timeout_phase"] == "dp_table_probe"
     assert result["dp_progress_trace_path"]
     assert result["dp_progress_trace"]["last_node"] == "mul0"
+
+
+def test_qbp_dp_promotion_probe_can_long_retry_after_timeout(
+    monkeypatch, toy_cost_json: str, tmp_path: Path
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_LONG_RETRY_TIMEOUT_SEC", "3")
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+
+    def maybe_slow_dp_probe(_context, _hints, *, selected_tasks=None, materialize=False):
+        if not _hints.get("_dp_long_timeout_retry"):
+            trace_path = Path(_hints["dp_trace_path"])
+            trace_path.write_text(
+                json.dumps({"last_stage": "node_incoming_option", "last_node": "mul0"})
+                + "\n",
+                encoding="utf-8",
+            )
+            time.sleep(5)
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "sampled_dp_latency_usec": 42.0,
+            "objective_cost_usec": 42.0,
+            "sampled_selected_path_digest": "long-retry-path",
+        }
+
+    monkeypatch.setattr(
+        oe_backend,
+        "_evaluate_sampled_budget_tasks_dp_probe",
+        maybe_slow_dp_probe,
+    )
+
+    result = oe_backend._evaluate_promotion_probe(
+        {"sampled_budget_tasks": [], "harness": {"dp_trace_dir": str(tmp_path)}},
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        params,
+        [],
+        timeout_sec=1,
+    )
+
+    assert result["valid"] is True
+    assert result["long_retry_from_timeout"] is True
+    assert result["long_retry_timeout_sec"] == 3
+    assert result["original_timeout_sec"] == 1
+    assert result["sampled_selected_path_digest"] == "long-retry-path"
 
 
 def test_qbp_dp_progress_trace_file_is_written(toy_cost_json: str, tmp_path: Path):

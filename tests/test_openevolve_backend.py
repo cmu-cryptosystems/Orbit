@@ -7182,6 +7182,39 @@ def test_qbp_dp_prune_preserves_seed_bridge_but_prefers_direct_state(
     assert by_key[(12, 52)].cost == 100.0
 
 
+def test_qbp_dp_prune_preserves_seed_neighborhood_candidate(
+    toy_cost_json: str,
+):
+    params = _params(toy_cost_json)
+    cheap_states = [
+        oe_backend._QBPDPState(4, 40 + idx, float(idx), 0.0, 0.0)
+        for idx in range(12)
+    ]
+    seed_neighborhood = oe_backend._QBPDPState(
+        13,
+        76,
+        10_000.0,
+        2.0,
+        5.0,
+        None,
+        "candidate_seed_neighborhood",
+        0.0,
+    )
+
+    pruned = oe_backend._qbp_dp_prune_states(
+        cheap_states + [seed_neighborhood],
+        1,
+        params,
+    )
+
+    assert any(
+        state.level == 13
+        and state.scale == 76
+        and state.source == "candidate_seed_neighborhood"
+        for state in pruned
+    )
+
+
 def test_qbp_dp_probe_records_failure_trace_and_seed_bridge(
     toy_cost_json: str, monkeypatch
 ):

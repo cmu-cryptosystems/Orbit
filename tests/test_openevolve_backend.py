@@ -6564,6 +6564,94 @@ def test_promotion_probe_uses_top_group_from_seed_metrics(toy_cost_json: str):
     ]
 
 
+def test_promotion_probe_prefers_reference_anchor_task_over_plain_top_cost(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", "1")
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    plain = Tdag(params, "plain_probe_graph")
+    plain.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    plain.add_node("plain_mul", op="mul", weight=1, op_descr={"single": 1, "double": 0}, comment="")
+    plain.add_edge("arg0", "plain_mul")
+    plain.inputs = {"arg0"}
+    plain.outputs = {"plain_mul"}
+
+    reference = Tdag(params, "reference_probe_graph")
+    reference.add_node("arg0", op="input", weight=1, op_descr={}, comment="")
+    reference.add_node(
+        "seed",
+        op="mul",
+        weight=1,
+        op_descr={"single": 1, "double": 0},
+        comment="scope=fhe_bert.bert.encoder.layer.0.output.LayerNorm;op=inv_sqrt_seed",
+    )
+    reference.add_edge("arg0", "seed")
+    reference.inputs = {"arg0"}
+    reference.outputs = {"seed"}
+
+    plain_groups = [
+        {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+    ]
+    reference_groups = [
+        {"in_lvl": -1, "in_scl": 41, "maino_v": "", "main_dag_size": 0},
+        {"in_lvl": 8, "in_scl": 120, "maino_v": "", "main_dag_size": 0},
+    ]
+    context = build_compile_context(reference, params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": plain_groups,
+            "context": build_context(
+                plain,
+                [{"in_lvl": -1, "in_scl": 40, "out_lvl": params.lvl_ub}],
+                params,
+            ),
+        },
+        {
+            "index": 1,
+            "context": build_context(
+                reference,
+                [
+                    {"in_lvl": -1, "in_scl": 41, "out_lvl": params.lvl_ub},
+                    {"in_lvl": 8, "in_scl": 120, "out_lvl": params.lvl_ub},
+                ],
+                params,
+            ),
+        },
+    ]
+    context["harness"]["reference_json"] = {
+        "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2}
+    }
+    context["harness"]["sampled_task_seed_metrics"] = [
+        {
+            "task_position": 0,
+            "task_index": 0,
+            "sampled_dp_latency_usec": 500.0,
+            "top_costly_boundary_groups": [
+                {"group_key": plain_groups[0], "min_cost_usec": 500.0}
+            ],
+        },
+        {
+            "task_position": 1,
+            "task_index": 1,
+            "sampled_dp_latency_usec": 100.0,
+            "top_costly_boundary_groups": [
+                {"group_key": reference_groups[0], "min_cost_usec": 100.0}
+            ],
+        },
+    ]
+
+    selected, reference_cost = oe_backend._promotion_probe_tasks(context)
+
+    assert reference_cost == 100.0
+    assert len(selected) == 1
+    assert selected[0]["index"] == 1
+    assert selected[0]["reference_anchor_probe"] is True
+    assert selected[0]["reference_anchor_summary"]["reference_anchor_nodes"] == ["seed"]
+    assert selected[0]["group_keys"] == reference_groups
+
+
 def test_top_cost_groups_reconstructed_from_sampled_task_metrics(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)

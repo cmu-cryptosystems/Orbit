@@ -5151,13 +5151,23 @@ def _boundary_group_key_from_dict(item: dict[str, Any]) -> str:
     )
 
 
-def _sampled_task_group_keys(task: dict[str, Any]) -> set[str]:
-    keys: set[str] = set()
-    for item in task.get("group_keys", []) or []:
-        if isinstance(item, dict):
-            keys.add(_boundary_group_key_from_dict(item))
-    if keys:
-        return keys
+def _boundary_group_key_to_dict(group_key: tuple) -> dict[str, Any]:
+    return {
+        "in_lvl": int(group_key[0]),
+        "in_scl": int(group_key[1]),
+        "maino_v": str(group_key[2]),
+        "main_dag_size": int(group_key[3]),
+    }
+
+
+def _sampled_task_group_key_dicts(task: dict[str, Any]) -> list[dict[str, Any]]:
+    explicit = [
+        deepcopy(item)
+        for item in task.get("group_keys", []) or []
+        if isinstance(item, dict)
+    ]
+    if explicit:
+        return explicit
     context = task.get("context", {})
     budgets = context.get("io_budgets", []) if isinstance(context, dict) else []
     try:
@@ -5169,8 +5179,22 @@ def _sampled_task_group_keys(task: dict[str, Any]) -> set[str]:
             ]
         )
     except Exception:
+        return []
+    return [
+        _boundary_group_key_to_dict(key)
+        for key in sorted(grouped, key=_boundary_group_key_string)
+    ]
+
+
+def _sampled_task_group_keys(task: dict[str, Any]) -> set[str]:
+    keys = {
+        _boundary_group_key_from_dict(item)
+        for item in _sampled_task_group_key_dicts(task)
+        if isinstance(item, dict)
+    }
+    if keys:
         return keys
-    return {_boundary_group_key_string(key) for key in grouped}
+    return set()
 
 
 def _sampled_task_metric_summary(
@@ -5294,6 +5318,93 @@ def _task_seed_metric_latency(metric: dict[str, Any]) -> float:
     return float("inf")
 
 
+def _task_reference_anchor_summary(
+    task: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    limit: int = 12,
+) -> dict[str, Any]:
+    patterns = _reference_bootstrap_patterns_from_context(context)
+    if not patterns:
+        return {"reference_anchor_count": 0, "reference_anchor_nodes": []}
+    task_context = task.get("context") if isinstance(task, dict) else None
+    if not isinstance(task_context, dict):
+        return {"reference_anchor_count": 0, "reference_anchor_nodes": []}
+    try:
+        task_tdag = tdag_from_context(task_context)
+        anchors = _reference_bootstrap_anchor_nodes(
+            task_tdag,
+            max(1, min(64, int(limit))),
+            {
+                "bootstrap_anchor_selector": "reference_bootstrap_locations",
+                "bootstrap_anchor_include_patterns": patterns,
+                "bootstrap_anchor_count": max(1, min(64, int(limit))),
+            },
+        )
+    except Exception:
+        anchors = []
+    locations: list[str] = []
+    for node in anchors[:limit]:
+        attrs = dict(task_tdag.nodes[node]) if "task_tdag" in locals() and node in task_tdag.nodes else {}
+        location = _node_location(attrs) or _node_op_tag(attrs) or _node_scope(attrs)
+        if location and location not in locations:
+            locations.append(location)
+    return {
+        "reference_anchor_count": len(anchors),
+        "reference_anchor_nodes": [str(node) for node in anchors[:limit]],
+        "reference_anchor_locations": locations[:limit],
+    }
+
+
+def _metric_task_position(
+    metric: dict[str, Any],
+    tasks: list[dict[str, Any]],
+) -> int:
+    position = _safe_int(metric.get("task_position"), -1)
+    task_index = _safe_int(metric.get("task_index"), position)
+    if position < 0 or position >= len(tasks):
+        position = next(
+            (
+                idx
+                for idx, task in enumerate(tasks)
+                if _safe_int(task.get("index"), idx) == task_index
+            ),
+            -1,
+        )
+    return position
+
+
+def _metric_selected_probe_task(
+    metric: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    use_reference_task_groups: bool,
+) -> tuple[dict[str, Any], float]:
+    selected_task = deepcopy(task)
+    task_latency = _task_seed_metric_latency(metric)
+    group_cost = task_latency
+    metric_groups = [
+        item
+        for item in metric.get("top_costly_boundary_groups", []) or []
+        if isinstance(item, dict) and isinstance(item.get("group_key"), dict)
+    ]
+    if use_reference_task_groups:
+        group_keys = (
+            _sampled_task_group_key_dicts(task)
+            or list(metric.get("group_keys", []) or [])
+        )
+        if group_keys:
+            selected_task["group_keys"] = deepcopy(group_keys)
+            return selected_task, group_cost
+    if metric_groups:
+        group = metric_groups[0]
+        selected_task["group_keys"] = [deepcopy(group["group_key"])]
+        group_cost = _finite_float(group.get("min_cost_usec"), group_cost)
+    elif metric.get("group_keys"):
+        selected_task["group_keys"] = deepcopy(metric.get("group_keys", []))
+    return selected_task, group_cost
+
+
 def _promotion_probe_tasks_from_seed_metrics(
     context: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float] | None:
@@ -5319,41 +5430,55 @@ def _promotion_probe_tasks_from_seed_metrics(
     ]
     if not usable:
         return None
+    reference_scored: list[tuple[int, float, int, dict[str, Any], dict[str, Any]]] = []
+    for metric in usable:
+        position = _metric_task_position(metric, tasks)
+        if position < 0 or position >= len(tasks):
+            continue
+        summary = _task_reference_anchor_summary(tasks[position], context)
+        score = int(summary.get("reference_anchor_count", 0) or 0)
+        if score > 0:
+            reference_scored.append(
+                (score, _task_seed_metric_latency(metric), position, metric, summary)
+            )
+    reference_scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
     usable.sort(key=_task_seed_metric_latency, reverse=True)
     selected: list[dict[str, Any]] = []
     selected_cost = 0.0
     seen_positions: set[int] = set()
     limit = _promotion_probe_limit()
-    for metric in usable:
-        position = _safe_int(metric.get("task_position"), -1)
-        task_index = _safe_int(metric.get("task_index"), position)
-        if position < 0 or position >= len(tasks):
-            position = next(
-                (
-                    idx
-                    for idx, task in enumerate(tasks)
-                    if _safe_int(task.get("index"), idx) == task_index
-                ),
-                -1,
-            )
+
+    def add_metric(
+        metric: dict[str, Any],
+        position: int,
+        *,
+        reference_summary: dict[str, Any] | None = None,
+    ) -> bool:
+        nonlocal selected_cost
         if position < 0 or position >= len(tasks) or position in seen_positions:
-            continue
-        selected_task = deepcopy(tasks[position])
-        group_cost = _task_seed_metric_latency(metric)
-        metric_groups = [
-            item
-            for item in metric.get("top_costly_boundary_groups", []) or []
-            if isinstance(item, dict) and isinstance(item.get("group_key"), dict)
-        ]
-        if metric_groups:
-            group = metric_groups[0]
-            selected_task["group_keys"] = [deepcopy(group["group_key"])]
-            group_cost = _finite_float(group.get("min_cost_usec"), group_cost)
-        elif metric.get("group_keys"):
-            selected_task["group_keys"] = deepcopy(metric.get("group_keys", []))
+            return False
+        selected_task, group_cost = _metric_selected_probe_task(
+            metric,
+            tasks[position],
+            use_reference_task_groups=bool(reference_summary),
+        )
+        if reference_summary:
+            selected_task["reference_anchor_probe"] = True
+            selected_task["reference_anchor_summary"] = deepcopy(reference_summary)
         selected.append(selected_task)
         seen_positions.add(position)
         selected_cost += group_cost
+        return True
+
+    for _score, _latency, position, metric, summary in reference_scored:
+        add_metric(metric, position, reference_summary=summary)
+        if len(selected) >= limit:
+            break
+    for metric in usable:
+        if len(selected) >= limit:
+            break
+        position = _metric_task_position(metric, tasks)
+        add_metric(metric, position)
         if len(selected) >= limit:
             break
     if not selected or selected_cost <= 0:

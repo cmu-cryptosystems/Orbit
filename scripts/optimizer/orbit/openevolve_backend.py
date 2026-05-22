@@ -2805,9 +2805,11 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         context.get("placement_units", []),
         context.get("placement_profile", []),
     )
-    if seed_trace_examples:
+    reference_examples = _reference_json_candidate_examples(context)
+    if seed_trace_examples or reference_examples:
         context.setdefault("harness", {})["candidate_examples"] = _merge_candidate_examples(
-            seed_trace_examples
+            seed_trace_examples,
+            reference_examples,
         )
     context_path.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _store_stable_compile_context(stable_context_path, context)
@@ -4656,6 +4658,64 @@ def _policy_bank_candidate_examples(
             }
         )
     return examples[:8]
+
+
+def _reference_json_candidate_examples(context: dict[str, Any]) -> list[dict[str, Any]]:
+    reference = context.get("harness", {}).get("reference_json", {})
+    if not isinstance(reference, dict) or not reference:
+        return []
+    latency_usec = None
+    for key in (
+        "final_tdag_latency_usec",
+        "final_latency_usec",
+        "tdag_latency_usec",
+        "baseline_latency_usec",
+    ):
+        value = reference.get(key)
+        if value is not None:
+            latency_usec = _finite_float(value, float("nan"))
+            break
+    if latency_usec is None or not math.isfinite(latency_usec):
+        for key in (
+            "final_tdag_latency_sec",
+            "final_latency_sec",
+            "tdag_latency_sec",
+            "baseline_latency_sec",
+        ):
+            value = reference.get(key)
+            if value is not None:
+                latency_usec = _finite_float(value, float("nan")) * 1_000_000.0
+                break
+    locations = reference.get("bootstrap_locations")
+    if not isinstance(locations, dict):
+        locations = reference.get("maintenance_locations", {}).get("bootstrap")
+    if not isinstance(locations, dict):
+        locations = {}
+    location_items = sorted(
+        ((str(key), _safe_int(value, 1)) for key, value in locations.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return [
+        {
+            "kind": "reference_static_baseline_trace",
+            "label": str(reference.get("source", "reference_json")),
+            "correct": True,
+            "latency_improved": False,
+            "objective_cost_usec": latency_usec if latency_usec is not None and math.isfinite(latency_usec) else 0.0,
+            "bootstrap_count": _finite_float(reference.get("bootstrap_count"), 0.0),
+            "rescale_count": _finite_float(reference.get("rescale_count"), 0.0),
+            "source_mlir": reference.get("source_mlir", ""),
+            "bootstrap_op_patterns": list(reference.get("bootstrap_op_patterns", []) or [])[:16],
+            "bootstrap_locations": [
+                {"location": location, "count": count}
+                for location, count in location_items[:16]
+            ],
+            "why_it_lost": (
+                "Static reference only: learn boundary/maintenance placement patterns, "
+                "but final selection still requires lower valid Orbit latency."
+            ),
+        }
+    ]
 
 
 def _merge_candidate_examples(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10843,14 +10903,15 @@ def _sampled_delta_replay_result(
     """Compose a scoped DP probe improvement with cached sampled seed metrics.
 
     A boundary-group overlay with a task index changes exactly one sampled
-    boundary. Replaying all other sampled boundaries through DP is both slower
-    and stricter than the cached seed replay. This helper keeps the validation
-    strict for the changed boundary while carrying forward unchanged seed
-    metrics as candidate-owned baseline paths.
+    boundary, or a small set of sampled boundaries. Replaying all other sampled
+    boundaries through DP is both slower and stricter than the cached seed
+    replay. This helper keeps the validation strict for the changed boundaries
+    while carrying forward unchanged seed metrics as candidate-owned baseline
+    paths.
     """
 
     selectors = _scoped_boundary_policy_selectors(hints)
-    if len(selectors) != 1:
+    if not selectors:
         return None
     if not _promotion_result_direct_valid(probe_result):
         return None
@@ -10880,13 +10941,22 @@ def _sampled_delta_replay_result(
             "seed_sampled_path": context.get("reference", {}).get("sampled_selected_path_digest")
             if isinstance(context.get("reference"), dict)
             else "",
-            "selector": selectors[0],
+            "selectors": selectors[:16],
             "probe_path": probe_result.get("sampled_selected_path_digest", ""),
             "latency": latency,
         }
     )
     task_count = sum(1 for task in context.get("sampled_budget_tasks", []) if isinstance(task, dict))
-    source_counts = {"candidate:seed_carry_forward": max(0, task_count - 1)}
+    changed_task_count = len(
+        {
+            _safe_int(selector.get("task_index"), -1)
+            for selector in selectors
+            if _safe_int(selector.get("task_index"), -1) >= 0
+        }
+    )
+    if changed_task_count <= 0:
+        changed_task_count = min(len(selectors), task_count)
+    source_counts = {"candidate:seed_carry_forward": max(0, task_count - changed_task_count)}
     source_counts.update(_selected_source_counts_from_result(probe_result))
     return {
         "valid": True,
@@ -10907,7 +10977,8 @@ def _sampled_delta_replay_result(
             "candidate_solved_boundary_groups": task_count,
             "selected_source_counts": source_counts,
             "sampled_delta": {
-                "selector": selectors[0],
+                "selectors": selectors[:16],
+                "changed_task_count": changed_task_count,
                 "full_reference_cost_usec": full_reference_cost,
                 "probe_reference_cost_usec": probe_reference_cost,
                 "probe_candidate_cost_usec": probe_latency,
@@ -11447,6 +11518,7 @@ def _promotion_probe_hints(
     )
     probe = _clamp_promotion_probe_patch(probe)
     policies = []
+    max_boundary_policies = max(1, min(4, len(selected_probe_tasks) or 1))
     for item in probe.get("boundary_group_policies", []) or []:
         if not isinstance(item, dict):
             continue
@@ -11458,7 +11530,7 @@ def _promotion_probe_hints(
         if isinstance(policy, dict):
             updated["policy"] = _clamp_promotion_probe_patch(policy)
         policies.append(updated)
-        if len(policies) >= 1:
+        if len(policies) >= max_boundary_policies:
             break
     probe["boundary_group_policies"] = policies
     probe["unit_policies"] = []
@@ -11523,8 +11595,28 @@ def _strategy_discovery_variants(
         top_groups = matching_groups or top_groups
 
     # Ensure the default bounded discovery limit still covers every strategy
-    # dimension once before exploring additional values.
-    output_splice_selectors = []
+    # dimension once before exploring additional values. Keep selectors scoped
+    # to task_index so discovery can compose independent top-boundary fixes
+    # instead of repeatedly rediscovering one local output splice.
+    output_splice_selectors: list[dict[str, Any]] = []
+    seen_output_splice_selectors: set[str] = set()
+
+    def add_output_splice_selector(selector: dict[str, Any]) -> None:
+        if not isinstance(selector, dict):
+            return
+        normalized = {
+            "in_lvl": _safe_int(selector.get("in_lvl"), -999),
+            "in_scl": _safe_int(selector.get("in_scl"), -999),
+            "maino_v": str(selector.get("maino_v", "")),
+            "main_dag_size": _safe_int(selector.get("main_dag_size"), 0),
+            "task_index": _safe_int(selector.get("task_index"), -1),
+        }
+        digest = _hint_digest(normalized)
+        if digest in seen_output_splice_selectors:
+            return
+        seen_output_splice_selectors.add(digest)
+        output_splice_selectors.append(dict(selector))
+
     for task in selected_probe_tasks or []:
         if not isinstance(task, dict):
             continue
@@ -11535,24 +11627,18 @@ def _strategy_discovery_variants(
             selector = dict(group_key)
             if task_index is not None:
                 selector["task_index"] = task_index
-            output_splice_selectors.append(selector)
-            break
-        if output_splice_selectors:
-            break
+            add_output_splice_selector(selector)
     for item in [group for group in top_groups or [] if isinstance(group, dict)][:1]:
         if output_splice_selectors:
             break
         selector = item.get("group_key", item)
         if isinstance(selector, dict):
-            output_splice_selectors.append(selector)
+            add_output_splice_selector(selector)
     if not output_splice_selectors:
         output_splice_selectors.append({})
-    for label, boundary_policy, scale_lattice in (
-        ("dp_output_splice_frontier", "frontier", "waterline_sf"),
-        ("dp_output_splice_waterline", "waterline", "waterline_sf"),
-        ("dp_output_splice_low", "low", "dense"),
-    ):
-        patch = {
+
+    def output_splice_patch(boundary_policy: str, scale_lattice: str) -> dict[str, Any]:
+        return {
             "dp_probe_mode": "output_splice",
             "dp_seed_exact_only": False,
             "dp_disable_seed_exact_candidate": True,
@@ -11569,6 +11655,14 @@ def _strategy_discovery_variants(
             "boundary_state_cap": 4,
             "max_scale_candidates": 16,
         }
+
+    output_splice_specs = (
+        ("dp_output_splice_frontier", "frontier", "waterline_sf"),
+        ("dp_output_splice_waterline", "waterline", "waterline_sf"),
+        ("dp_output_splice_low", "low", "dense"),
+    )
+    for label, boundary_policy, scale_lattice in output_splice_specs:
+        patch = output_splice_patch(boundary_policy, scale_lattice)
         add(
             label,
             "dp_probe_mode",
@@ -11592,6 +11686,54 @@ def _strategy_discovery_variants(
                 "scale_lattice",
             ],
         )
+    if len(output_splice_selectors) > 1:
+        for label, boundary_policy, scale_lattice in (
+            ("dp_output_splice_frontier_all", "frontier", "waterline_sf"),
+            ("dp_output_splice_low_all", "low", "dense"),
+        ):
+            add(
+                label,
+                "multi_boundary_output_splice",
+                {
+                    "boundary_group_policies": [
+                        {
+                            "selector": selector,
+                            "policy": output_splice_patch(boundary_policy, scale_lattice),
+                        }
+                        for selector in output_splice_selectors[:4]
+                        if selector
+                    ]
+                },
+                changed_keys=[
+                    "boundary_group_policies",
+                    "dp_probe_mode",
+                    "boundary_scale_policy",
+                    "scale_lattice",
+                ],
+            )
+        mixed_policies = []
+        for idx, selector in enumerate(output_splice_selectors[:4]):
+            if not selector:
+                continue
+            _label, boundary_policy, scale_lattice = output_splice_specs[idx % len(output_splice_specs)]
+            mixed_policies.append(
+                {
+                    "selector": selector,
+                    "policy": output_splice_patch(boundary_policy, scale_lattice),
+                }
+            )
+        if mixed_policies:
+            add(
+                "dp_output_splice_mixed_all",
+                "multi_boundary_output_splice",
+                {"boundary_group_policies": mixed_policies},
+                changed_keys=[
+                    "boundary_group_policies",
+                    "dp_probe_mode",
+                    "boundary_scale_policy",
+                    "scale_lattice",
+                ],
+            )
     add(
         "boundary_scale_policy_waterline",
         "boundary_scale_policy",
@@ -13070,7 +13212,7 @@ def _run_sampled_promotion_pass(
         params,
         selected_probe_tasks,
         probe_reference_cost,
-        eval_timeout_sec=min(15, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
+        eval_timeout_sec=eval_timeout_sec,
     )
 
     full_reference_cost = _promotion_reference_latency(context)
@@ -15058,6 +15200,11 @@ def _qbp_dp_cache_stats(hints: dict[str, Any]) -> dict[str, int]:
     return stats if isinstance(stats, dict) else {}
 
 
+def _qbp_dp_cache_stats_snapshot(hints: dict[str, Any]) -> dict[str, int]:
+    stats = _qbp_dp_cache_stats(hints)
+    return {str(key): int(value) for key, value in stats.items() if isinstance(value, int)}
+
+
 def _qbp_dp_transition_metrics_cached(
     params: Params,
     le: LatencyEstimator,
@@ -15168,6 +15315,8 @@ def _qbp_dp_trace_node(
     candidate_count: int,
     pruned_count: int,
     rejection_counts: Counter[str],
+    elapsed_sec: float | None = None,
+    cache_stats: dict[str, int] | None = None,
 ) -> None:
     if not isinstance(trace, dict):
         return
@@ -15181,6 +15330,10 @@ def _qbp_dp_trace_node(
         "candidate_count_after_prune": int(pruned_count),
         "rejection_counts": dict(rejection_counts),
     }
+    if elapsed_sec is not None:
+        item["elapsed_sec"] = round(max(0.0, float(elapsed_sec)), 6)
+    if cache_stats:
+        item["cache_stats"] = dict(cache_stats)
     trace.setdefault("node_frontiers", []).append(item)
     for reason, count in rejection_counts.items():
         _qbp_dp_trace_reject(trace, str(reason), int(count))
@@ -15198,6 +15351,11 @@ def _qbp_dp_trace_compact(trace: dict[str, Any] | None) -> dict[str, Any] | None
     if not isinstance(trace, dict):
         return None
     nodes = list(trace.get("node_frontiers", []) or [])
+    slowest_nodes = sorted(
+        (node for node in nodes if isinstance(node, dict)),
+        key=lambda item: _finite_float(item.get("elapsed_sec"), 0.0),
+        reverse=True,
+    )[:8]
     return {
         "boundary_key": trace.get("boundary_key", {}),
         "requested_output_level": trace.get("requested_output_level"),
@@ -15205,11 +15363,14 @@ def _qbp_dp_trace_compact(trace: dict[str, Any] | None) -> dict[str, Any] | None
         "first_empty_node": trace.get("first_empty_node"),
         "rejected_transition_reasons": dict(trace.get("rejected_transition_reasons", {}) or {}),
         "node_frontier_count": len(nodes),
+        "node_frontiers_head": nodes[:4],
         "node_frontiers_tail": nodes[-12:],
+        "slowest_node_frontiers": slowest_nodes,
         "reference_seed_bridge": trace.get("reference_seed_bridge"),
         "last_stage": trace.get("last_stage"),
         "last_node": trace.get("last_node"),
         "active_node_progress": trace.get("active_node_progress"),
+        "qbp_dp_cache_stats": trace.get("qbp_dp_cache_stats", {}),
         "elapsed_sec": trace.get("elapsed_sec"),
         "progress_timeout": bool(trace.get("progress_timeout", False)),
         "progress_trace_path": trace.get("progress_trace_path"),
@@ -15244,6 +15405,10 @@ def _write_qbp_dp_progress_trace(
         trace["last_node"] = str(node)
     started = _finite_float(trace.get("_started_at_monotonic"), time.monotonic())
     trace["elapsed_sec"] = max(0.0, time.monotonic() - started)
+    trace["qbp_dp_cache_stats"] = _qbp_dp_cache_stats_snapshot(hints)
+    active = trace.get("active_node_progress")
+    if isinstance(active, dict):
+        active.setdefault("qbp_dp_cache_stats", dict(trace["qbp_dp_cache_stats"]))
     path = _qbp_dp_trace_path(hints)
     if path is None:
         return
@@ -16036,6 +16201,145 @@ def _qbp_dp_add_seed_anchor_state(
     return sorted(states + [seed_state], key=_qbp_dp_state_select_key)
 
 
+def _qbp_dp_seed_output_splice_states(
+    tdag: Tdag,
+    node: str,
+    params: Params,
+    le: LatencyEstimator,
+    io_budget: dict[str, Any],
+    hints: dict[str, Any],
+    policy: dict[str, Any],
+    seed_anchor: dict[str, Any] | None,
+    seed_exact_state: _QBPDPState | None,
+    node_level_hint: int | None,
+    node_scale_hint: int | None,
+    seed_output_scales: list[int],
+    *,
+    materialize: bool,
+    seed_exact_disabled: bool,
+) -> list[_QBPDPState] | None:
+    """Fast path for terminal/output splice probes.
+
+    The expensive generic DP loops enumerate predecessor frontier combinations.
+    Output-splice probes intentionally keep the known-valid seed route and only
+    try alternative boundary output states. Compute that delta directly so
+    high-fanout terminal nodes do not dominate promotion probes.
+    """
+
+    if node not in tdag.outputs:
+        return None
+    if not isinstance(seed_anchor, dict) or not seed_anchor.get("valid"):
+        return None
+    node_key = str(node)
+    seed_in = _qbp_dp_seed_tuple(seed_anchor.get("node_inputs", {}).get(node_key))
+    seed_out = _qbp_dp_seed_tuple(seed_anchor.get("node_outputs", {}).get(node_key))
+    if seed_in is None or seed_out is None:
+        return None
+    input_level, input_scale = seed_in
+    seed_output_level, seed_output_scale = seed_out
+    if not params.is_decryptable_state(input_level, input_scale):
+        return None
+    seed_metrics = _qbp_dp_transition_metrics_cached(
+        params,
+        le,
+        hints,
+        input_level,
+        input_scale,
+        seed_output_level,
+        seed_output_scale,
+    )
+    if seed_metrics is None:
+        return None
+    seed_vertex_cost, seed_vertex_bootstrap, seed_vertex_rescale = seed_metrics
+    node_weight = float(tdag.nodes[node].get("weight", 1))
+    if seed_exact_state is not None:
+        base_cost = float(seed_exact_state.cost)
+        base_bootstrap = float(seed_exact_state.bootstrap_count)
+        base_rescale = float(seed_exact_state.rescale_count)
+        base_assign = seed_exact_state.assign_data
+    else:
+        base_cost = _finite_float(seed_anchor.get("cost_usec"), float("inf"))
+        base_bootstrap = _finite_float(seed_anchor.get("bootstrap_count"), float("inf"))
+        base_rescale = _finite_float(seed_anchor.get("rescale_count"), float("inf"))
+        base_assign = None
+    if not (
+        math.isfinite(base_cost)
+        and math.isfinite(base_bootstrap)
+        and math.isfinite(base_rescale)
+    ):
+        return None
+    output_states = _qbp_dp_output_states_cached(
+        tdag,
+        node,
+        params,
+        io_budget,
+        policy,
+        input_level,
+        input_scale,
+        node_level_hint,
+        node_scale_hint,
+        hints,
+        seed_output_scales,
+    )
+    output_states = sorted(set(output_states), key=lambda item: (abs(int(item[1]) - seed_output_scale), int(item[0]), int(item[1])))
+    output_cap = _int_hint(hints.get("dp_max_output_states_per_input"), 0)
+    if output_cap > 0 and len(output_states) > output_cap:
+        output_states = output_states[:output_cap]
+    states: list[_QBPDPState] = []
+    for output_level, output_scale in output_states:
+        if seed_exact_disabled and (int(output_level), int(output_scale)) == (
+            seed_output_level,
+            seed_output_scale,
+        ):
+            continue
+        metrics = _qbp_dp_transition_metrics_cached(
+            params,
+            le,
+            hints,
+            input_level,
+            input_scale,
+            int(output_level),
+            int(output_scale),
+        )
+        if metrics is None:
+            continue
+        vertex_cost, vertex_bootstrap, vertex_rescale = metrics
+        assign_data = None
+        if materialize:
+            if base_assign is None:
+                continue
+            assign_data = _qbp_dp_copy_assign_data(base_assign)
+            if not _qbp_dp_set_assign_value(
+                assign_data,
+                "v_lvl_out",
+                node,
+                int(output_level),
+                allow_overwrite=True,
+            ):
+                continue
+            if not _qbp_dp_set_assign_value(
+                assign_data,
+                "v_scl_out",
+                node,
+                int(output_scale),
+                allow_overwrite=True,
+            ):
+                continue
+        states.append(
+            _QBPDPState(
+                int(output_level),
+                int(output_scale),
+                max(0.0, base_cost - node_weight * seed_vertex_cost + node_weight * vertex_cost),
+                max(0.0, base_bootstrap - seed_vertex_bootstrap + vertex_bootstrap),
+                max(0.0, base_rescale - seed_vertex_rescale + vertex_rescale),
+                assign_data,
+                "candidate_seed_output_splice",
+                0.0,
+            )
+        )
+    return states
+
+
 def _qbp_dp_node_states(
     tdag: Tdag,
     node: str,
@@ -16049,6 +16353,7 @@ def _qbp_dp_node_states(
     trace: dict[str, Any] | None = None,
     seed_anchor: dict[str, Any] | None = None,
 ) -> list[_QBPDPState]:
+    node_started = time.monotonic()
     node_hints = _policy_hints_for_node(hints, list(hints.get("unit_policies", []) or []), str(node), dict(tdag.nodes[node]))
     policy = _policy_options(node_hints, params)
     node_level_hints = _int_map(hints.get("preferred_node_levels", {}))
@@ -16095,6 +16400,7 @@ def _qbp_dp_node_states(
             "combo_count": 0,
             "incoming_option_count": 0,
             "candidate_count_before_prune": 0,
+            "node_elapsed_sec": 0.0,
         }
     _qbp_dp_checkpoint_progress(trace, hints, stage="node_start", node=str(node))
     progress_interval = max(1, min(64, _int_hint(hints.get("dp_trace_progress_interval"), 16)))
@@ -16123,6 +16429,54 @@ def _qbp_dp_node_states(
         stats["seed_neighborhood_candidate_states"] = (
             int(stats.get("seed_neighborhood_candidate_states", 0) or 0) + 1
         )
+    if output_splice_only and node in tdag.outputs:
+        spliced = _qbp_dp_seed_output_splice_states(
+            tdag,
+            node,
+            params,
+            le,
+            io_budget,
+            hints,
+            policy,
+            seed_anchor,
+            seed_exact_state,
+            node_level_hints.get(node),
+            node_scale_hints.get(node),
+            seed_output_scales,
+            materialize=materialize,
+            seed_exact_disabled=seed_exact_disabled,
+        )
+        if spliced is not None:
+            candidate_states.extend(spliced)
+            pruned = _qbp_dp_prune_states(candidate_states, state_cap, params)
+            _qbp_dp_trace_node(
+                trace,
+                node=str(node),
+                op=str(tdag.nodes[node].get("op", "")),
+                pred_state_counts=[len(states) for states in pred_state_lists],
+                combo_count=0,
+                incoming_option_count=0,
+                candidate_count=len(candidate_states),
+                pruned_count=len(pruned),
+                rejection_counts=rejection_counts,
+                elapsed_sec=time.monotonic() - node_started,
+                cache_stats=_qbp_dp_cache_stats_snapshot(hints),
+            )
+            if isinstance(trace, dict):
+                trace["active_node_progress"] = {
+                    "node": str(node),
+                    "op": str(tdag.nodes[node].get("op", "")),
+                    "phase": "output_splice_fast_path",
+                    "pred_state_counts": [len(states) for states in pred_state_lists],
+                    "combo_count": 0,
+                    "incoming_option_count": 0,
+                    "candidate_count_before_prune": len(candidate_states),
+                    "candidate_count_after_prune": len(pruned),
+                    "node_elapsed_sec": round(time.monotonic() - node_started, 6),
+                    "rejection_counts": dict(rejection_counts),
+                }
+            _qbp_dp_checkpoint_progress(trace, hints, stage="node_output_splice_fast_path", node=str(node))
+            return pruned
     if (
         seed_exact_state is not None
         and not seed_exact_disabled
@@ -16142,6 +16496,8 @@ def _qbp_dp_node_states(
             candidate_count=len(candidate_states),
             pruned_count=len(pruned),
             rejection_counts=rejection_counts,
+            elapsed_sec=time.monotonic() - node_started,
+            cache_stats=_qbp_dp_cache_stats_snapshot(hints),
         )
         return pruned
 
@@ -16253,6 +16609,7 @@ def _qbp_dp_node_states(
                 "incoming_option_count": int(incoming_option_count),
                 "candidate_count_before_prune": len(candidate_states),
                 "latest_incoming_options": len(incoming_options),
+                "node_elapsed_sec": round(time.monotonic() - node_started, 6),
             }
         _qbp_dp_checkpoint_progress(trace, hints, stage="node_combo", node=str(node))
         for option_index, (input_scale, edge_scales, node_scale) in enumerate(incoming_options):
@@ -16267,8 +16624,9 @@ def _qbp_dp_node_states(
                         "incoming_option_index": int(option_index),
                         "incoming_option_count": int(incoming_option_count),
                         "candidate_count_before_prune": len(candidate_states),
+                        "node_elapsed_sec": round(time.monotonic() - node_started, 6),
                         "rejection_counts": dict(rejection_counts),
-                }
+                    }
                 _qbp_dp_checkpoint_progress(trace, hints, stage="node_incoming_option", node=str(node))
             for input_level in level_candidates():
                 if isinstance(trace, dict):
@@ -16282,6 +16640,7 @@ def _qbp_dp_node_states(
                         "input_level": int(input_level),
                         "incoming_option_count": int(incoming_option_count),
                         "candidate_count_before_prune": len(candidate_states),
+                        "node_elapsed_sec": round(time.monotonic() - node_started, 6),
                         "rejection_counts": dict(rejection_counts),
                     }
                 _qbp_dp_checkpoint_progress(trace, hints, stage="node_input_level", node=str(node))
@@ -16356,6 +16715,7 @@ def _qbp_dp_node_states(
                                 "output_state_index": int(output_index),
                                 "output_state_count": len(output_states),
                                 "candidate_count_before_prune": len(candidate_states),
+                                "node_elapsed_sec": round(time.monotonic() - node_started, 6),
                                 "rejection_counts": dict(rejection_counts),
                             }
                         _qbp_dp_checkpoint_progress(trace, hints, stage="node_output_state", node=str(node))
@@ -16460,6 +16820,8 @@ def _qbp_dp_node_states(
         candidate_count=len(candidate_states),
         pruned_count=len(pruned),
         rejection_counts=rejection_counts,
+        elapsed_sec=time.monotonic() - node_started,
+        cache_stats=_qbp_dp_cache_stats_snapshot(hints),
     )
     if isinstance(trace, dict):
         trace["active_node_progress"] = {
@@ -16471,6 +16833,7 @@ def _qbp_dp_node_states(
             "incoming_option_count": int(incoming_option_count),
             "candidate_count_before_prune": len(candidate_states),
             "candidate_count_after_prune": len(pruned),
+            "node_elapsed_sec": round(time.monotonic() - node_started, 6),
             "rejection_counts": dict(rejection_counts),
         }
     _qbp_dp_checkpoint_progress(trace, hints, stage="node_complete", node=str(node))

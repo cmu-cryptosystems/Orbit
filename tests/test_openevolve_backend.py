@@ -3769,6 +3769,49 @@ def test_promotion_probe_hints_are_lightweight_and_targeted(toy_cost_json: str):
     assert probe["unit_policies"] == []
 
 
+def test_promotion_probe_hints_preserve_multiple_sampled_boundary_policies():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "boundary_group_policies": [
+            {
+                "selector": {
+                    "task_index": idx,
+                    "in_lvl": 16 - idx,
+                    "in_scl": 40 + idx,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                },
+                "policy": {"dp_probe_mode": "output_splice", "max_scale_candidates": 64},
+            }
+            for idx in range(4)
+        ],
+    }
+    tasks = [
+        {
+            "index": idx,
+            "group_keys": [
+                {
+                    "in_lvl": 16 - idx,
+                    "in_scl": 40 + idx,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": 16 - idx, "in_scl": 40 + idx}]},
+        }
+        for idx in range(3)
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    assert len(probe["boundary_group_policies"]) == 3
+    assert [item["selector"]["task_index"] for item in probe["boundary_group_policies"]] == [0, 1, 2]
+    assert all(
+        item["policy"]["max_scale_candidates"] <= 48
+        for item in probe["boundary_group_policies"]
+    )
+
+
 def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)
@@ -6713,6 +6756,112 @@ def test_strategy_discovery_variants_change_one_dimension(toy_cost_json: str):
     assert all(isinstance(item["hints"], dict) for item in variants)
 
 
+def test_strategy_discovery_variants_include_multi_boundary_output_splice(
+    toy_cost_json: str, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_STRATEGY_DISCOVERY_VARIANTS", "24")
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    tasks = [
+        {
+            "index": idx,
+            "group_keys": [
+                {
+                    "in_lvl": 16 - idx,
+                    "in_scl": 40 + idx,
+                    "maino_v": "",
+                    "main_dag_size": 3,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": 16 - idx, "in_scl": 40 + idx}]},
+        }
+        for idx in range(2)
+    ]
+
+    variants = oe_backend._strategy_discovery_variants(
+        {"strategy": "bootstrap_mcts", "boundary_scale_policy": "frontier"},
+        context,
+        tasks,
+    )
+
+    composed = next(
+        item for item in variants if item["label"] == "dp_output_splice_frontier_all"
+    )
+    policies = composed["hints"]["boundary_group_policies"]
+    assert composed["dimension"] == "multi_boundary_output_splice"
+    assert len(policies) == 2
+    assert [item["selector"]["task_index"] for item in policies] == [0, 1]
+    assert all(item["policy"]["dp_probe_mode"] == "output_splice" for item in policies)
+
+
+def test_sampled_delta_replay_composes_multiple_scoped_boundaries(toy_cost_json: str):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["sampled_budget_tasks"] = [
+        {
+            "index": idx,
+            "seed_metrics": {
+                "bootstrap_count": 3.0,
+                "rescale_count": 6.0,
+                "selected_path_digest": f"seed-{idx}",
+            },
+            "context": {"io_budgets": [{"in_lvl": 16 - idx, "in_scl": 40 + idx}]},
+        }
+        for idx in range(2)
+    ]
+    context["reference"] = {"sampled_selected_path_digest": "seed-full"}
+    selectors = [
+        {"task_index": 0, "in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+        {"task_index": 1, "in_lvl": 15, "in_scl": 41, "maino_v": "", "main_dag_size": 0},
+    ]
+    hints = {
+        "boundary_group_policies": [
+            {"selector": selector, "policy": {"dp_probe_mode": "output_splice"}}
+            for selector in selectors
+        ]
+    }
+    probe_result = {
+        "valid": True,
+        "boundary_group_validity": 1.0,
+        "candidate_qbp_coverage": 1.0,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "sampled_dp_latency_usec": 170.0,
+        "objective_cost_usec": 170.0,
+        "bootstrap_count": 4.0,
+        "rescale_count": 10.0,
+        "sampled_selected_path_digest": "candidate-probe",
+        "path_differential": {
+            "seed_bootstrap_count": 6.0,
+            "candidate_bootstrap_count": 4.0,
+            "seed_rescale_count": 12.0,
+            "candidate_rescale_count": 10.0,
+        },
+        "diagnostics": {
+            "fallback_selected_boundary_groups": 0,
+            "invalid_boundary_groups": 0,
+            "selected_source_counts": {"candidate:qbp_dp": 2},
+        },
+    }
+
+    result = oe_backend._sampled_delta_replay_result(
+        context,
+        hints,
+        probe_result,
+        probe_reference_cost=200.0,
+        full_reference_cost=300.0,
+    )
+
+    assert result is not None
+    assert result["sampled_dp_latency_usec"] == 270.0
+    assert result["bootstrap_count"] == 4.0
+    assert result["rescale_count"] == 10.0
+    assert result["diagnostics"]["sampled_delta"]["changed_task_count"] == 2
+    assert len(result["diagnostics"]["sampled_delta"]["selectors"]) == 2
+    assert result["diagnostics"]["selected_source_counts"]["candidate:seed_carry_forward"] == 0
+
+
 def test_path_differential_reports_collapse_and_latency_reasons():
     seed = {
         "selected_path_digest": "seed",
@@ -7078,6 +7227,53 @@ def test_qbp_dp_progress_trace_file_is_written(toy_cost_json: str, tmp_path: Pat
     payload = json.loads(trace_path.read_text())
     assert payload["node_frontiers"]
     assert payload["last_stage"] in {"budget_done", "budget_output_states", "node_complete"}
+    assert "qbp_dp_cache_stats" in payload
+    assert any("elapsed_sec" in item for item in payload["node_frontiers"])
+
+
+def test_qbp_dp_output_splice_fast_path_skips_generic_output_frontier(
+    toy_cost_json: str,
+    monkeypatch,
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _toy_pdag(params)
+    le = LatencyEstimator(params)
+    original = oe_backend._qbp_dp_incoming_options
+
+    def guarded_incoming_options(tdag, node, *args, **kwargs):
+        if str(node) == "0":
+            raise AssertionError("output splice should not enumerate output incoming options")
+        return original(tdag, node, *args, **kwargs)
+
+    monkeypatch.setattr(oe_backend, "_qbp_dp_incoming_options", guarded_incoming_options)
+
+    result = oe_backend._qbp_dp_solve_budget(
+        graph,
+        params,
+        {"in_lvl": 16, "in_scl": 40, "out_lvl": 16},
+        le,
+        {
+            "strategy": "bootstrap_mcts",
+            "qbp_engine": "dp",
+            "enable_seed_frontier_anchor": True,
+            "dp_trace": True,
+            "dp_probe_mode": "output_splice",
+            "dp_seed_splice_output_only": True,
+            "dp_seed_exact_only": False,
+            "dp_max_output_states_per_input": 4,
+        },
+        materialize=False,
+    )
+
+    assert result.valid is True
+    assert result.seed_bridge_count == 0.0
+    assert result.trace is not None
+    assert result.trace["active_node_progress"]["phase"] == "output_splice_fast_path"
 
 
 def test_qbp_dp_transition_and_output_state_caches(toy_cost_json: str):

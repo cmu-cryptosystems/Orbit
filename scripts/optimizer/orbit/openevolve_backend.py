@@ -42,7 +42,7 @@ class PlacementError(Exception):
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 CONTEXT_SCHEMA_VERSION = "orbit-openevolve-placement-context-v4"
-COMPILE_CONTEXT_SCHEMA_VERSION = "orbit-openevolve-compile-harness-v4"
+COMPILE_CONTEXT_SCHEMA_VERSION = "orbit-openevolve-compile-harness-v5"
 SAMPLED_QBP_TASK_CACHE_SCHEMA_VERSION = "orbit-openevolve-sampled-qbp-task-v1"
 BANNED_CANDIDATE_TOKENS = (
     "gurobipy",
@@ -1020,8 +1020,8 @@ def place(context):
             policy["bootstrap_anchor_count"] = 0
             policy["boundary_state_cap"] = 3
             policy["bootstrap_penalty"] = 2_500_000_000.0
-            policy["selection_bootstrap_penalty"] = 250_000_000.0
-            policy["selection_objective"] = "min_bootstrap"
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
         elif name == "component_budget_repair":
             action["prior"] = 0.28
             policy["selection_objective"] = "cost"
@@ -1579,8 +1579,8 @@ def place(context):
                 policy["bootstrap_anchor_count"] = 0
                 policy["boundary_state_cap"] = 3
                 policy["bootstrap_penalty"] = 2_500_000_000.0
-                policy["selection_bootstrap_penalty"] = 250_000_000.0
-                policy["selection_objective"] = "min_bootstrap"
+                policy["selection_bootstrap_penalty"] = 0.0
+                policy["selection_objective"] = "cost"
             elif name == "component_budget_repair":
                 action["prior"] = 0.28
                 policy["selection_objective"] = "cost"
@@ -1806,12 +1806,11 @@ def place(context):
             },
         )
         return policy
-    target_bootstraps = context.get("harness", {}).get("target_bootstrap_count", 0)
     portfolio = [
         builder.budget_fulfillment_beam()["policy"],
         builder.budget_fulfillment_beam(
             bootstrap_penalty=4_000_000_000.0,
-            selection_bootstrap_penalty=500_000_000.0,
+            selection_bootstrap_penalty=0.0,
             beam_width=6,
             state_cap_per_node=16,
             max_scale_candidates=24,
@@ -1839,9 +1838,6 @@ def place(context):
             else:
                 policy = builder.low_scale_frontier(refresh_fanout_at_level_floor=True)["policy"]
             unit_policies.append(builder.unit_policy(selector, policy))
-    if target_bootstraps:
-        portfolio[0]["selection_bootstrap_penalty"] = 500_000_000.0
-        portfolio[1]["selection_bootstrap_penalty"] = 750_000_000.0
     return builder.unit_portfolio(
         global_policy,
         *unit_policies,
@@ -2017,7 +2013,7 @@ def build_context(pdag: Tdag, io_budgets_list: list[dict], params: Params) -> di
                 params, "openevolve_evaluator_timeout_sec", 180
             ),
             "openevolve_budget_aggressive": getattr(params, "openevolve_budget_aggressive", True),
-            "openevolve_target_bootstrap_count": getattr(params, "openevolve_target_bootstrap_count", 0),
+            "openevolve_target_bootstrap_count": 0,
             "noise_estimator": params.noise_estimator,
             "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
             "noise_estimator_alpha": params.noise_estimator_alpha,
@@ -2154,7 +2150,7 @@ def build_compile_context(dag: Tdag, params: Params) -> dict[str, Any]:
         "reference_json": _load_reference_json(params.openevolve_reference_json),
         "finalists": params.openevolve_finalists,
         "budget_aggressive": getattr(params, "openevolve_budget_aggressive", True),
-        "target_bootstrap_count": getattr(params, "openevolve_target_bootstrap_count", 0),
+        "target_bootstrap_count": 0,
         "noise_estimator": params.noise_estimator,
         "noise_estimator_min_output_margin_bits": params.noise_estimator_min_output_margin_bits,
         "noise_estimator_alpha": params.noise_estimator_alpha,
@@ -3949,7 +3945,7 @@ def _compile_policy_bank_variants(
                     "bootstrap_anchor_count": 0,
                     "boundary_state_cap": 2,
                     "bootstrap_penalty": 5_000_000_000.0,
-                    "selection_objective": "min_bootstrap",
+                    "selection_objective": "cost",
                 },
             },
         },
@@ -5820,13 +5816,8 @@ def evaluate_compile_candidate_program(
         boundary_score = max(0.0, min(1.0, float(result.get("boundary_quality", 0.0))))
         policy_effect_score = float(policy_effect.get("effect_score", 0.0))
         action_effect_score = _action_effect_score(diagnostics)
-        target_bootstrap_count = _context_target_bootstrap_count(context)
-        target_bootstrap_score = _contextual_target_bootstrap_score(
-            context,
-            target_bootstrap_count,
-            result["bootstrap_count"],
-            reference.get("bootstrap_count"),
-        )
+        target_bootstrap_count = 0
+        target_bootstrap_score = 0.0
         component_bootstrap = _component_bootstrap_alignment_summary(
             context,
             result.get("bootstrap_locations", {}),
@@ -5892,8 +5883,6 @@ def evaluate_compile_candidate_program(
         quality_score = (
             0.35 * latency_score
             + 0.08 * bootstrap_score
-            + 0.05 * target_bootstrap_score
-            + 0.10 * component_bootstrap_score
             + 0.05 * rescale_score
             + 0.08 * boundary_score
             + 0.07 * risk_score
@@ -7994,13 +7983,7 @@ def _placement_effect_summary(
     candidate_bootstraps = _finite_float(result.get("bootstrap_count"), float("nan"))
     baseline_rescales = _finite_float(baseline.get("rescale_count"), float("nan"))
     candidate_rescales = _finite_float(result.get("rescale_count"), float("nan"))
-    target = _context_target_bootstrap_count(context)
-    baseline_target_score = _contextual_target_bootstrap_score(
-        context,
-        target,
-        baseline_bootstraps,
-        baseline.get("reference_bootstrap_count"),
-    )
+    baseline_target_score = 0.0
     group_den = max(1, max(scored_groups, baseline_scored_groups))
     solved_delta = (solved_groups - baseline_solved_groups) / group_den
     candidate_group_delta = (candidate_groups - baseline_candidate_groups) / group_den
@@ -8023,13 +8006,12 @@ def _placement_effect_summary(
         if math.isfinite(baseline_rescales) and math.isfinite(candidate_rescales)
         else 0.0
     )
-    target_delta = float(candidate_target_score) - float(baseline_target_score)
+    target_delta = 0.0
     effect_score = min(
         1.0,
         max(0.0, 0.30 * solved_delta)
         + max(0.0, 0.25 * candidate_group_delta)
         + max(0.0, 0.20 * latency_delta)
-        + max(0.0, 0.15 * target_delta)
         + max(0.0, 0.05 * bootstrap_delta)
         + max(0.0, 0.05 * rescale_delta)
         + max(0.0, 0.10 * fallback_delta),
@@ -8043,7 +8025,6 @@ def _placement_effect_summary(
             latency_delta,
             bootstrap_delta,
             rescale_delta,
-            target_delta,
         )
     )
     return {
@@ -8060,7 +8041,7 @@ def _placement_effect_summary(
         "latency_delta_ratio": float(latency_delta),
         "bootstrap_delta_ratio": float(bootstrap_delta),
         "rescale_delta_ratio": float(rescale_delta),
-        "target_bootstrap_score_delta": float(target_delta),
+        "target_bootstrap_score_delta": 0.0,
         "baseline": {
             "final_latency_usec": baseline_latency if math.isfinite(baseline_latency) else "inf",
             "bootstrap_count": baseline_bootstraps if math.isfinite(baseline_bootstraps) else "nan",
@@ -8069,7 +8050,7 @@ def _placement_effect_summary(
             "candidate_solved_boundary_groups": baseline_candidate_groups,
             "fallback_selected_groups": baseline_fallback_groups,
             "fallback_selected_budgets": baseline_fallback_budgets,
-            "target_bootstrap_score": float(baseline_target_score),
+            "target_bootstrap_score": 0.0,
         },
     }
 
@@ -8247,8 +8228,8 @@ def _bootstrap_mcts_initial_policy_for_context(context: dict[str, Any]) -> dict[
             policy["bootstrap_anchor_count"] = 0
             policy["boundary_state_cap"] = 3
             policy["bootstrap_penalty"] = 2_500_000_000.0
-            policy["selection_bootstrap_penalty"] = 250_000_000.0
-            policy["selection_objective"] = "min_bootstrap"
+            policy["selection_bootstrap_penalty"] = 0.0
+            policy["selection_objective"] = "cost"
         elif name == "component_budget_repair":
             action["prior"] = 0.28
             policy["selection_objective"] = "cost"
@@ -9683,7 +9664,7 @@ def _run_full_bundle_finalists(
                     "effective_duplicate": False,
                     "seed_equivalent_policy": True,
                     "selected_path_changed_vs_seed": False,
-                    "target_bootstrap_count": _context_target_bootstrap_count(full_context),
+                    "target_bootstrap_count": 0,
                     "seed_bootstrap_count": _context_seed_bootstrap_count(full_context),
                 },
             }
@@ -9879,7 +9860,7 @@ def _run_full_bundle_finalists(
                     latency_target = _finalist_latency_target_usec(full_context)
                     margin_target = _finalist_output_margin_target_bits(full_context)
                     forced_bootstrap_floor = _finalist_forced_bootstrap_floor(full_context)
-                    target_bootstrap_count = _context_target_bootstrap_count(full_context)
+                    target_bootstrap_count = 0
                     seed_bootstrap_count = _context_seed_bootstrap_count(full_context)
                     bootstrap_delta_vs_seed = (
                         int(result["bootstrap_count"]) - seed_bootstrap_count
@@ -9889,11 +9870,7 @@ def _run_full_bundle_finalists(
                     bootstrap_regression = int(
                         bootstrap_delta_vs_seed is not None and bootstrap_delta_vs_seed > 0
                     )
-                    bootstrap_excess = (
-                        max(0, int(result["bootstrap_count"]) - target_bootstrap_count)
-                        if target_bootstrap_count > 0
-                        else 0
-                    )
+                    bootstrap_excess = 0
                     plaintext_quality_reject, plaintext_quality_reason = _finalist_plaintext_quality_reject(
                         full_context
                     )
@@ -9969,8 +9946,8 @@ def _run_full_bundle_finalists(
                         "output_margin_target_bits": margin_target,
                         "output_margin_reject": bool(margin_reject),
                         "forced_bootstrap_floor": forced_bootstrap_floor,
-                        "target_bootstrap_count": target_bootstrap_count,
-                        "target_bootstrap_excess": bootstrap_excess,
+                        "target_bootstrap_count": 0,
+                        "target_bootstrap_excess": 0,
                         "seed_bootstrap_count": seed_bootstrap_count,
                         "bootstrap_delta_vs_seed": bootstrap_delta_vs_seed,
                         "bootstrap_regression": bool(bootstrap_regression),
@@ -10047,7 +10024,7 @@ def _run_full_bundle_finalists(
                     "latency_target_usec": _finalist_latency_target_usec(full_context),
                     "output_margin_target_bits": _finalist_output_margin_target_bits(full_context),
                     "forced_bootstrap_floor": _finalist_forced_bootstrap_floor(full_context),
-                    "target_bootstrap_count": _context_target_bootstrap_count(full_context),
+                    "target_bootstrap_count": 0,
                     "seed_bootstrap_count": _context_seed_bootstrap_count(full_context),
                 },
                 "noise_estimator": {
@@ -14723,7 +14700,7 @@ def _alphaevolve_feedback(
         ),
         "policy_effect": policy_effect,
         "placement_effect": placement_effect,
-        "target_bootstrap_count": target,
+        "target_bootstrap_count": 0,
         "bootstrap_count": bootstrap_count,
         "component_bootstrap_score": component_score,
         "candidate_qbp_coverage": qbp_coverage,
@@ -14811,13 +14788,8 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         bootstrap_score = _relative_reduction(
             reference["bootstrap_count"], counts["bootstrap"]
         )
-        target_bootstrap_count = _context_target_bootstrap_count(context)
-        target_bootstrap_score = _contextual_target_bootstrap_score(
-            context,
-            target_bootstrap_count,
-            counts["bootstrap"],
-            reference["bootstrap_count"],
-        )
+        target_bootstrap_count = 0
+        target_bootstrap_score = 0.0
         component_bootstrap = _component_bootstrap_alignment_summary(
             context,
             _maintenance_locations(assignments[0])["bootstrap"] if assignments else {},
@@ -14830,8 +14802,6 @@ def evaluate_candidate_program(context_path: str | Path, program_path: str | Pat
         quality_score = (
             0.39 * latency_score
             + 0.12 * bootstrap_score
-            + 0.06 * target_bootstrap_score
-            + 0.09 * component_bootstrap_score
             + 0.08 * rescale_score
             + 0.13 * risk_score
             + 0.12 * reserve_score
@@ -18875,17 +18845,11 @@ def _boundary_mcts_group_reward(
     if not attempts:
         return -0.1
     summary = _assignment_count_summary([attempt.assign for attempt in attempts])
-    bootstrap_score = _policy_target_bootstrap_score(
-        hints,
-        params,
-        summary["avg_bootstrap"],
-        None,
-    )
     rescale_score = 1.0 / (1.0 + summary["avg_rescale"] / 32.0)
     cost_score = 1.0 / (1.0 + (sum(attempt.cost for attempt in attempts) / len(attempts)) / 1_000_000_000.0)
     objective = _selection_objective(hints)
     if objective == "cost":
-        return 0.72 * coverage + 0.20 * cost_score + 0.05 * bootstrap_score + 0.03 * rescale_score
+        return 0.75 * coverage + 0.22 * cost_score + 0.03 * rescale_score
     if objective == "min_bootstrap":
         low_bootstrap_score = 1.0 / (1.0 + summary["avg_bootstrap"])
         return 0.58 * coverage + 0.30 * low_bootstrap_score + 0.07 * cost_score + 0.05 * rescale_score
@@ -19099,8 +19063,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "bootstrap_anchor_count": max(0, _int_hint(base.get("bootstrap_anchor_count"), 0)),
         }
     )
-    target = max(0, _int_hint(base.get("target_bootstrap_count"), 0))
-    explicit_anchor_count = max(0, min(8, target)) if target > 0 else 0
     variants = [
         (
             "strict_no_bootstrap",
@@ -19139,9 +19101,9 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "level_drop_penalty": 0.0,
                 "rescale_penalty": max(25_000.0, _float_hint(base.get("rescale_penalty"), 0.0)),
                 "boundary_scale_policy": "frontier",
-                "bootstrap_anchor_count": explicit_anchor_count,
+                "bootstrap_anchor_count": 0,
                 "boundary_state_cap": max(3, _int_hint(base.get("boundary_state_cap"), 3)),
-                "selection_objective": "min_bootstrap",
+                "selection_objective": "cost",
             },
             0.18,
         ),
@@ -19151,7 +19113,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 **_waterline_seed_policy(),
                 "direct_budget_policy": True,
                 "allow_seed_fallback": False,
-                "target_bootstrap_count": target,
                 "selection_bootstrap_penalty": max(
                     250_000_000.0,
                     _float_hint(base.get("selection_bootstrap_penalty"), 0.0),
@@ -19163,7 +19124,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "budget_fulfillment_beam",
             {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "selection_bootstrap_penalty": 0.0,
                 "selection_objective": "cost",
@@ -19174,7 +19134,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "wide_boundary_cost_beam",
             {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 8,
                 "state_cap_per_node": 32,
@@ -19191,7 +19150,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "dense_boundary_cost_beam",
             {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 10,
                 "state_cap_per_node": 48,
@@ -19209,7 +19167,6 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
             "nonlinear_phase_boundary_beam",
             {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 10,
                 "state_cap_per_node": 48,
@@ -19303,7 +19260,7 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                     300_000_000.0, _float_hint(base.get("selection_bootstrap_penalty"), 0.0)
                 ),
                 "boundary_scale_policy": "sf",
-                "bootstrap_anchor_count": explicit_anchor_count,
+                "bootstrap_anchor_count": 0,
             },
             0.19,
         ),
@@ -19319,7 +19276,7 @@ def _default_bootstrap_mcts_actions(hints: dict[str, Any], params: Params) -> li
                 "reserve_penalty": max(100_000.0, _float_hint(base.get("reserve_penalty"), 0.0)),
                 "min_transition_reserve": max(2, _int_hint(base.get("min_transition_reserve"), 0)),
                 "boundary_scale_policy": "frontier",
-                "bootstrap_anchor_count": explicit_anchor_count,
+                "bootstrap_anchor_count": 0,
             },
             -0.10,
         ),
@@ -19389,11 +19346,7 @@ def _mcts_invalid_reward(action: MCTSAction, step: int) -> float:
 
 
 def _mcts_target_met(assign: Assign, params: Params, hints: dict[str, Any]) -> bool:
-    return _policy_bootstrap_target_met(
-        hints,
-        params,
-        _aggregate_counts([assign])["bootstrap"],
-    )
+    return False
 
 
 def _policy_assignment_score(
@@ -19617,14 +19570,13 @@ def _zero_iteration_portfolio_hints() -> dict[str, Any]:
 
 
 def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
-    target = int(getattr(params, "openevolve_target_bootstrap_count", 0) or 0) if params else 0
     rollout_budget = (
         24
         if params is None
         else max(8, min(64, int(getattr(params, "openevolve_mcts_rollout_budget", 24))))
     )
     budget_aggressive = bool(getattr(params, "openevolve_budget_aggressive", False)) if params else False
-    sampled_repair_cap = 128 if budget_aggressive else max(16, target)
+    sampled_repair_cap = 128 if budget_aggressive else 32
     policy = _low_scale_frontier_policy()
     policy.update(
         {
@@ -19650,7 +19602,6 @@ def _bootstrap_mcts_seed_policy(params: Params | None = None) -> dict[str, Any]:
             "mcts_rollout_budget": rollout_budget,
             "mcts_exploration_weight": 1.4,
             "mcts_max_repair_bootstraps": sampled_repair_cap,
-            "target_bootstrap_count": target,
             "mcts_action_cap": 6,
             "boundary_state_cap": 6,
             "enable_direct_budget_beam": False,
@@ -20767,19 +20718,7 @@ def _contextual_target_bootstrap_score(
     candidate: int | float,
     reference: int | float | None = None,
 ) -> float:
-    component_target = _safe_int(
-        context.get("unit_bootstrap_budget", {}).get("component_budget_total"),
-        0,
-    )
-    if component_target <= 0:
-        return _target_bootstrap_score(target, candidate, reference)
-    target_int = max(component_target, _safe_int(target, 0))
-    return _bootstrap_budget_fit_score(
-        max(0.0, _finite_float(candidate, float("inf"))),
-        target_int,
-        reference,
-        component_target=component_target,
-    )
+    return 0.0
 
 
 def _policy_target_bootstrap_score(
@@ -20788,22 +20727,7 @@ def _policy_target_bootstrap_score(
     candidate: int | float,
     reference: int | float | None = None,
 ) -> float:
-    target = max(
-        0,
-        _int_hint(
-            hints.get("target_bootstrap_count"),
-            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
-        ),
-    )
-    component_target = sum(_policy_unit_bootstrap_targets(hints).values())
-    if component_target <= 0:
-        return _target_bootstrap_score(target, candidate, reference)
-    return _bootstrap_budget_fit_score(
-        max(0.0, _finite_float(candidate, float("inf"))),
-        max(target, component_target),
-        reference,
-        component_target=component_target,
-    )
+    return 0.0
 
 
 def _bootstrap_budget_fit_score(
@@ -20831,21 +20755,7 @@ def _policy_bootstrap_target_met(
     params: Params,
     candidate: int | float,
 ) -> bool:
-    target = max(
-        0,
-        _int_hint(
-            hints.get("target_bootstrap_count"),
-            int(getattr(params, "openevolve_target_bootstrap_count", 0)),
-        ),
-    )
-    component_target = sum(_policy_unit_bootstrap_targets(hints).values())
-    candidate_value = max(0.0, _finite_float(candidate, float("inf")))
-    if component_target > 0:
-        return candidate_value >= max(1.0, 0.65 * component_target) and candidate_value <= max(
-            component_target,
-            target,
-        ) * 1.35
-    return target > 0 and candidate_value <= target
+    return False
 
 
 def _component_bootstrap_alignment_summary(
@@ -20915,16 +20825,14 @@ def _component_bootstrap_alignment_score(
 
 
 def _context_target_bootstrap_count(context: dict[str, Any]) -> int:
-    return max(
-        0,
-        _safe_int(
-            context.get("harness", {}).get(
-                "target_bootstrap_count",
-                context.get("params", {}).get("openevolve_target_bootstrap_count", 0),
-            ),
-            0,
-        ),
-    )
+    """Deprecated compatibility hook.
+
+    OpenEvolve placement is correctness-gated latency minimization. Bootstrap
+    count remains diagnostic only; exact targets must not affect scoring, seeds,
+    or finalist selection.
+    """
+
+    return 0
 
 
 def _context_seed_bootstrap_count(context: dict[str, Any]) -> int | None:
@@ -20961,7 +20869,6 @@ def _alphaevolve_guidance(params: Params, unit_bootstrap_budget: dict[str, Any])
     placement policy, while Orbit owns CKKS legality, repair, and final DP.
     """
 
-    requested_target = int(getattr(params, "openevolve_target_bootstrap_count", 0) or 0)
     return {
         "source": "Adapting AlphaEvolve to Optimize Fully Homomorphic Encryption on TPUs",
         "principles": [
@@ -21023,7 +20930,7 @@ def _alphaevolve_guidance(params: Params, unit_bootstrap_budget: dict[str, Any])
             "clear_only": "replay QBP boundary groups with deterministic Orbit repair",
             "finalist": "full-bundle replay; fallback-heavy candidates cannot win",
         },
-        "requested_bootstrap_target": requested_target if requested_target > 0 else None,
+        "requested_bootstrap_target": None,
         "maintenance_pressure_summary": {
             "kind_pressure_totals": unit_bootstrap_budget.get("kind_pressure_totals", {}),
             "unit_pressure_count": len(unit_bootstrap_budget.get("unit_maintenance_pressure", {}) or {}),
@@ -21437,7 +21344,6 @@ def _unit_bootstrap_budget_summary(
             }
             kind_pressure_totals[kind] += float(pressure)
             kind_counts[kind] += 1
-    requested_global = max(0, _safe_int(global_target, 0))
     return {
         "unit_budgets": {},
         "unit_maintenance_pressure": unit_pressure,
@@ -21445,8 +21351,8 @@ def _unit_bootstrap_budget_summary(
         "kind_unit_counts": dict(sorted(kind_counts.items())),
         "kind_priors": _NONLINEAR_MAINTENANCE_PRIORS,
         "component_budget_total": 0,
-        "requested_global_target": requested_global,
-        "effective_target_bootstrap_count": requested_global,
+        "requested_global_target": 0,
+        "effective_target_bootstrap_count": 0,
         "notes": [
             "Maintenance pressure is a relative graph prior, not a bootstrap-count target.",
             "Final Orbit validation and latency decide whether bootstraps are legal and useful.",
@@ -21748,11 +21654,6 @@ def candidate_actions(
     """Build bounded MCTS actions without relying on BERT-specific labels."""
 
     ckks = _ckks_dict(context)
-    target = (
-        int(target_bootstraps)
-        if target_bootstraps is not None
-        else _context_target_bootstrap_count(context)
-    )
     component_targets = _context_unit_bootstrap_targets(context)
     component_anchor_count = _graph_maintenance_anchor_hint(context)
     base = {
@@ -21772,7 +21673,6 @@ def candidate_actions(
         "beam_width": 6,
         "state_cap_per_node": 16,
         "scale_lattice": "waterline_sf",
-        "target_bootstrap_count": target,
         "boundary_scale_policy": "frontier",
         "boundary_state_cap": 4,
         "bootstrap_anchor_count": 0,
@@ -21796,7 +21696,6 @@ def candidate_actions(
             "prior": 0.54,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 8,
                 "state_cap_per_node": 32,
@@ -21812,7 +21711,6 @@ def candidate_actions(
             "prior": 0.36,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 8,
                 "state_cap_per_node": 32,
@@ -21894,7 +21792,6 @@ def candidate_actions(
                 **_waterline_seed_policy(),
                 "direct_budget_policy": True,
                 "allow_seed_fallback": False,
-                "target_bootstrap_count": target,
                 "selection_bootstrap_penalty": 0.0,
                 "selection_objective": "cost",
             },
@@ -21924,7 +21821,6 @@ def candidate_actions(
             "prior": 0.58,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 12,
                 "state_cap_per_node": 40,
@@ -21942,7 +21838,6 @@ def candidate_actions(
             "prior": 0.40,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 10,
                 "state_cap_per_node": 48,
@@ -21960,7 +21855,6 @@ def candidate_actions(
             "prior": 0.44,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 10,
                 "state_cap_per_node": 48,
@@ -21999,8 +21893,8 @@ def candidate_actions(
                 "bootstrap_anchor_count": 0,
                 "boundary_state_cap": 3,
                 "bootstrap_penalty": 2_500_000_000.0,
-                "selection_bootstrap_penalty": 250_000_000.0,
-                "selection_objective": "min_bootstrap",
+                "selection_bootstrap_penalty": 0.0,
+                "selection_objective": "cost",
             },
         },
         {
@@ -22019,8 +21913,7 @@ def candidate_actions(
             "policy": {
                 **_low_scale_frontier_policy(),
                 "allow_seed_fallback": False,
-                "target_bootstrap_count": target,
-                "selection_bootstrap_penalty": 900_000_000.0,
+                "selection_bootstrap_penalty": 0.0,
             },
         },
     ]
@@ -22088,7 +21981,6 @@ def candidate_actions(
             "prior": 0.50,
             "policy": {
                 **_budget_fulfillment_beam_policy(),
-                "target_bootstrap_count": target,
                 "direct_budget_policy": True,
                 "beam_width": 10,
                 "state_cap_per_node": 48,
@@ -22168,20 +22060,10 @@ def score_rollout(metrics: dict[str, Any], *, target_bootstraps: int | None = No
         if math.isfinite(latency) and latency > 0 and math.isfinite(reference) and reference > 0
         else 0.0
     )
-    target_score = (
-        _target_bootstrap_score(
-            int(target_bootstraps),
-            _finite_float(metrics.get("bootstrap_count"), float("inf")),
-            None,
-        )
-        if target_bootstraps
-        else 1.0
-    )
     return (
-        0.55 * latency_score
+        0.60 * latency_score
         + 0.30 * max(0.0, min(1.0, validity))
         + 0.10 / (1.0 + repairs)
-        + 0.05 * target_score
     )
 
 
@@ -22203,7 +22085,7 @@ class PlacementMCTS:
         if bool(self.context.get("harness", {}).get("budget_aggressive", False)):
             max_repair_bootstraps = max(int(max_repair_bootstraps), 128)
         else:
-            max_repair_bootstraps = max(int(max_repair_bootstraps), int(target_bootstraps))
+            max_repair_bootstraps = max(int(max_repair_bootstraps), 32)
         policy = _bootstrap_mcts_seed_policy()
         component_targets = _context_unit_bootstrap_targets(self.context)
         policy.update(
@@ -22211,7 +22093,6 @@ class PlacementMCTS:
                 "budget_aggressive": bool(
                     self.context.get("harness", {}).get("budget_aggressive", False)
                 ),
-                "target_bootstrap_count": int(target_bootstraps),
                 "component_bootstrap_budgets": component_targets,
                 "mcts_rollout_budget": int(rollout_budget),
                 "mcts_exploration_weight": float(exploration_weight),
@@ -22222,7 +22103,6 @@ class PlacementMCTS:
                 "include_seed_repair_actions": False,
                 "mcts_actions": candidate_actions(
                     self.context,
-                    target_bootstraps=int(target_bootstraps),
                     action_cap=int(action_cap),
                 ),
             }

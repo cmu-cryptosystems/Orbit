@@ -744,7 +744,7 @@ def test_builder_compile_seed_includes_bounded_reliable_portfolio(toy_cost_json:
         "level_preserving",
     ]
     assert hints["portfolio"][0]["budget_aggressive"] is True
-    assert hints["portfolio"][1]["selection_bootstrap_penalty"] == 500_000_000.0
+    assert hints["portfolio"][1]["selection_bootstrap_penalty"] == 0.0
     assert hints["portfolio"][4]["bootstrap_penalty"] == 650_000_000.0
     assert hints["portfolio"][5]["bootstrap_penalty"] == 650_000_000.0
     assert hints["portfolio"][6]["min_internal_level"] == 6
@@ -1177,8 +1177,8 @@ def test_contextual_bootstrap_score_does_not_infer_component_targets(toy_cost_js
     lower = oe_backend._contextual_target_bootstrap_score(context, 9, 1, None)
     higher_but_under_explicit = oe_backend._contextual_target_bootstrap_score(context, 9, 3, None)
 
-    assert lower == 1.0
-    assert higher_but_under_explicit == 1.0
+    assert lower == 0.0
+    assert higher_but_under_explicit == 0.0
     assert context["unit_bootstrap_budget"]["unit_budgets"] == {}
 
 
@@ -1209,7 +1209,7 @@ def test_bootstrap_mcts_api_builds_low_bootstrap_actions(toy_cost_json: str):
     sampled = oe_backend._compile_hints_for_eval_suite(hints, "polybert-sampled")
 
     assert hints["strategy"] == "bootstrap_mcts"
-    assert hints["target_bootstrap_count"] == 9
+    assert hints.get("target_bootstrap_count", 0) == 0
     assert len(hints["mcts_actions"]) >= 4
     assert hints["mcts_actions"][0]["name"] == "strict_no_bootstrap"
     assert any(
@@ -3470,7 +3470,7 @@ def test_component_budget_mcts_does_not_stop_at_too_few_bootstraps(toy_cost_json
     }
 
     assert not oe_backend._policy_bootstrap_target_met(hints, params, 3)
-    assert oe_backend._policy_bootstrap_target_met(hints, params, 7)
+    assert not oe_backend._policy_bootstrap_target_met(hints, params, 7)
 
 
 def test_context_includes_alphaevolve_guidance(toy_cost_json: str):
@@ -3483,7 +3483,7 @@ def test_context_includes_alphaevolve_guidance(toy_cost_json: str):
     assert guidance["source"].startswith("Adapting AlphaEvolve")
     assert "strategy_pool" in guidance
     assert any("execution-trace" in item or "trace" in item for item in guidance["principles"])
-    assert guidance["requested_bootstrap_target"] == 9
+    assert guidance["requested_bootstrap_target"] is None
     assert "maintenance_pressure_summary" in guidance
 
 

@@ -93,7 +93,7 @@ python3 scripts/optimizer/orbit/run_orbit.py [options]
 - `--openevolve-api-key-env <name>`: API key environment variable. Default is `OPENAI_API_KEY`; Gemini also falls back to `GEMINI_API_KEY`.
 - `--openevolve-secondary-provider <none|gemini|openai|custom>`, `--openevolve-secondary-model <name>`, `--openevolve-secondary-weight <w>`: Optional second model in OpenEvolve's LLM ensemble. A common setting is Gemini Flash-Lite primary plus OpenAI `gpt-5.5` secondary.
 - `--openevolve-budget-aggressive` / `--no-openevolve-budget-aggressive`: Bias sampled scoring toward candidates that directly solve more budget records before latency wins.
-- `--openevolve-target-bootstrap-count <n>`: Soft bootstrap target used in sampled scoring and finalist selection. `0` disables it.
+- `--openevolve-target-bootstrap-count <n>`: Deprecated compatibility option. Current OpenEvolve placement ranks only correctness-gated latency; bootstrap count is reported as a diagnostic.
 - `--openevolve-llm-timeout-sec <n>`, `--openevolve-llm-retries <n>`, `--openevolve-llm-retry-delay-sec <n>`: Runtime retry controls for generated OpenEvolve configs.
 - `--openevolve-evaluator-timeout-sec <n>`, `--openevolve-parallel-evaluations <n>`, `--openevolve-checkpoint-interval <n>`: Evaluator and checkpoint controls for positive-iteration searches.
 - `--openevolve-fail-open` / `--no-openevolve-fail-open`: Return the best recovered or initial validated candidate if OpenEvolve runtime fails. Enabled by default.
@@ -193,7 +193,7 @@ python3 -m scripts.optimizer.orbit.optimizer \
   --no-partition
 ```
 
-Gemini plus OpenAI ensemble search with a low-bootstrap target:
+Gemini plus OpenAI ensemble search with correctness-gated latency minimization:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
@@ -211,7 +211,6 @@ python3 -m scripts.optimizer.orbit.optimizer \
   --openevolve-model gemini-3.1-flash-lite \
   --openevolve-secondary-provider openai \
   --openevolve-secondary-model gpt-5.5 \
-  --openevolve-target-bootstrap-count 9 \
   --no-compress \
   --no-partition
 ```

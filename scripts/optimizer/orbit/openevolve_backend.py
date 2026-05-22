@@ -2874,6 +2874,7 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
     )
     context.setdefault("harness", {})["candidate_examples"] = _merge_candidate_examples(
         seed_trace_examples,
+        reference_examples,
         policy_bank.get("examples", []),
     )
     context.setdefault("harness", {})["policy_bank_summary"] = policy_bank.get("summary", {})
@@ -4695,6 +4696,40 @@ def _reference_json_candidate_examples(context: dict[str, Any]) -> list[dict[str
         ((str(key), _safe_int(value, 1)) for key, value in locations.items()),
         key=lambda item: (-item[1], item[0]),
     )
+    source_mlir = str(reference.get("source_mlir", "") or "")
+    mlir_path = Path(source_mlir).expanduser() if source_mlir else None
+    mlir_preview = ""
+    mlir_digest = ""
+    if mlir_path is not None and mlir_path.exists():
+        try:
+            mlir_text = mlir_path.read_text(encoding="utf-8", errors="ignore")
+            mlir_digest = hashlib.sha256(mlir_text.encode("utf-8")).hexdigest()
+            mlir_preview = mlir_text[:TRACE_PREVIEW_CHARS]
+        except Exception:
+            mlir_preview = ""
+            mlir_digest = ""
+    if not mlir_preview:
+        trace_lines = [
+            'module attributes {orbit.trace = "reference_json"} {',
+            f"  // objective_cost_usec = {latency_usec if latency_usec is not None and math.isfinite(latency_usec) else 0.0}",
+        ]
+        for location, count in location_items[:64]:
+            safe_location = location.replace('"', "'")
+            trace_lines.append(
+                f'  "orbit.trace.bootstrap"() {{node = "{safe_location}", count = {max(1, int(count))}}} : () -> ()'
+            )
+        trace_lines.append("}")
+        mlir_preview = "\n".join(trace_lines) + "\n"
+        mlir_digest = hashlib.sha256(mlir_preview.encode("utf-8")).hexdigest()
+    trace_features = _mlir_trace_features(mlir_preview)
+    trace_features["trace_kind_counts"]["bootstrap"] = max(
+        int(trace_features.get("trace_kind_counts", {}).get("bootstrap", 0) or 0),
+        int(_finite_float(reference.get("bootstrap_count"), 0.0) or 0),
+    )
+    trace_features["bootstrap_locations"] = [
+        {"location": location, "count": count}
+        for location, count in location_items[:16]
+    ]
     return [
         {
             "kind": "reference_static_baseline_trace",
@@ -4705,6 +4740,10 @@ def _reference_json_candidate_examples(context: dict[str, Any]) -> list[dict[str
             "bootstrap_count": _finite_float(reference.get("bootstrap_count"), 0.0),
             "rescale_count": _finite_float(reference.get("rescale_count"), 0.0),
             "source_mlir": reference.get("source_mlir", ""),
+            "candidate_mlir_path": source_mlir,
+            "candidate_mlir_digest": mlir_digest,
+            "candidate_mlir_preview": mlir_preview[:TRACE_PREVIEW_CHARS],
+            "trace_features": trace_features,
             "bootstrap_op_patterns": list(reference.get("bootstrap_op_patterns", []) or [])[:16],
             "bootstrap_locations": [
                 {"location": location, "count": count}
@@ -12284,10 +12323,10 @@ def _strategy_discovery_variants(
     if reference_anchor_probe_selected:
         dimension_priority = {
             "seed_maintenance_perturbation": 0,
-            "per_top_boundary_override": 1,
-            "dp_probe_mode": 2,
-            "multi_boundary_output_splice": 2,
-            "reference_bootstrap_anchor_policy": 2,
+            "reference_bootstrap_anchor_policy": 1,
+            "per_top_boundary_override": 2,
+            "dp_probe_mode": 3,
+            "multi_boundary_output_splice": 3,
             "boundary_scale_policy": 3,
             "scale_lattice": 3,
             "boundary_state_cap": 3,
@@ -12307,9 +12346,9 @@ def _strategy_discovery_variants(
             if label.startswith("seed_bootstrap_"):
                 return (0, label)
             if label.startswith("reference_anchor_"):
-                return (2, f"{reference_label_priority.get(label, 99):02d}:{label}")
+                return (1, f"{reference_label_priority.get(label, 99):02d}:{label}")
             if label.startswith("dp_output_splice"):
-                return (1, label)
+                return (3, label)
             return (dimension_priority.get(dimension, 3), label)
 
         variants.sort(key=reference_anchor_priority)
@@ -15175,7 +15214,10 @@ def _load_reference_json(path: str | None) -> dict[str, Any]:
     if not path:
         return {}
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("_source_path", str(path))
+        return data
     except Exception as exc:
         return {"load_error": f"{type(exc).__name__}: {str(exc)[:240]}", "path": path}
 

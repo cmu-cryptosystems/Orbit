@@ -2752,9 +2752,11 @@ def test_strategy_discovery_prioritizes_reference_anchor_probe_variants(
     assert labels[0].startswith("seed_bootstrap_")
     assert "seed_bootstrap_remove_0" in labels
     assert "seed_bootstrap_shift_prev_0" in labels
-    assert labels.index("dp_output_splice_frontier") > labels.index(
-        "seed_bootstrap_shift_prev_0"
-    )
+    assert "reference_anchor_neighborhood_frontier" in labels
+    if "dp_output_splice_frontier" in labels:
+        assert labels.index("reference_anchor_neighborhood_frontier") < labels.index(
+            "dp_output_splice_frontier"
+        )
 
 
 def test_strategy_discovery_examples_mark_promotable_status():
@@ -3354,6 +3356,37 @@ def test_merge_candidate_examples_preserves_seed_mlir_preview():
     assert examples[0]["kind"] == "seed_mlir_trace_reference"
     assert len(examples[0]["candidate_mlir_preview"]) == oe_backend.TRACE_PREVIEW_CHARS
     assert examples[1]["candidate_mlir_preview"] == "module { }"
+
+
+def test_reference_json_candidate_examples_include_trace_preview(tmp_path: Path):
+    mlir_path = tmp_path / "reference.mlir"
+    mlir_path.write_text(
+        'module attributes {orbit.trace = "placement"} {\n'
+        '  "orbit.trace.bootstrap"() {node = "layer.0.inv_sqrt_seed"} : () -> ()\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    context = {
+        "harness": {
+            "reference_json": {
+                "source": "gurobi_reference",
+                "source_mlir": str(mlir_path),
+                "final_tdag_latency_usec": 123.0,
+                "bootstrap_count": 2,
+                "bootstrap_locations": {"layer=layer.0;op=inv_sqrt_seed": 2},
+                "bootstrap_op_patterns": {"inv_sqrt_seed": 2},
+            }
+        }
+    }
+
+    examples = oe_backend._reference_json_candidate_examples(context)
+
+    assert examples
+    assert examples[0]["kind"] == "reference_static_baseline_trace"
+    assert examples[0]["candidate_mlir_path"] == str(mlir_path)
+    assert "orbit.trace.bootstrap" in examples[0]["candidate_mlir_preview"]
+    assert examples[0]["trace_features"]["trace_kind_counts"]["bootstrap"] == 2
+    assert examples[0]["bootstrap_locations"][0]["location"] == "layer=layer.0;op=inv_sqrt_seed"
 
 
 def test_mlir_trace_features_extracts_trace_ops_and_boundaries():

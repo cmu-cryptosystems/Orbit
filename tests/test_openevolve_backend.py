@@ -6830,6 +6830,11 @@ def test_sampled_promotion_limits_extra_probes_after_selection(
     assert summary["selected"] is True
     assert summary["post_selection_probe_count"] == 1
     assert any(record.get("stage") == "selected_probe_budget_stop" for record in summary["records"])
+    ledger = json.loads((tmp_path / "sampled_promotion" / "strategy_ledger.json").read_text())
+    assert ledger["selected_strategy"]["stage"] == "dp_table_probe_sampled_only"
+    assert ledger["selected_is_final_mlir_candidate"] is False
+    assert "selected_probe_has_no_final_mlir_yet" in ledger["findings"]
+    assert ledger["promotion_diversity"]["distinct_probe_effective_path_count"] == 1
 
 
 def test_single_boundary_debug_skips_sampled_only_by_default(

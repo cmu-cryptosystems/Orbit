@@ -11821,6 +11821,202 @@ def _promotion_record_summary(
     }
 
 
+def _policy_summary_dict(record: dict[str, Any]) -> dict[str, Any]:
+    for key in ("policy_summary", "full_policy_summary"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _reference_latency_from_json(reference: dict[str, Any]) -> float:
+    for key in (
+        "final_tdag_latency_usec",
+        "final_latency_usec",
+        "tdag_latency_usec",
+        "baseline_latency_usec",
+    ):
+        value = _finite_float(reference.get(key), float("nan"))
+        if math.isfinite(value) and value > 0:
+            return value
+    for key in (
+        "final_tdag_latency_sec",
+        "final_latency_sec",
+        "tdag_latency_sec",
+        "baseline_latency_sec",
+    ):
+        value = _finite_float(reference.get(key), float("nan"))
+        if math.isfinite(value) and value > 0:
+            return value * 1_000_000.0
+    return float("inf")
+
+
+def _strategy_tracking_report(
+    context: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    params: Params,
+) -> dict[str, Any]:
+    """Summarize whether OpenEvolve found transferable placement strategies.
+
+    This artifact is deliberately separate from OpenEvolve's scalar score:
+    it compares the selected sampled strategy to the optional static reference
+    and explains whether the strategy is a real global candidate, a one-probe
+    exploratory move, or a collapsed duplicate path.
+    """
+
+    harness = context.get("harness", {}) if isinstance(context.get("harness"), dict) else {}
+    reference = harness.get("reference_json", {})
+    if not isinstance(reference, dict):
+        reference = {}
+    selected_record = summary.get("selected_record")
+    if not isinstance(selected_record, dict):
+        selected_record = {}
+    selected_policy = _policy_summary_dict(selected_record)
+    presets = selected_policy.get("mcts_action_presets")
+    preset_names: list[str] = []
+    if isinstance(presets, dict):
+        preset_names = sorted(str(key) for key in presets)
+    action_allowlist = selected_policy.get("mcts_action_allowlist")
+    if not isinstance(action_allowlist, list):
+        action_allowlist = []
+    reference_locations = reference.get("bootstrap_locations")
+    if not isinstance(reference_locations, dict):
+        reference_locations = {}
+    reference_patterns = reference.get("bootstrap_op_patterns")
+    if not isinstance(reference_patterns, dict):
+        reference_patterns = {}
+    selected_latency = _finite_float(summary.get("selected_latency_usec"), float("inf"))
+    probe_reference = _finite_float(
+        summary.get("probe_reference_latency_usec"), float("inf")
+    )
+    sampled_reference = _finite_float(
+        summary.get("sampled_reference_latency_usec"), float("inf")
+    )
+    static_reference_latency = _reference_latency_from_json(reference)
+    stage = str(selected_record.get("stage", ""))
+    sampled_only_selected = stage == "dp_table_probe_sampled_only"
+    distinct_policies = int(summary.get("distinct_probe_policy_count", 0) or 0)
+    distinct_paths = int(summary.get("distinct_probe_effective_path_count", 0) or 0)
+    record_reasons: Counter[str] = Counter()
+    for record in summary.get("records", []) or []:
+        if isinstance(record, dict):
+            reason = str(record.get("reason", ""))
+            if reason:
+                record_reasons[reason] += 1
+    findings: list[str] = []
+    if selected_record:
+        findings.append("selected_latency_improving_probe")
+    if sampled_only_selected:
+        findings.append("selected_probe_has_no_final_mlir_yet")
+    if distinct_policies > 1 and distinct_paths <= 1:
+        findings.append("policy_mutations_collapse_to_same_effective_qbp_path")
+    if math.isfinite(selected_latency) and math.isfinite(probe_reference) and selected_latency < probe_reference:
+        findings.append("same_probe_latency_improved")
+    if math.isfinite(static_reference_latency) and math.isfinite(selected_latency):
+        findings.append("static_reference_comparison_is_not_global_for_sampled_probe")
+    next_mutation_guidance: list[str] = []
+    if distinct_policies > 1 and distinct_paths <= 1:
+        next_mutation_guidance.append(
+            "Increase effective path diversity: mutate boundary_group_policies, action allowlist, and selected-source mix until selected_path_digest changes on more than one top boundary group."
+        )
+    if sampled_only_selected:
+        next_mutation_guidance.append(
+            "Promote only after task-wise multi-boundary DP probes improve the same-task seed; this single-boundary result should not emit a final MLIR."
+        )
+    if reference_locations:
+        next_mutation_guidance.append(
+            "Use reference bootstrap locations as soft anchor examples, not fixed targets; compare component phases and minimize Orbit latency after validity."
+        )
+    return {
+        "schema_version": "orbit-openevolve-strategy-ledger-v1",
+        "selection_scope": "sampled_dp_probe" if sampled_only_selected else "sampled_or_full_replay",
+        "selected_is_final_mlir_candidate": bool(
+            selected_record and not sampled_only_selected
+        ),
+        "baseline_reference": {
+            "source": reference.get("source", ""),
+            "source_mlir": reference.get("source_mlir", ""),
+            "latency_usec": (
+                static_reference_latency if math.isfinite(static_reference_latency) else None
+            ),
+            "bootstrap_count": _finite_float(reference.get("bootstrap_count"), 0.0),
+            "bootstrap_op_patterns": dict(reference_patterns),
+            "bootstrap_locations": dict(list(reference_locations.items())[:32]),
+        },
+        "selected_strategy": {
+            "stage": stage,
+            "reason": selected_record.get("reason"),
+            "latency_usec": selected_latency if math.isfinite(selected_latency) else None,
+            "probe_reference_latency_usec": (
+                probe_reference if math.isfinite(probe_reference) else None
+            ),
+            "sampled_reference_latency_usec": (
+                sampled_reference if math.isfinite(sampled_reference) else None
+            ),
+            "latency_ratio_vs_probe_seed": (
+                selected_latency / probe_reference
+                if math.isfinite(selected_latency)
+                and math.isfinite(probe_reference)
+                and probe_reference > 0
+                else None
+            ),
+            "bootstrap_count": _finite_float(selected_record.get("bootstrap_count"), 0.0),
+            "rescale_count": _finite_float(selected_record.get("rescale_count"), 0.0),
+            "selected_path_digest": selected_record.get("selected_path_digest", ""),
+            "path_collapse_reason": selected_record.get("path_collapse_reason", ""),
+            "action_allowlist": [str(item) for item in action_allowlist[:16]],
+            "action_preset_names": preset_names[:16],
+            "boundary_group_policy_count": int(
+                selected_policy.get(
+                    "boundary_group_policy_count",
+                    len(selected_policy.get("boundary_group_policies", []) or []),
+                )
+                or 0
+            ),
+            "policy_summary": selected_policy,
+        },
+        "promotion_diversity": {
+            "distinct_probe_policy_count": distinct_policies,
+            "distinct_probe_effective_path_count": distinct_paths,
+            "distinct_probe_path_source_count": int(
+                summary.get("distinct_probe_path_source_count", 0) or 0
+            ),
+            "duplicate_policy_count": int(summary.get("duplicate_policy_count", 0) or 0),
+            "duplicate_effective_path_count": int(
+                summary.get("duplicate_effective_path_count", 0) or 0
+            ),
+            "reason_counts": dict(record_reasons),
+        },
+        "mlir_comparison": {
+            "baseline_mlir_path": reference.get("source_mlir", ""),
+            "openevolve_final_mlir_available": bool(
+                selected_record and not sampled_only_selected
+            ),
+            "openevolve_final_mlir_note": (
+                "sampled-only DP table probe; final MLIR emission intentionally skipped"
+                if sampled_only_selected
+                else ""
+            ),
+        },
+        "findings": findings,
+        "next_mutation_guidance": next_mutation_guidance,
+        "run_settings": {
+            "sampled_only": bool(getattr(params, "openevolve_sampled_only", False)),
+            "eval_suite": str(getattr(params, "openevolve_eval_suite", "")),
+            "qbp_engine": str(getattr(params, "openevolve_qbp_engine", "")),
+            "search_mode": str(getattr(params, "openevolve_search_mode", "")),
+        },
+    }
+
+
 def _promotion_probe_result_from_discovery_record(record: dict[str, Any]) -> dict[str, Any]:
     """Reconstruct a compact probe result from strategy discovery artifacts.
 
@@ -15517,8 +15713,14 @@ def _run_sampled_promotion_pass(
         "eval_timeout_sec": eval_timeout_sec,
         "records": records,
     }
+    strategy_tracking = _strategy_tracking_report(context, summary, params=params)
+    summary["strategy_tracking"] = strategy_tracking
     (promotion_dir / "promotion_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (promotion_dir / "strategy_ledger.json").write_text(
+        json.dumps(strategy_tracking, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
     if getattr(params, "openevolve_qbp_engine", "mcts") == "dp":
@@ -15533,6 +15735,7 @@ def _run_sampled_promotion_pass(
                     "distinct_probe_policy_count": len(seen_policy_digests),
                     "distinct_probe_effective_path_count": len(seen_effective_digests),
                     "distinct_probe_path_source_count": len(seen_path_source_digests),
+                    "strategy_tracking": strategy_tracking,
                     "records": [
                         {
                             key: record.get(key)

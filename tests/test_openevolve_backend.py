@@ -6533,6 +6533,126 @@ def test_sampled_promotion_selects_real_qbp_latency_winner(
     assert progress["selected"] is True
 
 
+def test_sampled_only_dp_probe_selects_without_materialization(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_sampled_only=True,
+        openevolve_finalists=0,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+            "seed_metrics": {
+                "sampled_dp_latency_usec": 100.0,
+                "selected_path_digest": "seed-path",
+                "selected_source_counts": {"seed": 1},
+                "bootstrap_count": 3,
+                "rescale_count": 5,
+            },
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    code = "def place(context):\n    return {'marker': 'fast', 'qbp_engine': 'dp'}\n"
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: [code])
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda *_args: {"marker": "fast", "qbp_engine": "dp"},
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_static_validate_hints",
+        lambda *_args: {"valid": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda _context, _hints, _params, tasks, cost, timeout_sec: (
+            tasks,
+            cost,
+            {"valid": True, "sampled_dp_latency_usec": cost},
+        ),
+    )
+    monkeypatch.setattr(oe_backend, "_run_single_boundary_dp_debug", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "latency_improved_codes": [],
+            "skip_policy_digests": set(),
+            "summary": {},
+        },
+    )
+
+    def fake_probe(_context, _hints, _params, _tasks, *, timeout_sec):
+        assert timeout_sec >= 0
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 80.0,
+            "objective_cost_usec": 80.0,
+            "bootstrap_count": 2,
+            "rescale_count": 4,
+            "sampled_selected_path_digest": "candidate-path",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "selected_source_counts": {"candidate": 1},
+            },
+        }
+
+    def fail_materialization(*_args, **_kwargs):
+        raise AssertionError("sampled-only DP table probe should not materialize")
+
+    monkeypatch.setattr(oe_backend, "_evaluate_promotion_probe", fake_probe)
+    monkeypatch.setattr(oe_backend, "_evaluate_dp_probe_for_promotion", fail_materialization)
+    monkeypatch.setattr(oe_backend, "_evaluate_sampled_budget_tasks_for_promotion", fail_materialization)
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        code,
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert selected["marker"] == "fast"
+    assert selected["openevolve_promotion_stage"] == "dp_table_probe_sampled_only"
+    assert selected["openevolve_promotion_requires_full_materialization"] is True
+    assert selected["openevolve_promotion_latency_usec"] == 80.0
+    assert selected["openevolve_promotion_reference_latency_usec"] == 100.0
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["selected"] is True
+    assert summary["selected_record"]["stage"] == "dp_table_probe_sampled_only"
+    assert summary["selected_record"]["sampled_only_probe_selected"] is True
+
+
 def test_sampled_promotion_fails_open_when_no_candidate_improves(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):

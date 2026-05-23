@@ -15160,6 +15160,48 @@ def _run_sampled_promotion_pass(
             and bool(path_diff.get("selected_path_changed", False))
             and probe_latency_improved
         ):
+            if (
+                bool(getattr(params, "openevolve_sampled_only", False))
+                and int(getattr(params, "openevolve_finalists", 0) or 0) <= 0
+            ):
+                probe_record["stage"] = "dp_table_probe_sampled_only"
+                probe_record["reason"] = "dp_changed_faster_sampled_only_selected"
+                probe_record["sampled_only_probe_selected"] = True
+                item = (
+                    probe_latency,
+                    _finite_float(probe_result.get("bootstrap_count"), 0.0),
+                    _finite_float(probe_result.get("rescale_count"), 0.0),
+                    index,
+                    active_probe_hints,
+                    probe_record,
+                    code,
+                )
+                if best is None or item[:4] < best[:4]:
+                    best = item
+                _write_promotion_progress(
+                    promotion_dir,
+                    started_at=started_at,
+                    timeout_sec=timeout_sec,
+                    current_stage="dp_table_probe_sampled_only_selected",
+                    current_index=index,
+                    total_candidates=min(limit, len(codes)),
+                    records=records,
+                    selected=True,
+                )
+                if _promotion_stop_after_selected():
+                    records.append(
+                        {
+                            "index": index,
+                            "stage": "selected_stop",
+                            "reason": (
+                                "stopping promotion after first latency-improving "
+                                "sampled-only DP table probe"
+                            ),
+                            "selected_latency_usec": probe_latency,
+                        }
+                    )
+                    break
+                continue
             print(
                 "OpenEvolve compile harness: sampled promotion "
                 f"candidate {len(seen)}/{len(codes)} materialized DP probe "
@@ -15495,10 +15537,19 @@ def _run_sampled_promotion_pass(
     if best is None:
         return None
     selected_hints = deepcopy(best[4])
+    selected_record = best[5]
+    selected_stage = str(selected_record.get("stage") or "sampled_qbp")
+    selected_reference = _finite_float(
+        selected_record.get("reference_latency_usec"),
+        full_reference_cost,
+    )
     selected_hints["openevolve_promotion_validated"] = True
-    selected_hints["openevolve_promotion_stage"] = "sampled_qbp"
+    selected_hints["openevolve_promotion_stage"] = selected_stage
     selected_hints["openevolve_promotion_latency_usec"] = float(best[0])
-    selected_hints["openevolve_promotion_reference_latency_usec"] = float(full_reference_cost)
+    selected_hints["openevolve_promotion_reference_latency_usec"] = float(selected_reference)
+    selected_hints["openevolve_promotion_requires_full_materialization"] = (
+        selected_stage == "dp_table_probe_sampled_only"
+    )
     selected_hints["openevolve_promotion_code_digest"] = hashlib.sha256(
         best[6].encode("utf-8")
     ).hexdigest()

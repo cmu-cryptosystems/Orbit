@@ -11652,7 +11652,16 @@ def _promotion_confirmation_probe_tasks(
         micro_tasks = _strategy_discovery_micro_probe_tasks(tasks)
         if micro_tasks:
             tasks = micro_tasks
-            reference_cost = float("inf")
+            cached_reference = sum(
+                _task_seed_metric_latency(task.get("seed_metrics", {}))
+                for task in tasks
+                if isinstance(task, dict)
+            )
+            reference_cost = (
+                float(cached_reference)
+                if math.isfinite(cached_reference) and cached_reference > 0
+                else float("inf")
+            )
     if not tasks:
         return None
     return tasks, reference_cost
@@ -15494,16 +15503,22 @@ def _run_sampled_promotion_pass(
                             len(confirmation_tasks),
                         )
                     )
-                    confirmation_tasks, confirmation_reference_cost, _confirmation_seed_probe = (
-                        _apply_dp_probe_seed_reference(
-                            context,
-                            initial_hints,
-                            params,
-                            confirmation_tasks,
-                            fallback_reference,
-                            timeout_sec=min(120, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
+                    if not (
+                        math.isfinite(confirmation_reference_cost)
+                        and confirmation_reference_cost > 0
+                    ):
+                        confirmation_tasks, confirmation_reference_cost, _confirmation_seed_probe = (
+                            _apply_dp_probe_seed_reference(
+                                context,
+                                initial_hints,
+                                params,
+                                confirmation_tasks,
+                                fallback_reference,
+                                timeout_sec=min(120, eval_timeout_sec)
+                                if eval_timeout_sec > 0
+                                else 0,
+                            )
                         )
-                    )
                     if not (
                         math.isfinite(confirmation_reference_cost)
                         and confirmation_reference_cost > 0

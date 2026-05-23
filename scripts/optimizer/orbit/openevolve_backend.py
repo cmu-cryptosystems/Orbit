@@ -11565,6 +11565,20 @@ def _promotion_probe_limit() -> int:
     return max(1, min(16, value))
 
 
+def _promotion_confirmation_task_count() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_CONFIRM_TASKS", "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 3
+    return max(1, min(16, value))
+
+
+def _promotion_confirmation_micro_enabled() -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_CONFIRM_MICRO", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _promotion_stop_after_selected() -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_STOP_AFTER_SELECTED", "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -11605,6 +11619,43 @@ def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]
     if selected and not math.isfinite(reference_cost):
         reference_cost = _promotion_fallback_probe_reference_cost(context, len(selected))
     return selected, reference_cost
+
+
+def _promotion_confirmation_probe_tasks(
+    context: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], float] | None:
+    """Build a broader but still cheap probe for sampled-only promotion.
+
+    The first promotion probe is intentionally narrow so OpenEvolve can iterate
+    quickly.  This confirmation probe prevents one local boundary improvement
+    from being treated as a global placement win by checking multiple
+    high-cost sampled tasks before selecting the candidate.
+    """
+
+    target_count = _promotion_confirmation_task_count()
+    if target_count <= 1:
+        return deepcopy(selected_probe_tasks), float("inf")
+    old_value = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS")
+    os.environ["ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS"] = str(target_count)
+    try:
+        expanded = _promotion_probe_tasks_from_seed_metrics(context)
+    finally:
+        if old_value is None:
+            os.environ.pop("ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS", None)
+        else:
+            os.environ["ORBIT_OPENEVOLVE_PROMOTION_PROBE_TASKS"] = old_value
+    if expanded is None:
+        expanded = (deepcopy(selected_probe_tasks), float("inf"))
+    tasks, reference_cost = expanded
+    if _promotion_confirmation_micro_enabled():
+        micro_tasks = _strategy_discovery_micro_probe_tasks(tasks)
+        if micro_tasks:
+            tasks = micro_tasks
+            reference_cost = float("inf")
+    if not tasks:
+        return None
+    return tasks, reference_cost
 
 
 def _micro_probe_budget_for_group(
@@ -11902,7 +11953,7 @@ def _strategy_tracking_report(
     )
     static_reference_latency = _reference_latency_from_json(reference)
     stage = str(selected_record.get("stage", ""))
-    sampled_only_selected = stage == "dp_table_probe_sampled_only"
+    sampled_only_selected = stage.startswith("dp_table_probe_sampled_only")
     distinct_policies = int(summary.get("distinct_probe_policy_count", 0) or 0)
     distinct_paths = int(summary.get("distinct_probe_effective_path_count", 0) or 0)
     record_reasons: Counter[str] = Counter()
@@ -15411,16 +15462,187 @@ def _run_sampled_promotion_pass(
                 bool(getattr(params, "openevolve_sampled_only", False))
                 and int(getattr(params, "openevolve_finalists", 0) or 0) <= 0
             ):
-                probe_record["stage"] = "dp_table_probe_sampled_only"
-                probe_record["reason"] = "dp_changed_faster_sampled_only_selected"
+                selected_record = probe_record
+                selected_latency = probe_latency
+                selected_bootstrap = _finite_float(probe_result.get("bootstrap_count"), 0.0)
+                selected_rescale = _finite_float(probe_result.get("rescale_count"), 0.0)
+                selected_stage = "dp_table_probe_sampled_only"
+                selected_reason = "dp_changed_faster_sampled_only_selected"
+                confirmation = _promotion_confirmation_probe_tasks(
+                    context,
+                    selected_probe_tasks,
+                )
+                if confirmation is not None:
+                    confirmation_tasks, confirmation_reference_cost = confirmation
+                    confirmation_digest = _sampled_tasks_digest(confirmation_tasks)
+                    selected_digest = _sampled_tasks_digest(selected_probe_tasks)
+                    confirmation_needed = (
+                        _promotion_confirmation_task_count() > 1
+                        and confirmation_digest
+                        and confirmation_digest != selected_digest
+                    )
+                else:
+                    confirmation_tasks = []
+                    confirmation_reference_cost = float("inf")
+                    confirmation_needed = False
+                if confirmation_needed:
+                    fallback_reference = (
+                        confirmation_reference_cost
+                        if math.isfinite(confirmation_reference_cost)
+                        else _promotion_fallback_probe_reference_cost(
+                            context,
+                            len(confirmation_tasks),
+                        )
+                    )
+                    confirmation_tasks, confirmation_reference_cost, _confirmation_seed_probe = (
+                        _apply_dp_probe_seed_reference(
+                            context,
+                            initial_hints,
+                            params,
+                            confirmation_tasks,
+                            fallback_reference,
+                            timeout_sec=min(120, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
+                        )
+                    )
+                    if not (
+                        math.isfinite(confirmation_reference_cost)
+                        and confirmation_reference_cost > 0
+                    ):
+                        confirmation_reference_cost = sum(
+                            _task_seed_metric_latency(task.get("seed_metrics", {}))
+                            for task in confirmation_tasks
+                            if isinstance(task, dict)
+                        )
+                    confirmation_seed_summary = _probe_seed_summary(
+                        confirmation_tasks,
+                        confirmation_reference_cost,
+                    )
+                    confirmation_context = deepcopy(context)
+                    confirmation_context["sampled_budget_tasks"] = deepcopy(
+                        confirmation_tasks
+                    )
+                    confirmation_context.setdefault("harness", {})[
+                        "experience_probe"
+                    ] = True
+                    confirmation_hints = _promotion_probe_hints(
+                        eval_hints,
+                        confirmation_tasks,
+                    )
+                    print(
+                        "OpenEvolve compile harness: sampled promotion "
+                        f"candidate {len(seen)}/{len(codes)} "
+                        "sampled_only_confirmation_dp "
+                        f"tasks={len(confirmation_tasks)} "
+                        f"timeout_limit={eval_timeout_sec}s.",
+                        flush=True,
+                    )
+                    _write_promotion_progress(
+                        promotion_dir,
+                        started_at=started_at,
+                        timeout_sec=timeout_sec,
+                        current_stage="sampled_only_confirmation_dp",
+                        current_index=index,
+                        total_candidates=min(limit, len(codes)),
+                        records=records,
+                        selected=best is not None,
+                    )
+                    confirmation_result = _evaluate_promotion_probe(
+                        confirmation_context,
+                        confirmation_hints,
+                        params,
+                        confirmation_tasks,
+                        timeout_sec=eval_timeout_sec,
+                    )
+                    confirmation_latency = _promotion_latency(confirmation_result)
+                    confirmation_diff = _path_differential_summary(
+                        confirmation_seed_summary,
+                        confirmation_result,
+                    )
+                    confirmation_record = _promotion_record_summary(
+                        index=index,
+                        stage="sampled_only_confirmation_dp",
+                        hints=confirmation_hints,
+                        result=confirmation_result,
+                        reason="",
+                        code_digest=code_digest,
+                    )
+                    confirmation_record["reference_latency_usec"] = (
+                        confirmation_reference_cost
+                    )
+                    confirmation_record["first_probe_latency_usec"] = probe_latency
+                    confirmation_record["first_probe_reference_latency_usec"] = (
+                        probe_reference_cost
+                    )
+                    confirmation_record["first_probe_selected_path_digest"] = (
+                        probe_record.get("selected_path_digest", "")
+                    )
+                    confirmation_record["path_differential"] = confirmation_diff
+                    confirmation_record["confirmation_task_count"] = len(
+                        confirmation_tasks
+                    )
+                    records.append(confirmation_record)
+                    _write_promotion_progress(
+                        promotion_dir,
+                        started_at=started_at,
+                        timeout_sec=timeout_sec,
+                        current_stage="sampled_only_confirmation_done",
+                        current_index=index,
+                        total_candidates=min(limit, len(codes)),
+                        records=records,
+                        selected=best is not None,
+                    )
+                    if not _promotion_result_direct_valid(confirmation_result):
+                        probe_record["reason"] = "sampled_only_confirmation_not_direct_valid"
+                        confirmation_record["reason"] = (
+                            "sampled_only_confirmation_not_direct_valid"
+                        )
+                        continue
+                    if not bool(confirmation_diff.get("selected_path_changed", False)):
+                        probe_record["reason"] = "sampled_only_confirmation_seed_equivalent"
+                        confirmation_record["reason"] = (
+                            "sampled_only_confirmation_seed_equivalent"
+                        )
+                        continue
+                    if not (
+                        math.isfinite(confirmation_latency)
+                        and math.isfinite(confirmation_reference_cost)
+                        and confirmation_latency < confirmation_reference_cost
+                    ):
+                        probe_record["reason"] = (
+                            "sampled_only_confirmation_not_latency_improved"
+                        )
+                        confirmation_record["reason"] = (
+                            "sampled_only_confirmation_not_latency_improved"
+                        )
+                        continue
+                    selected_record = confirmation_record
+                    selected_latency = confirmation_latency
+                    selected_bootstrap = _finite_float(
+                        confirmation_result.get("bootstrap_count"),
+                        0.0,
+                    )
+                    selected_rescale = _finite_float(
+                        confirmation_result.get("rescale_count"),
+                        0.0,
+                    )
+                    selected_stage = "dp_table_probe_sampled_only_confirmed"
+                    selected_reason = "dp_changed_faster_sampled_only_confirmed"
+                probe_record["stage"] = selected_stage
+                probe_record["reason"] = selected_reason
                 probe_record["sampled_only_probe_selected"] = True
+                selected_record["stage"] = selected_stage
+                selected_record["reason"] = selected_reason
+                selected_record["sampled_only_probe_selected"] = True
+                selected_record["sampled_only_confirmation_required"] = bool(
+                    confirmation_needed
+                )
                 item = (
-                    probe_latency,
-                    _finite_float(probe_result.get("bootstrap_count"), 0.0),
-                    _finite_float(probe_result.get("rescale_count"), 0.0),
+                    selected_latency,
+                    selected_bootstrap,
+                    selected_rescale,
                     index,
                     active_probe_hints,
-                    probe_record,
+                    selected_record,
                     code,
                 )
                 if best is None or item[:4] < best[:4]:
@@ -15429,7 +15651,7 @@ def _run_sampled_promotion_pass(
                     promotion_dir,
                     started_at=started_at,
                     timeout_sec=timeout_sec,
-                    current_stage="dp_table_probe_sampled_only_selected",
+                    current_stage=selected_stage,
                     current_index=index,
                     total_candidates=min(limit, len(codes)),
                     records=records,
@@ -15444,7 +15666,7 @@ def _run_sampled_promotion_pass(
                                 "stopping promotion after first latency-improving "
                                 "sampled-only DP table probe"
                             ),
-                            "selected_latency_usec": probe_latency,
+                            "selected_latency_usec": selected_latency,
                         }
                     )
                     break

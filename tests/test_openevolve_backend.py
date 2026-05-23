@@ -9121,6 +9121,38 @@ def test_qbp_dp_seed_guided_replay_matches_valid_seed(toy_cost_json: str):
     assert replay["checked_node_count"] == len(graph.nodes)
 
 
+def test_qbp_dp_seed_guided_replay_handles_constant_predecessor(toy_cost_json: str):
+    params = _params(
+        toy_cost_json,
+        openevolve_iterations=1,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    graph = _constant_bias_pdag(params)
+    le = LatencyEstimator(params)
+    budget = {"in_lvl": 16, "in_scl": 40, "out_lvl": 16}
+    attempt = oe_backend._solve_one_budget_attempt(
+        graph,
+        params,
+        budget,
+        le,
+        "reference_seed_bridge_latency_beam",
+        oe_backend._budget_fulfillment_beam_policy(),
+    )
+
+    replay = oe_backend._qbp_dp_seed_guided_replay(
+        graph,
+        params,
+        budget,
+        le,
+        {"strategy": "bootstrap_mcts", "qbp_engine": "dp"},
+        attempt,
+    )
+
+    assert replay["valid"] is True
+    assert replay["checked_node_count"] == len(graph.nodes)
+
+
 def test_qbp_dp_seed_guided_replay_reports_missing_scale_candidate(
     toy_cost_json: str, monkeypatch
 ):

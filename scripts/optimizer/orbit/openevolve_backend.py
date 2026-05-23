@@ -19841,7 +19841,7 @@ def _qbp_dp_seed_guided_replay(
                 target_edge_scales[pred] = (
                     int(params.Csw)
                     if pdag.nodes[node].get("op") == "mul"
-                    else int(v_is)
+                    else int(v_in_scale)
                 )
                 continue
             edge = (pred, node)

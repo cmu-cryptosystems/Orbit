@@ -4172,6 +4172,65 @@ def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: st
     assert broad_summary["promote_to_probe"] is False
 
 
+def test_experience_surrogate_complexity_penalty_preserves_differences(
+    toy_cost_json: str,
+):
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    base_policy = {
+        "strategy": "bootstrap_mcts",
+        "selection_objective": "cost",
+        "boundary_state_cap": 20,
+        "max_scale_candidates": 96,
+        "beam_width": 12,
+        "state_cap_per_node": 64,
+    }
+    focused = {
+        **base_policy,
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "policy": {
+                    **base_policy,
+                    "strategy": "latency_beam",
+                    "boundary_scale_policy": "frontier",
+                },
+            }
+        ],
+    }
+    unfocused = {
+        **base_policy,
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": 7, "in_scl": 99, "maino_v": "", "main_dag_size": 0},
+                "policy": {**base_policy, "strategy": "latency_beam"},
+            }
+        ],
+    }
+
+    focused_summary = oe_backend._experience_surrogate_summary(
+        context,
+        focused,
+        {"effect_score": 1.0, "seed_equivalent": False},
+    )
+    unfocused_summary = oe_backend._experience_surrogate_summary(
+        context,
+        unfocused,
+        {"effect_score": 1.0, "seed_equivalent": False},
+    )
+
+    assert focused_summary["promotion_complexity_reasons"]
+    assert unfocused_summary["promotion_complexity_reasons"]
+    assert focused_summary["score"] > unfocused_summary["score"]
+    assert focused_summary["score"] > 0.18
+
+
 def test_discover_finalists_uses_best_and_checkpoint_scores(tmp_path: Path):
     output_dir = tmp_path / "openevolve_output"
     best_code = "def place(context):\n    return {'tag': 'result_best'}\n"

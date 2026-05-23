@@ -6334,6 +6334,7 @@ def _experience_surrogate_summary(
     complexity_reasons = _promotion_complexity_reasons(eval_hints)
     focus_score = _boundary_group_policy_focus_score(context, eval_hints)
     target_focus = 1.0 if targeted_count <= 2 else max(0.0, 1.0 - 0.15 * (targeted_count - 2))
+    complexity_penalty = min(0.36, 0.06 * len(complexity_reasons))
     raw_score = (
         0.16 * effect_score
         + 0.14 * min(1.0, action_overlap)
@@ -6346,10 +6347,10 @@ def _experience_surrogate_summary(
     )
     score = min(
         1.0,
-        raw_score,
+        max(0.0, raw_score - complexity_penalty),
     )
     if complexity_reasons:
-        score = min(score, 0.18)
+        score = min(score, 0.62)
     digest = _hint_digest(payload)
     seed_equivalent = bool(policy_effect.get("seed_equivalent", False))
     every = _experience_probe_every()

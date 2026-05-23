@@ -11569,6 +11569,16 @@ def _promotion_stop_after_selected() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _single_boundary_debug_enabled(params: Params) -> bool:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG", "").strip().lower()
+    if raw:
+        return raw not in {"0", "false", "no", "off"}
+    return not (
+        bool(getattr(params, "openevolve_sampled_only", False))
+        and int(getattr(params, "openevolve_finalists", 0) or 0) <= 0
+    )
+
+
 def _promotion_probe_tasks(context: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
     from_metrics = _promotion_probe_tasks_from_seed_metrics(context)
     if from_metrics is not None:
@@ -14736,14 +14746,18 @@ def _run_sampled_promotion_pass(
         probe_reference_cost,
         timeout_sec=min(15, eval_timeout_sec) if eval_timeout_sec > 0 else 0,
     )
-    single_boundary_debug = _run_single_boundary_dp_debug(
-        promotion_dir,
-        context,
-        initial_hints,
-        params,
-        selected_probe_tasks,
-        probe_reference_cost,
-        eval_timeout_sec=eval_timeout_sec,
+    single_boundary_debug = (
+        _run_single_boundary_dp_debug(
+            promotion_dir,
+            context,
+            initial_hints,
+            params,
+            selected_probe_tasks,
+            probe_reference_cost,
+            eval_timeout_sec=eval_timeout_sec,
+        )
+        if _single_boundary_debug_enabled(params)
+        else None
     )
 
     full_reference_cost = _promotion_reference_latency(context)

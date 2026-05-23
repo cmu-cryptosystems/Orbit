@@ -6653,6 +6653,22 @@ def test_sampled_only_dp_probe_selects_without_materialization(
     assert summary["selected_record"]["sampled_only_probe_selected"] is True
 
 
+def test_single_boundary_debug_skips_sampled_only_by_default(
+    toy_cost_json: str, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_sampled_only=True,
+        openevolve_finalists=0,
+    )
+
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG", raising=False)
+    assert oe_backend._single_boundary_debug_enabled(params) is False
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG", "1")
+    assert oe_backend._single_boundary_debug_enabled(params) is True
+
+
 def test_sampled_promotion_fails_open_when_no_candidate_improves(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):

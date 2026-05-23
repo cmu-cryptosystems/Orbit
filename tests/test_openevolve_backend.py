@@ -4234,6 +4234,44 @@ def test_promotion_probe_hints_boundary_policy_limit_env(monkeypatch):
     assert [item["selector"]["task_index"] for item in probe["boundary_group_policies"]] == [0, 1, 2]
 
 
+def test_promotion_probe_hints_concretizes_broad_boundary_selectors():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "boundary_group_policies": [
+            {
+                "selector": {"in_lvl": 16, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "policy": {"dp_probe_mode": "seed_bridge_candidate"},
+            },
+            {
+                "selector": {"in_lvl": 8, "in_scl": 40, "maino_v": "", "main_dag_size": 0},
+                "policy": {"dp_probe_mode": "seed_bridge_candidate"},
+            },
+        ],
+    }
+    tasks = [
+        {
+            "index": idx,
+            "group_keys": [
+                {
+                    "in_lvl": 16 if idx != 4 else 8,
+                    "in_scl": 40,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": 16 if idx != 4 else 8, "in_scl": 40}]},
+        }
+        for idx in range(6)
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    policies = probe["boundary_group_policies"]
+    assert len(policies) == 6
+    assert all(item["selector"].get("task_index") is not None for item in policies)
+    assert sorted(item["selector"]["task_index"] for item in policies) == list(range(6))
+
+
 def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)

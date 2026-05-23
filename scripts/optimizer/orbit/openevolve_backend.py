@@ -12896,6 +12896,46 @@ def _boundary_group_selector_matches_task(selector: Any, task: dict[str, Any] | 
     return str(task.get("index")) == str(task_key)
 
 
+def _selector_has_task_index(selector: Any) -> bool:
+    return isinstance(selector, dict) and any(
+        key in selector and selector.get(key) is not None
+        for key in ("task_index", "sampled_task_index", "sample_index")
+    )
+
+
+def _task_scoped_selector_for_probe(
+    selector: dict[str, Any],
+    selected_probe_tasks: list[dict[str, Any]],
+    seen_selector_digests: set[str],
+) -> dict[str, Any] | None:
+    for task in selected_probe_tasks or []:
+        if not isinstance(task, dict) or task.get("index") is None:
+            continue
+        if not _boundary_group_selector_matches_sampled_tasks(selector, [task]):
+            continue
+        for group in _sampled_task_group_key_dicts(task):
+            key = (
+                _safe_int(group.get("in_lvl"), -1),
+                _safe_int(group.get("in_scl"), -1),
+                str(group.get("maino_v", "")),
+                _safe_int(group.get("main_dag_size"), 0),
+            )
+            if not _boundary_group_selector_matches_key(selector, key):
+                continue
+            scoped = {
+                "task_index": task.get("index"),
+                "in_lvl": key[0],
+                "in_scl": key[1],
+                "maino_v": key[2],
+                "main_dag_size": key[3],
+            }
+            digest = _hint_digest(scoped)
+            if digest in seen_selector_digests:
+                continue
+            return scoped
+    return None
+
+
 def _promotion_probe_hints(
     eval_hints: dict[str, Any],
     selected_probe_tasks: list[dict[str, Any]],
@@ -12940,24 +12980,32 @@ def _promotion_probe_hints(
         policies.append(updated)
         if len(policies) >= max_boundary_policies:
             break
-    if not _scoped_boundary_policy_selectors({"boundary_group_policies": policies}):
-        for policy_index, item in enumerate(list(policies)):
-            selector = item.get("selector", {}) if isinstance(item, dict) else {}
-            if not isinstance(selector, dict):
-                continue
-            for task in selected_probe_tasks:
-                if not isinstance(task, dict) or task.get("index") is None:
-                    continue
-                if not _boundary_group_selector_matches_sampled_tasks(selector, [task]):
-                    continue
-                updated = dict(item)
-                updated_selector = dict(selector)
-                updated_selector["task_index"] = task.get("index")
-                updated["selector"] = updated_selector
-                policies[policy_index] = updated
-                break
-            if _scoped_boundary_policy_selectors({"boundary_group_policies": policies}):
-                break
+    scoped_policies: list[dict[str, Any]] = []
+    seen_selectors: set[str] = set()
+    for item in policies:
+        selector = item.get("selector", {}) if isinstance(item, dict) else {}
+        if not isinstance(selector, dict):
+            continue
+        updated = dict(item)
+        if _selector_has_task_index(selector):
+            scoped_selector = dict(selector)
+        else:
+            scoped_selector = _task_scoped_selector_for_probe(
+                selector,
+                selected_probe_tasks,
+                seen_selectors,
+            )
+            if scoped_selector is None:
+                scoped_selector = dict(selector)
+        selector_digest = _hint_digest(scoped_selector)
+        if selector_digest in seen_selectors:
+            continue
+        seen_selectors.add(selector_digest)
+        updated["selector"] = scoped_selector
+        scoped_policies.append(updated)
+        if len(scoped_policies) >= max_boundary_policies:
+            break
+    policies = scoped_policies
     seen_selectors = {
         _hint_digest(item.get("selector", {}))
         for item in policies

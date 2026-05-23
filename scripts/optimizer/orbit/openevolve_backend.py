@@ -11608,6 +11608,15 @@ def _promotion_max_evals_after_selected() -> int:
     return max(0, min(128, value))
 
 
+def _promotion_duplicate_effective_stop() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_DUPLICATE_EFFECTIVE_STOP", "").strip()
+    try:
+        value = int(raw) if raw else 0
+    except ValueError:
+        value = 0
+    return max(0, min(128, value))
+
+
 def _single_boundary_debug_enabled(params: Params) -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG", "").strip().lower()
     if raw:
@@ -15448,10 +15457,7 @@ def _run_sampled_promotion_pass(
         if effective_digest in seen_effective_digests:
             duplicate_effective_count += 1
             probe_record["reason"] = "duplicate_probe_effective_path"
-            duplicate_stop = _int_hint(
-                os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_DUPLICATE_EFFECTIVE_STOP"),
-                3,
-            )
+            duplicate_stop = _promotion_duplicate_effective_stop()
             if duplicate_stop > 0 and duplicate_effective_count >= duplicate_stop:
                 records.append(
                     {

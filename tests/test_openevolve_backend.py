@@ -6996,6 +6996,14 @@ def test_promotion_timeout_defaults_allow_long_dp_probes(
     assert oe_backend._promotion_timeout_sec(params) == 123
 
 
+def test_promotion_duplicate_effective_stop_defaults_to_exhaustive(monkeypatch):
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_DUPLICATE_EFFECTIVE_STOP", raising=False)
+    assert oe_backend._promotion_duplicate_effective_stop() == 0
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_DUPLICATE_EFFECTIVE_STOP", "9")
+    assert oe_backend._promotion_duplicate_effective_stop() == 9
+
+
 def test_sampled_promotion_fails_open_when_no_candidate_improves(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):

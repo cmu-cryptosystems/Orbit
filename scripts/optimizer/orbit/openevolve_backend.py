@@ -543,8 +543,10 @@ def place(context):
     traces: compare orbit.trace.bootstrap, orbit.trace.rescale,
     orbit.trace.boundary_group, and selected-source operations against
     objective_cost_usec, then mutate the active policy below. Good mutations
-    change the selected path digest and lower latency; trace-only or
-    seed-equivalent changes are exploration examples, not winners.
+    change the selected path digest and lower latency across multiple top-cost
+    sampled boundary groups; a one-boundary win is only a first-stage probe and
+    cannot be selected unless a broader confirmation probe also improves.
+    Trace-only or seed-equivalent changes are exploration examples, not winners.
     """
     mcts = PlacementMCTS(context)
     actions = mcts.candidate_actions(action_cap=16)
@@ -586,7 +588,9 @@ def place(context):
         # Keep trace-group switches explicit but disabled in the seed. This
         # gives OpenEvolve a small, concrete boolean surface to mutate from
         # prior MLIR/path traces without making the initial program broad or
-        # slow.
+        # slow. Promotion confirms sampled-only candidates on several top
+        # groups, so useful mutations should enable a coherent set of
+        # group_index 0/1/2 overrides rather than overfitting one boundary.
         trace_group_overrides = [
             {
                 "enabled": False,
@@ -619,6 +623,17 @@ def place(context):
                 "max_scale_candidates": 96,
                 "bootstrap_penalty": 25_000_000.0,
                 "beam_width": 12,
+                "state_cap_per_node": 48,
+            },
+            {
+                "enabled": False,
+                "group_index": 2,
+                "boundary_scale_policy": "frontier",
+                "scale_lattice": "waterline_sf",
+                "boundary_state_cap": 12,
+                "max_scale_candidates": 80,
+                "bootstrap_penalty": 35_000_000.0,
+                "beam_width": 10,
                 "state_cap_per_node": 48,
             },
         ]

@@ -12799,6 +12799,7 @@ def _promotion_probe_hints(
     probe = deepcopy(eval_hints)
     probe.pop("portfolio", None)
     probe["allow_seed_fallback"] = True
+    probe.setdefault("dp_allow_seed_bridge_candidate", True)
     probe["budget_aggressive"] = False
     probe["mcts_action_presets"] = _clamp_promotion_probe_presets(
         probe.get("mcts_action_presets")
@@ -20999,6 +21000,7 @@ def _apply_boundary_group_policy_overlays(
                 "dp_seed_maintenance_count",
                 "dp_seed_maintenance_radius",
                 "dp_seed_maintenance_direction",
+                "dp_allow_seed_bridge_candidate",
                 "frontier_cap",
             }:
                 merged[key] = value
@@ -27010,6 +27012,7 @@ _PATCHABLE_POLICY_KEYS = {
             "dp_seed_maintenance_count",
             "dp_seed_maintenance_radius",
             "dp_seed_maintenance_direction",
+            "dp_allow_seed_bridge_candidate",
             "noise_slack_model",
             "boundary_scale_policy",
     "boundary_state_cap",

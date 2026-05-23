@@ -11495,9 +11495,9 @@ def _promotion_candidate_limit(params: Params) -> int:
 def _promotion_timeout_sec(params: Params) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else max(2_400, 4 * _promotion_eval_timeout_sec(params))
+        value = int(raw) if raw else max(7_200, 4 * _promotion_eval_timeout_sec(params))
     except ValueError:
-        value = max(2_400, 4 * _promotion_eval_timeout_sec(params))
+        value = max(7_200, 4 * _promotion_eval_timeout_sec(params))
     return max(0, min(86_400, value))
 
 
@@ -11507,10 +11507,10 @@ def _promotion_eval_timeout_sec(params: Params) -> int:
         value = (
             int(raw)
             if raw
-            else max(900, int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180))
+            else max(1_800, int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180))
         )
     except (TypeError, ValueError):
-        value = 900
+        value = 1_800
     return max(0, min(7_200, value))
 
 
@@ -11901,6 +11901,23 @@ def _promotion_record_summary(
         "dp_progress_trace_path": result.get("dp_progress_trace_path") if result else None,
         "dp_progress_trace": result.get("dp_progress_trace") if result else None,
         "selected_source_counts": dict(diagnostics.get("selected_source_counts", {}) or {}),
+        "requested_boundary_groups": int(
+            diagnostics.get("requested_boundary_groups", 0) or 0
+        ),
+        "solved_boundary_groups": int(diagnostics.get("solved_boundary_groups", 0) or 0),
+        "candidate_solved_boundary_groups": int(
+            diagnostics.get("candidate_solved_boundary_groups", 0) or 0
+        ),
+        "partial_boundary_groups": int(diagnostics.get("partial_boundary_groups", 0) or 0),
+        "invalid_boundary_groups_detail": int(
+            diagnostics.get("invalid_boundary_groups", 0) or 0
+        ),
+        "unreachable_boundary_groups": int(
+            diagnostics.get("unreachable_boundary_groups", 0) or 0
+        ),
+        "candidate_invalid_reasons": dict(
+            diagnostics.get("candidate_invalid_reasons", {}) or {}
+        ),
         "policy_summary": _compact_policy_summary(hints or {}),
     }
 
@@ -12777,6 +12794,59 @@ def _boundary_group_selector_matches_sampled_tasks(
     return False
 
 
+def _promotion_probe_default_boundary_policies(
+    selected_probe_tasks: list[dict[str, Any]],
+    *,
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    """Create scoped probe policies so one-boundary wins can be replayed as deltas.
+
+    OpenEvolve often proposes only global DP knobs.  Promotion probes intentionally
+    evaluate a small set of top-cost boundary groups, so we attach explicit
+    task/group selectors to the probe hints.  That lets sampled promotion compose
+    a validated top-boundary improvement with cached seed metrics for unchanged
+    sampled boundaries instead of immediately forcing a full strict replay.
+    """
+
+    policies: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for task in selected_probe_tasks or []:
+        if not isinstance(task, dict):
+            continue
+        task_index = task.get("index")
+        if task_index is None:
+            continue
+        for group in _sampled_task_group_key_dicts(task):
+            selector = {
+                "task_index": task_index,
+                "in_lvl": _safe_int(group.get("in_lvl"), -1),
+                "in_scl": _safe_int(group.get("in_scl"), -1),
+                "maino_v": str(group.get("maino_v", "")),
+                "main_dag_size": _safe_int(group.get("main_dag_size"), 0),
+            }
+            digest = _hint_digest(selector)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            policies.append(
+                {
+                    "selector": selector,
+                    "policy": {
+                        "dp_allow_seed_bridge_candidate": True,
+                        "dp_probe_mode": "seed_bridge_candidate",
+                        "dp_seed_exact_only": True,
+                        "dp_max_combos_per_node": 1,
+                        "dp_max_incoming_options_per_combo": 1,
+                        "dp_max_level_candidates": 1,
+                        "dp_max_output_states_per_input": 1,
+                    },
+                }
+            )
+            if len(policies) >= max(1, int(limit)):
+                return policies
+    return policies
+
+
 def _boundary_group_selector_matches_task(selector: Any, task: dict[str, Any] | None) -> bool:
     if not isinstance(selector, dict):
         return False
@@ -12834,6 +12904,35 @@ def _promotion_probe_hints(
         policies.append(updated)
         if len(policies) >= max_boundary_policies:
             break
+    if not _scoped_boundary_policy_selectors({"boundary_group_policies": policies}):
+        for policy_index, item in enumerate(list(policies)):
+            selector = item.get("selector", {}) if isinstance(item, dict) else {}
+            if not isinstance(selector, dict):
+                continue
+            for task in selected_probe_tasks:
+                if not isinstance(task, dict) or task.get("index") is None:
+                    continue
+                if not _boundary_group_selector_matches_sampled_tasks(selector, [task]):
+                    continue
+                updated = dict(item)
+                updated_selector = dict(selector)
+                updated_selector["task_index"] = task.get("index")
+                updated["selector"] = updated_selector
+                policies[policy_index] = updated
+                break
+            if _scoped_boundary_policy_selectors({"boundary_group_policies": policies}):
+                break
+    remaining_boundary_policies = max_boundary_policies - len(policies)
+    if (
+        remaining_boundary_policies > 0
+        and not _scoped_boundary_policy_selectors({"boundary_group_policies": policies})
+    ):
+        policies.extend(
+            _promotion_probe_default_boundary_policies(
+                selected_probe_tasks,
+                limit=remaining_boundary_policies,
+            )
+        )
     probe["boundary_group_policies"] = policies
     probe["unit_policies"] = []
     return probe
@@ -13552,6 +13651,49 @@ def _dp_probe_lightweight_hints(hints: dict[str, Any]) -> dict[str, Any]:
         result["dp_max_incoming_options_per_combo"] = 1
         result["dp_max_level_candidates"] = 1
         result["dp_max_output_states_per_input"] = 1
+    return result
+
+
+def _dp_probe_sampled_replay_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    """Use a less aggressive clamp for sampled confirmation than table probes.
+
+    Table probes should be cheap enough to run many times.  Once a candidate has
+    produced a lower-latency materialized top-boundary result, sampled replay is
+    allowed to spend more time preserving enough frontier diversity to cover all
+    reachable sampled boundary groups.
+    """
+
+    result = _dp_probe_lightweight_hints(hints)
+    result["enable_seed_frontier_anchor"] = True
+    result["dp_seed_exact_only"] = False
+    result["dp_seed_neighborhood_radius"] = max(
+        1,
+        _int_hint(result.get("dp_seed_neighborhood_radius"), 1),
+    )
+    result["dp_max_combos_per_node"] = max(
+        2,
+        min(4, _int_hint(result.get("dp_max_combos_per_node"), 2)),
+    )
+    result["dp_max_incoming_options_per_combo"] = max(
+        3,
+        min(8, _int_hint(result.get("dp_max_incoming_options_per_combo"), 3)),
+    )
+    result["dp_max_output_states_per_input"] = max(
+        4,
+        min(8, _int_hint(result.get("dp_max_output_states_per_input"), 4)),
+    )
+    result["dp_max_level_candidates"] = max(
+        2,
+        min(3, _int_hint(result.get("dp_max_level_candidates"), 2)),
+    )
+    for key, lower, upper in (
+        ("frontier_cap", 4, 8),
+        ("state_cap_per_node", 4, 8),
+        ("beam_width", 4, 8),
+        ("boundary_state_cap", 3, 6),
+    ):
+        if key in result:
+            result[key] = max(lower, min(upper, _int_hint(result.get(key), lower)))
     return result
 
 
@@ -15841,7 +15983,7 @@ def _run_sampled_promotion_pass(
                 ]
                 full_result = _evaluate_dp_probe_for_promotion(
                     context,
-                    _dp_probe_lightweight_hints(active_probe_hints),
+                    _dp_probe_sampled_replay_hints(active_probe_hints),
                     sampled_tasks,
                     timeout_sec=eval_timeout_sec,
                     materialize=True,

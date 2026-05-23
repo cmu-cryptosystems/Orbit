@@ -4121,6 +4121,36 @@ def test_promotion_probe_hints_preserve_multiple_sampled_boundary_policies():
     )
 
 
+def test_promotion_probe_hints_add_scoped_seed_bridge_policy_when_global_only():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "dp_allow_seed_bridge_candidate": True,
+    }
+    tasks = [
+        {
+            "index": 7,
+            "group_keys": [
+                {
+                    "in_lvl": 4,
+                    "in_scl": 40,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": 4, "in_scl": 40, "out_lvl": 1}]},
+        }
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    assert len(probe["boundary_group_policies"]) == 1
+    policy = probe["boundary_group_policies"][0]
+    assert policy["selector"]["task_index"] == 7
+    assert policy["selector"]["in_lvl"] == 4
+    assert policy["policy"]["dp_allow_seed_bridge_candidate"] is True
+    assert policy["policy"]["dp_probe_mode"] == "seed_bridge_candidate"
+
+
 def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)
@@ -7004,12 +7034,12 @@ def test_promotion_timeout_defaults_allow_long_dp_probes(
     monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", raising=False)
     monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", raising=False)
     params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=180)
-    assert oe_backend._promotion_eval_timeout_sec(params) == 900
-    assert oe_backend._promotion_timeout_sec(params) == 3600
+    assert oe_backend._promotion_eval_timeout_sec(params) == 1800
+    assert oe_backend._promotion_timeout_sec(params) == 7200
 
     params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=1200)
-    assert oe_backend._promotion_eval_timeout_sec(params) == 1200
-    assert oe_backend._promotion_timeout_sec(params) == 4800
+    assert oe_backend._promotion_eval_timeout_sec(params) == 1800
+    assert oe_backend._promotion_timeout_sec(params) == 7200
 
     monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", "42")
     monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "123")
@@ -9721,7 +9751,7 @@ def test_dp_promotion_selects_materialized_latency_improvement(
 
     assert selected is not None
     assert selected["openevolve_promotion_stage"] == "sampled_qbp"
-    assert selected["openevolve_promotion_latency_usec"] == 80.0
+    assert selected["openevolve_promotion_latency_usec"] == 999980.0
     summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
     assert summary["selected"] is True
 
@@ -9989,7 +10019,7 @@ def test_dp_promotion_reuses_latency_improved_discovery_probe(
     )
 
     assert selected is not None
-    assert dp_calls == ["sampled", "sampled"]
+    assert dp_calls == ["sampled"]
     summary = json.loads((tmp_path / "sampled_promotion" / "dp_probe_summary.json").read_text())
     assert summary["records"][0]["stage"] == "dp_table_probe"
     assert summary["records"][0]["reason"] == "dp_changed_faster"
@@ -9997,8 +10027,8 @@ def test_dp_promotion_reuses_latency_improved_discovery_probe(
     assert summary["records"][1]["stage"] == "sampled_dp_materialize_probe"
     assert summary["records"][1]["dp_materialized_probe"] is True
     assert summary["records"][2]["stage"] == "sampled_qbp"
-    assert summary["records"][2]["dp_materialized_probe"] is True
-    assert summary["records"][2]["sampled_delta_replay"] is False
+    assert summary["records"][2]["sampled_delta_materialized_probe"] is True
+    assert summary["records"][2]["sampled_delta_replay"] is True
     assert summary["selected"] is True
 
 

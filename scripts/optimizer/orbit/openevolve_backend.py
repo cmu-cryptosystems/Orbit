@@ -2638,6 +2638,320 @@ def _ensure_sampled_seed_metadata(
     return True
 
 
+def _metadata_context_enabled(params: Params) -> bool:
+    if getattr(params, "openevolve_eval_suite", "polybert-sampled") == "polybert-full":
+        return False
+    raw = os.environ.get("ORBIT_OPENEVOLVE_METADATA_CONTEXT", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return (
+        bool(getattr(params, "openevolve_sampled_only", False))
+        and int(getattr(params, "openevolve_iterations", 0) or 0) > 0
+        and getattr(params, "openevolve_eval_suite", "polybert-sampled") != "polybert-full"
+    )
+
+
+def _metadata_partition_delta(params: Params) -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_METADATA_PARTITION_DELTA", "").strip()
+    try:
+        return max(8, min(200, int(raw))) if raw else 80
+    except ValueError:
+        return 80
+
+
+def _metadata_input_boundary_levels(params: Params, *, first_partition: bool) -> list[int]:
+    if first_partition:
+        return [-1]
+    candidates = [
+        int(params.lvl_ub),
+        max(int(params.bts_lb) + 1, int(params.lvl_ub) // 2),
+        max(int(params.bts_lb) + 1, int(params.lvl_lb) + 1),
+    ]
+    result: list[int] = []
+    for level in candidates:
+        level = max(1, min(int(params.lvl_ub), int(level)))
+        if level not in result:
+            result.append(level)
+    return result or [int(params.lvl_ub)]
+
+
+def _metadata_output_levels(params: Params) -> list[int]:
+    candidates = [
+        int(params.lvl_ub),
+        max(int(params.bts_lb) + 1, int(params.lvl_ub) * 3 // 4),
+        max(int(params.bts_lb) + 1, int(params.lvl_ub) // 2),
+        max(int(params.bts_lb) + 1, int(params.lvl_ub) // 4),
+        1,
+    ]
+    result: list[int] = []
+    for level in candidates:
+        level = max(1, min(int(params.lvl_ub), int(level)))
+        if level not in result:
+            result.append(level)
+    return result
+
+
+def _metadata_partition_records(dag: Tdag, params: Params) -> list[Tdag]:
+    try:
+        from .siso_partition import rdag_siso_partition
+
+        pdags = rdag_siso_partition(dag, _metadata_partition_delta(params))
+    except Exception:
+        pdags = []
+    if not pdags:
+        pdags = [dag]
+    return [pdag for pdag in pdags if len(pdag.nodes) > 1]
+
+
+def _metadata_partition_complexity(pdag: Tdag, params: Params) -> float:
+    op_weights = {
+        "mul": 7.0,
+        "rotate": 4.0,
+        "rot": 4.0,
+        "add": 1.0,
+        "sub": 1.0,
+        "constant": 0.25,
+        "input": 0.0,
+    }
+    score = 0.0
+    for _node, attrs in pdag.nodes(data=True):
+        op = str(attrs.get("op", ""))
+        score += op_weights.get(op, 2.0) * max(1.0, _finite_float(attrs.get("weight"), 1.0))
+    # A small edge term keeps high-fanout regions near the front even when
+    # their op labels are generic after Rotom lowering.
+    score += 0.35 * float(len(pdag.edges))
+    return max(1.0, score)
+
+
+def _metadata_budget_group_for_partition(
+    pdag: Tdag,
+    params: Params,
+    *,
+    first_partition: bool,
+    input_level: int,
+) -> tuple[tuple[int, int, str, int], list[dict[str, Any]]]:
+    in_scl = int(params.Sw)
+    group_key = (int(input_level), in_scl, "", 0)
+    budgets = [
+        {
+            "in_lvl": int(input_level),
+            "in_scl": in_scl,
+            "out_lvl": int(out_level),
+        }
+        for out_level in _metadata_output_levels(params)
+    ]
+    return group_key, budgets
+
+
+def _metadata_selected_partitions(dag: Tdag, params: Params) -> list[tuple[int, Tdag]]:
+    pdags = _metadata_partition_records(dag, params)
+    if not pdags:
+        return []
+    limit = max(1, min(len(pdags), _sampled_compile_boundary_group_limit(params)))
+    ranked = sorted(
+        enumerate(pdags),
+        key=lambda item: (
+            _metadata_partition_complexity(item[1], params),
+            len(item[1].nodes),
+            len(item[1].edges),
+        ),
+        reverse=True,
+    )
+    selected_indexes = {idx for idx, _pdag in ranked[:limit]}
+    # Include the first and last partitions so sampled promotion sees boundary
+    # behavior, not only high-cost middle nonlinear regions.
+    selected_indexes.add(0)
+    selected_indexes.add(len(pdags) - 1)
+    selected = [(idx, pdags[idx]) for idx in sorted(selected_indexes)]
+    return selected[:limit]
+
+
+def _metadata_seed_metric_for_task(
+    *,
+    task_position: int,
+    task: dict[str, Any],
+    pdag: Tdag,
+    params: Params,
+    complexity: float,
+) -> dict[str, Any]:
+    group_keys = [
+        item
+        for item in task.get("group_keys", []) or []
+        if isinstance(item, dict)
+    ]
+    output_levels = _metadata_output_levels(params)
+    # This is only a ranking proxy for choosing real QBP probes. It must be
+    # deterministic and monotonic with graph cost, but it is not allowed to win
+    # final selection without real QBP promotion.
+    level_span = max(1, int(params.lvl_ub) - min(output_levels))
+    group_cost = float(complexity * max(1, len(output_levels)) * (1.0 + level_span / 16.0) * 1_000_000.0)
+    digest_payload = {
+        "task": task.get("index"),
+        "pdag": pdag.name,
+        "groups": group_keys,
+        "output_levels": output_levels,
+        "complexity": round(float(complexity), 3),
+    }
+    top_groups = []
+    for item in group_keys:
+        top_groups.append(
+            {
+                "group_key": dict(item),
+                "key": _boundary_group_key_from_dict(item),
+                "requested_output_levels": output_levels,
+                "min_cost_usec": group_cost,
+                "max_cost_usec": group_cost * 1.25,
+                "min_bootstrap": 0.0,
+                "max_bootstrap": 0.0,
+                "min_rescale": 0.0,
+                "max_rescale": 0.0,
+                "selected_source_counts": {"metadata_seed": len(output_levels)},
+            }
+        )
+    return {
+        "task_position": int(task_position),
+        "task_index": _safe_int(task.get("index"), task_position),
+        "kind": str(task.get("kind", "metadata")),
+        "metadata_only": True,
+        "pdag_name": pdag.name,
+        "pdag_nodes": int(len(pdag.nodes)),
+        "pdag_edges": int(len(pdag.edges)),
+        "group_keys": group_keys,
+        "requested_budgets": int(len(output_levels) * max(1, len(group_keys))),
+        "solved_budgets": int(len(output_levels) * max(1, len(group_keys))),
+        "requested_boundary_groups": int(max(1, len(group_keys))),
+        "reachable_boundary_groups": int(max(1, len(group_keys))),
+        "solved_boundary_groups": int(max(1, len(group_keys))),
+        "candidate_solved_boundary_groups": int(max(1, len(group_keys))),
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+        "sampled_dp_latency_usec": float(group_cost),
+        "objective_cost_usec": float(group_cost),
+        "total_frontier_cost_usec": float(group_cost),
+        "bootstrap_count": 0.0,
+        "rescale_count": 0.0,
+        "avg_bootstrap": 0.0,
+        "avg_rescale": 0.0,
+        "selected_path_digest": _hint_digest(digest_payload),
+        "selected_source_counts": {"metadata_seed": len(output_levels)},
+        "top_costly_boundary_groups": top_groups,
+        "unsolved_boundary_groups": {"reasons": {}, "examples": []},
+    }
+
+
+def _metadata_sampled_seed_context(
+    context: dict[str, Any],
+    dag: Tdag,
+    params: Params,
+    initial_hints: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _metadata_context_enabled(params):
+        return None
+    selected = _metadata_selected_partitions(dag, params)
+    if not selected:
+        return None
+    tasks: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []
+    remaining = _sampled_compile_boundary_group_limit(params)
+    for task_position, (partition_index, pdag) in enumerate(selected):
+        if remaining <= 0:
+            break
+        first_partition = partition_index == 0
+        group_budgets: list[dict[str, Any]] = []
+        group_keys: list[dict[str, Any]] = []
+        for input_level in _metadata_input_boundary_levels(params, first_partition=first_partition):
+            if remaining <= 0:
+                break
+            key, budgets = _metadata_budget_group_for_partition(
+                pdag,
+                params,
+                first_partition=first_partition,
+                input_level=input_level,
+            )
+            group_budgets.extend(budgets)
+            group_keys.append(_boundary_group_key_to_dict(key))
+            remaining -= 1
+        if not group_budgets:
+            continue
+        task_context = build_context(pdag, group_budgets, params)
+        task_context.setdefault("harness", {})["metadata_only_context"] = True
+        cache_dir = getattr(params, "openevolve_sampled_qbp_cache_dir", None)
+        if cache_dir:
+            task_context.setdefault("harness", {})["sampled_qbp_cache_dir"] = str(cache_dir)
+        task = {
+            "index": int(partition_index),
+            "kind": "metadata",
+            "metadata_only": True,
+            "partition_index": int(partition_index),
+            "group_keys": group_keys,
+            "context": task_context,
+        }
+        tasks.append(task)
+        metrics.append(
+            _metadata_seed_metric_for_task(
+                task_position=len(tasks) - 1,
+                task=task,
+                pdag=pdag,
+                params=params,
+                complexity=_metadata_partition_complexity(pdag, params),
+            )
+        )
+    if not tasks or not metrics:
+        return None
+    _annotate_sampled_budget_tasks_with_seed_metrics(tasks, metrics)
+    objective = float(sum(_task_seed_metric_latency(metric) for metric in metrics))
+    path_digest = _hint_digest(
+        [
+            {
+                "task_index": metric.get("task_index"),
+                "selected_path_digest": metric.get("selected_path_digest"),
+                "latency": _digest_float(metric.get("sampled_dp_latency_usec")),
+            }
+            for metric in metrics
+        ]
+    )
+    top_groups = _top_costly_boundary_groups_from_task_metrics(metrics)
+    return {
+        "valid": True,
+        "validity": 1.0,
+        "boundary_group_validity": 1.0,
+        "candidate_qbp_coverage": 1.0,
+        "metadata_only_context": True,
+        "sampled_progress_only": True,
+        "source": "metadata_only_context_seed",
+        "final_latency_usec": objective,
+        "objective_cost_usec": objective,
+        "sampled_dp_latency_usec": objective,
+        "total_frontier_cost_usec": objective,
+        "bootstrap_count": 0.0,
+        "rescale_count": 0.0,
+        "sampled_selected_path_bootstraps": 0.0,
+        "sampled_selected_path_rescales": 0.0,
+        "sampled_selected_path_digest": path_digest,
+        "selected_path_digest": path_digest,
+        "fallback_selected_budgets": 0,
+        "fallback_selected_groups": 0,
+        "invalid_boundary_groups": 0,
+        "unreachable_boundary_groups": 0,
+        "sampled_budget_tasks": tasks,
+        "sampled_task_seed_metrics": metrics,
+        "top_costly_boundary_groups": top_groups,
+        "unsolved_boundary_groups": {"reasons": {}, "examples": []},
+        "selected_path_records": [],
+        "policy_summary": _compact_policy_summary(initial_hints),
+        "diagnostics": {
+            "metadata_only_context": True,
+            "sampled_task_count": len(tasks),
+            "sampled_task_metrics": metrics,
+            "top_costly_boundary_groups": top_groups,
+            "selected_path_digest": path_digest,
+        },
+    }
+
+
 def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> dict[str, Any]:
     try:
         from openevolve import run_evolution
@@ -2741,78 +3055,112 @@ def run_compile_openevolve(dag: Tdag, le: LatencyEstimator, params: Params) -> d
         if _ensure_sampled_seed_metadata(context, initial_hints, params):
             record_harness_timing("sampled_seed_metadata")
     else:
-        print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
-        context_collection_hints = _context_collection_seed_hints(initial_hints, params)
-        reference = _evaluate_compile_hints(context, context_collection_hints, suppress_output=True)
-        record_harness_timing("seed_context_collection_replay")
-        context["reference"] = {
-            "final_latency_usec": reference.get("final_latency_usec"),
-            "objective_cost_usec": reference.get(
-                "objective_cost_usec", reference.get("final_latency_usec")
-            ),
-            "total_frontier_cost_usec": reference.get("total_frontier_cost_usec"),
-            "sampled_dp_latency_usec": reference.get("sampled_dp_latency_usec"),
-            "bootstrap_count": reference.get("bootstrap_count"),
-            "rescale_count": reference.get("rescale_count"),
-            "valid": reference.get("valid", False),
-            "effective_qbp_digest": _effective_qbp_digest(reference.get("diagnostics", {})),
-            "selected_path_digest": _selected_path_digest(reference, reference.get("diagnostics", {})),
-            "source": "context_collection_seed"
-            if context_collection_hints is not initial_hints
-            else "initial_seed",
-            "policy_summary": _compact_policy_summary(context_collection_hints),
-        }
-        context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
-        if reference.get("sampled_budget_tasks"):
-            context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
-            if params.openevolve_eval_suite != "polybert-full":
-                sampled_reference = _evaluate_compile_hints(
-                    context,
-                    _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
-                    suppress_output=True,
-                )
-                record_harness_timing("sampled_seed_replay")
-                sampled_baseline = _placement_baseline_from_result(sampled_reference)
-                sampled_baseline["source"] = "sampled_initial_seed"
-                sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
-                harness = context.setdefault("harness", {})
-                harness["sampled_seed_baseline"] = sampled_baseline
-                if sampled_baseline.get("sampled_task_seed_metrics"):
-                    harness["sampled_task_seed_metrics"] = list(
-                        sampled_baseline.get("sampled_task_seed_metrics", [])
+        metadata_reference = _metadata_sampled_seed_context(
+            context,
+            dag,
+            params,
+            initial_hints,
+        )
+        if metadata_reference is not None:
+            print(
+                "OpenEvolve compile harness: using metadata-only sampled seed "
+                "context; real QBP is deferred to promotion probes.",
+                flush=True,
+            )
+            context["reference"] = dict(metadata_reference)
+            context["sampled_budget_tasks"] = list(
+                metadata_reference.get("sampled_budget_tasks", []) or []
+            )
+            harness = context.setdefault("harness", {})
+            harness["seed_baseline"] = dict(metadata_reference)
+            harness["sampled_seed_baseline"] = dict(metadata_reference)
+            harness["sampled_task_seed_metrics"] = list(
+                metadata_reference.get("sampled_task_seed_metrics", []) or []
+            )
+            harness["top_costly_boundary_groups"] = list(
+                metadata_reference.get("top_costly_boundary_groups", []) or []
+            )[:8]
+            harness["unsolved_boundary_groups"] = dict(
+                metadata_reference.get("unsolved_boundary_groups", {}) or {}
+            )
+            harness["selected_path_records"] = list(
+                metadata_reference.get("selected_path_records", []) or []
+            )[:64]
+            context["placement_profile"] = []
+            record_harness_timing("metadata_seed_context")
+        else:
+            print("OpenEvolve compile harness: evaluating initial seed baseline.", flush=True)
+            context_collection_hints = _context_collection_seed_hints(initial_hints, params)
+            reference = _evaluate_compile_hints(context, context_collection_hints, suppress_output=True)
+            record_harness_timing("seed_context_collection_replay")
+            context["reference"] = {
+                "final_latency_usec": reference.get("final_latency_usec"),
+                "objective_cost_usec": reference.get(
+                    "objective_cost_usec", reference.get("final_latency_usec")
+                ),
+                "total_frontier_cost_usec": reference.get("total_frontier_cost_usec"),
+                "sampled_dp_latency_usec": reference.get("sampled_dp_latency_usec"),
+                "bootstrap_count": reference.get("bootstrap_count"),
+                "rescale_count": reference.get("rescale_count"),
+                "valid": reference.get("valid", False),
+                "effective_qbp_digest": _effective_qbp_digest(reference.get("diagnostics", {})),
+                "selected_path_digest": _selected_path_digest(reference, reference.get("diagnostics", {})),
+                "source": "context_collection_seed"
+                if context_collection_hints is not initial_hints
+                else "initial_seed",
+                "policy_summary": _compact_policy_summary(context_collection_hints),
+            }
+            context.setdefault("harness", {})["seed_baseline"] = dict(context["reference"])
+            if reference.get("sampled_budget_tasks"):
+                context["sampled_budget_tasks"] = reference["sampled_budget_tasks"]
+                if params.openevolve_eval_suite != "polybert-full":
+                    sampled_reference = _evaluate_compile_hints(
+                        context,
+                        _compile_hints_for_eval_suite(initial_hints, params.openevolve_eval_suite),
+                        suppress_output=True,
                     )
-                    _annotate_sampled_budget_tasks_with_seed_metrics(
-                        context["sampled_budget_tasks"],
-                        harness["sampled_task_seed_metrics"],
+                    record_harness_timing("sampled_seed_replay")
+                    sampled_baseline = _placement_baseline_from_result(sampled_reference)
+                    sampled_baseline["source"] = "sampled_initial_seed"
+                    sampled_baseline["policy_summary"] = _compact_policy_summary(initial_hints)
+                    harness = context.setdefault("harness", {})
+                    harness["sampled_seed_baseline"] = sampled_baseline
+                    if sampled_baseline.get("sampled_task_seed_metrics"):
+                        harness["sampled_task_seed_metrics"] = list(
+                            sampled_baseline.get("sampled_task_seed_metrics", [])
+                        )
+                        _annotate_sampled_budget_tasks_with_seed_metrics(
+                            context["sampled_budget_tasks"],
+                            harness["sampled_task_seed_metrics"],
+                        )
+                    harness["top_costly_boundary_groups"] = list(
+                        sampled_baseline.get("top_costly_boundary_groups", []) or []
+                    )[:8]
+                    harness["selected_path_records"] = list(
+                        sampled_baseline.get("selected_path_records", []) or []
+                    )[:64]
+                    if isinstance(sampled_baseline.get("final_selected_path_record"), dict):
+                        harness["final_selected_path_record"] = dict(
+                            sampled_baseline["final_selected_path_record"]
+                        )
+                    harness["unsolved_boundary_groups"] = dict(
+                        sampled_baseline.get("unsolved_boundary_groups", {}) or {}
                     )
-                harness["top_costly_boundary_groups"] = list(
-                    sampled_baseline.get("top_costly_boundary_groups", []) or []
-                )[:8]
-                harness["selected_path_records"] = list(
-                    sampled_baseline.get("selected_path_records", []) or []
-                )[:64]
-                if isinstance(sampled_baseline.get("final_selected_path_record"), dict):
-                    harness["final_selected_path_record"] = dict(
-                        sampled_baseline["final_selected_path_record"]
+                    context["reference"] = dict(sampled_baseline)
+                    seed_trace_examples = _seed_mlir_trace_examples(
+                        context,
+                        initial_path,
+                        initial_hints,
+                        sampled_reference,
                     )
-                harness["unsolved_boundary_groups"] = dict(
-                    sampled_baseline.get("unsolved_boundary_groups", {}) or {}
-                )
-                context["reference"] = dict(sampled_baseline)
+            context["placement_profile"] = reference.get("bottleneck_summary", [])
+            if not seed_trace_examples:
                 seed_trace_examples = _seed_mlir_trace_examples(
                     context,
                     initial_path,
                     initial_hints,
-                    sampled_reference,
+                    reference,
                 )
-        context["placement_profile"] = reference.get("bottleneck_summary", [])
-        if not seed_trace_examples:
-            seed_trace_examples = _seed_mlir_trace_examples(
-                context,
-                initial_path,
-                initial_hints,
-                reference,
-            )
         print(
             "OpenEvolve compile harness: seed baseline "
             f"valid={context['reference'].get('valid')} "
@@ -11136,10 +11484,14 @@ def _promotion_timeout_sec(params: Params) -> int:
 def _promotion_eval_timeout_sec(params: Params) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180)
+        value = (
+            int(raw)
+            if raw
+            else max(600, int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180))
+        )
     except (TypeError, ValueError):
-        value = 180
-    return max(0, min(3_600, value))
+        value = 600
+    return max(0, min(7_200, value))
 
 
 def _promotion_long_retry_timeout_sec(current_timeout_sec: int) -> int:

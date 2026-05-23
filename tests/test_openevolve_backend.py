@@ -6062,6 +6062,62 @@ def test_historical_context_selection_keeps_nontrivial_cached(monkeypatch):
     assert not oe_backend._should_use_historical_context(cached, historical)
 
 
+def test_metadata_seed_context_builds_sampled_tasks_without_replay(
+    toy_cost_json: str, monkeypatch
+):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_METADATA_CONTEXT", "1")
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_sampled_only=True,
+    )
+    params.openevolve_iterations = 1
+    graph = _mul_chain_pdag(params, length=4)
+    context = build_compile_context(graph, params)
+    initial_hints = oe_backend._bootstrap_mcts_seed_policy(params)
+
+    reference = oe_backend._metadata_sampled_seed_context(
+        context,
+        graph,
+        params,
+        initial_hints,
+    )
+
+    assert reference is not None
+    assert reference["source"] == "metadata_only_context_seed"
+    assert reference["metadata_only_context"] is True
+    assert reference["valid"] is True
+    assert reference["sampled_budget_tasks"]
+    assert reference["sampled_task_seed_metrics"]
+    assert reference["objective_cost_usec"] > 0
+    for task in reference["sampled_budget_tasks"]:
+        assert task["metadata_only"] is True
+        assert task["group_keys"]
+        assert task["context"]["io_budgets"]
+        assert task["seed_metrics"]["metadata_only"] is True
+
+
+def test_metadata_seed_context_disabled_for_full_suite(toy_cost_json: str, monkeypatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_METADATA_CONTEXT", "1")
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-full",
+        openevolve_sampled_only=True,
+    )
+    params.openevolve_iterations = 1
+    graph = _mul_chain_pdag(params, length=4)
+
+    assert (
+        oe_backend._metadata_sampled_seed_context(
+            build_compile_context(graph, params),
+            graph,
+            params,
+            oe_backend._bootstrap_mcts_seed_policy(params),
+        )
+        is None
+    )
+
+
 def test_cached_context_reference_latency_prefers_sampled_objective(
     toy_cost_json: str,
 ):

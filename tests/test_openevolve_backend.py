@@ -6196,6 +6196,55 @@ def test_seed_equivalent_candidate_skips_expensive_sampled_replay(
     assert result["artifacts"]["failure_stage"] == "seed_equivalent_policy_probe_skip"
 
 
+def test_metadata_initial_program_uses_surrogate_instead_of_sampled_replay(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_INLINE_QBP", raising=False)
+    params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {
+        "objective_cost_usec": 100.0,
+        "valid": True,
+        "metadata_only_context": True,
+    }
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+        }
+    ]
+    context["harness"]["top_costly_boundary_groups"] = [
+        {
+            "key": "in_lvl=-1;in_scl=40;maino_v=;main_dag_size=3",
+            "group_key": {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3},
+            "min_cost_usec": 100.0,
+        }
+    ]
+    context_path = tmp_path / "compile_context.json"
+    program_path = tmp_path / "initial_program.py"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    program_path.write_text("def place(context):\n    return {}\n", encoding="utf-8")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("metadata initial program should not run sampled replay")
+
+    monkeypatch.setattr(
+        oe_backend,
+        "_policy_effect_summary",
+        lambda *_args, **_kwargs: {"seed_equivalent": True, "effect_score": 0.0},
+    )
+    monkeypatch.setattr(oe_backend, "_evaluate_compile_hints", fail_if_called)
+
+    result = evaluate_compile_candidate_program(context_path, program_path)
+
+    assert result["artifacts"]["failure_stage"] == "experience_surrogate_feature_only"
+    assert result["metrics"]["experience_surrogate_score"] >= 0.0
+    assert result["metrics"]["experience_probe_promoted"] == 0.0
+
+
 def test_experience_probe_uses_top_groups_before_full_sampled_replay(
     toy_cost_json: str, tmp_path: Path, monkeypatch
 ):

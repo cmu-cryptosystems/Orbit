@@ -6627,6 +6627,10 @@ def evaluate_compile_candidate_program(
             timings["record_trace"] = float(time.perf_counter() - trace_start)
             attach_timings(result)
             return result
+        metadata_seed_context = bool(
+            isinstance(context.get("reference"), dict)
+            and context["reference"].get("metadata_only_context")
+        )
         probe_skip = _experience_probe_skip_result(
             context,
             hints,
@@ -6634,7 +6638,7 @@ def evaluate_compile_candidate_program(
             eval_suite,
             policy_effect,
             suppress_output=True,
-            disabled=allow_seed_equivalent,
+            disabled=allow_seed_equivalent and not metadata_seed_context,
         )
         mark_timing("experience_probe")
         if probe_skip is not None:

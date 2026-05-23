@@ -6712,6 +6712,126 @@ def test_sampled_only_dp_probe_selects_without_materialization(
     assert summary["selected_record"]["sampled_only_probe_selected"] is True
 
 
+def test_sampled_promotion_limits_extra_probes_after_selection(
+    toy_cost_json: str, tmp_path: Path, monkeypatch
+):
+    params = _params(
+        toy_cost_json,
+        openevolve_eval_suite="polybert-sampled",
+        openevolve_sampled_only=True,
+        openevolve_finalists=0,
+        openevolve_search_mode="bootstrap-mcts",
+        openevolve_qbp_engine="dp",
+    )
+    context = build_compile_context(_mul_chain_pdag(params, length=3), params)
+    context["reference"] = {"sampled_dp_latency_usec": 100.0, "objective_cost_usec": 100.0}
+    context["sampled_budget_tasks"] = [
+        {
+            "index": 0,
+            "group_keys": [
+                {"in_lvl": -1, "in_scl": 40, "maino_v": "", "main_dag_size": 3}
+            ],
+            "context": {"io_budgets": [{"in_lvl": -1, "in_scl": 40}]},
+            "seed_metrics": {"sampled_dp_latency_usec": 100.0},
+        }
+    ]
+    output_dir = tmp_path / "oe"
+    output_dir.mkdir()
+    codes = [
+        f"def place(context):\n    return {{'marker': 'p{idx}', 'qbp_engine': 'dp'}}\n"
+        for idx in range(3)
+    ]
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_STOP_AFTER_SELECTED", "0")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_MAX_EVALS_AFTER_SELECTED", "1")
+    monkeypatch.setattr(oe_backend, "_discover_finalist_codes", lambda *_args: codes)
+    monkeypatch.setattr(
+        oe_backend,
+        "_hints_from_code",
+        lambda code, _context: (
+            lambda marker: {
+                "marker": marker,
+                "qbp_engine": "dp",
+                "boundary_state_cap": 2 + int(marker),
+            }
+        )(code.split("'p", 1)[1].split("'", 1)[0]),
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_static_validate_hints",
+        lambda *_args: {"valid": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_apply_dp_probe_seed_reference",
+        lambda _context, _hints, _params, tasks, cost, timeout_sec: (
+            tasks,
+            cost,
+            {"valid": True, "sampled_dp_latency_usec": cost},
+        ),
+    )
+    monkeypatch.setattr(oe_backend, "_run_single_boundary_dp_debug", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        oe_backend,
+        "_run_strategy_discovery_prepass",
+        lambda *_args, **_kwargs: {
+            "path_moving_codes": [],
+            "latency_improved_codes": [],
+            "skip_policy_digests": set(),
+            "summary": {},
+        },
+    )
+    probe_calls = []
+
+    def fake_probe(_context, hints, _params, _tasks, *, timeout_sec):
+        probe_calls.append(hints["marker"])
+        return {
+            "valid": True,
+            "boundary_group_validity": 1.0,
+            "candidate_qbp_coverage": 1.0,
+            "fallback_selected_budgets": 0,
+            "fallback_selected_groups": 0,
+            "invalid_boundary_groups": 0,
+            "sampled_dp_latency_usec": 80.0,
+            "objective_cost_usec": 80.0,
+            "bootstrap_count": 2,
+            "rescale_count": 4,
+            "sampled_selected_path_digest": "same-candidate-path",
+            "diagnostics": {
+                "fallback_selected_boundary_groups": 0,
+                "invalid_boundary_groups": 0,
+                "selected_source_counts": {"candidate": 1},
+            },
+        }
+
+    monkeypatch.setattr(oe_backend, "_evaluate_promotion_probe", fake_probe)
+    monkeypatch.setattr(
+        oe_backend,
+        "_evaluate_sampled_budget_tasks_for_promotion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no materialization")),
+    )
+    monkeypatch.setattr(
+        oe_backend,
+        "_evaluate_dp_probe_for_promotion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no materialization")),
+    )
+
+    selected = oe_backend._run_sampled_promotion_pass(
+        tmp_path,
+        output_dir,
+        context,
+        codes[0],
+        params,
+        {},
+    )
+
+    assert selected is not None
+    assert probe_calls == ["0", "1"]
+    summary = json.loads((tmp_path / "sampled_promotion" / "promotion_summary.json").read_text())
+    assert summary["selected"] is True
+    assert summary["post_selection_probe_count"] == 1
+    assert any(record.get("stage") == "selected_probe_budget_stop" for record in summary["records"])
+
+
 def test_single_boundary_debug_skips_sampled_only_by_default(
     toy_cost_json: str, monkeypatch
 ):
@@ -6726,6 +6846,25 @@ def test_single_boundary_debug_skips_sampled_only_by_default(
 
     monkeypatch.setenv("ORBIT_OPENEVOLVE_SINGLE_BOUNDARY_DEBUG", "1")
     assert oe_backend._single_boundary_debug_enabled(params) is True
+
+
+def test_promotion_timeout_defaults_allow_long_dp_probes(
+    toy_cost_json: str, monkeypatch
+):
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", raising=False)
+    params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=180)
+    assert oe_backend._promotion_eval_timeout_sec(params) == 900
+    assert oe_backend._promotion_timeout_sec(params) == 3600
+
+    params = _params(toy_cost_json, openevolve_evaluator_timeout_sec=1200)
+    assert oe_backend._promotion_eval_timeout_sec(params) == 1200
+    assert oe_backend._promotion_timeout_sec(params) == 4800
+
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_EVAL_TIMEOUT_SEC", "42")
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "123")
+    assert oe_backend._promotion_eval_timeout_sec(params) == 42
+    assert oe_backend._promotion_timeout_sec(params) == 123
 
 
 def test_sampled_promotion_fails_open_when_no_candidate_improves(

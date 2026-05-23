@@ -11480,9 +11480,9 @@ def _promotion_candidate_limit(params: Params) -> int:
 def _promotion_timeout_sec(params: Params) -> int:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_TIMEOUT_SEC", "").strip()
     try:
-        value = int(raw) if raw else 600
+        value = int(raw) if raw else max(2_400, 4 * _promotion_eval_timeout_sec(params))
     except ValueError:
-        value = 600
+        value = max(2_400, 4 * _promotion_eval_timeout_sec(params))
     return max(0, min(86_400, value))
 
 
@@ -11492,10 +11492,10 @@ def _promotion_eval_timeout_sec(params: Params) -> int:
         value = (
             int(raw)
             if raw
-            else max(600, int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180))
+            else max(900, int(getattr(params, "openevolve_evaluator_timeout_sec", 180) or 180))
         )
     except (TypeError, ValueError):
-        value = 600
+        value = 900
     return max(0, min(7_200, value))
 
 
@@ -11568,6 +11568,15 @@ def _promotion_probe_limit() -> int:
 def _promotion_stop_after_selected() -> bool:
     raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_STOP_AFTER_SELECTED", "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
+
+
+def _promotion_max_evals_after_selected() -> int:
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_MAX_EVALS_AFTER_SELECTED", "").strip()
+    try:
+        value = int(raw) if raw else 8
+    except ValueError:
+        value = 8
+    return max(0, min(128, value))
 
 
 def _single_boundary_debug_enabled(params: Params) -> bool:
@@ -13998,6 +14007,7 @@ def _write_promotion_progress(
     records: list[dict[str, Any]],
     selected: bool,
     timed_out: bool = False,
+    selected_record: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "current_stage": current_stage,
@@ -14010,6 +14020,8 @@ def _write_promotion_progress(
         "timeout_sec": timeout_sec,
         "latest_records": records[-8:],
     }
+    if selected_record is not None:
+        payload["selected_record"] = selected_record
     (promotion_dir / "promotion_progress.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
@@ -14816,6 +14828,9 @@ def _run_sampled_promotion_pass(
     duplicate_path_source_count = 0
     discovery_seed_equivalent_skip_count = 0
     probe_evaluated_count = 0
+    stop_after_selected = _promotion_stop_after_selected()
+    max_evals_after_selected = _promotion_max_evals_after_selected()
+    post_selection_probe_count = 0
     timed_out = False
     seed_probe_summary = _probe_seed_summary(selected_probe_tasks, probe_reference_cost)
 
@@ -14831,6 +14846,24 @@ def _run_sampled_promotion_pass(
     )
 
     for index, code in enumerate(codes):
+        if (
+            best is not None
+            and not stop_after_selected
+            and max_evals_after_selected > 0
+            and post_selection_probe_count >= max_evals_after_selected
+        ):
+            records.append(
+                {
+                    "index": index,
+                    "stage": "selected_probe_budget_stop",
+                    "reason": (
+                        "stopping promotion after "
+                        f"{post_selection_probe_count} additional probes after selection"
+                    ),
+                    "max_evals_after_selected": max_evals_after_selected,
+                }
+            )
+            break
         if len(seen_effective_digests) >= limit:
             break
         if timeout_sec > 0 and time.monotonic() - started_at >= timeout_sec:
@@ -14984,6 +15017,7 @@ def _run_sampled_promotion_pass(
             continue
         seen_policy_digests.add(policy_digest)
         probe_evaluated_count += 1
+        had_selection_at_probe_start = best is not None
         probe_context = deepcopy(context)
         probe_context["sampled_budget_tasks"] = deepcopy(selected_probe_tasks)
         probe_context.setdefault("harness", {})["experience_probe"] = True
@@ -15131,6 +15165,8 @@ def _run_sampled_promotion_pass(
             records=records,
             selected=best is not None,
         )
+        if had_selection_at_probe_start:
+            post_selection_probe_count += 1
         if not _promotion_result_direct_valid(probe_result):
             probe_record["reason"] = (
                 "dp_incomplete"
@@ -15203,7 +15239,7 @@ def _run_sampled_promotion_pass(
                     records=records,
                     selected=True,
                 )
-                if _promotion_stop_after_selected():
+                if stop_after_selected:
                     records.append(
                         {
                             "index": index,
@@ -15405,7 +15441,7 @@ def _run_sampled_promotion_pass(
         )
         if best is None or item[:4] < best[:4]:
             best = item
-        if _promotion_stop_after_selected():
+        if stop_after_selected:
             records.append(
                 {
                     "index": index,
@@ -15420,6 +15456,8 @@ def _run_sampled_promotion_pass(
         "candidate_count": len(codes),
         "evaluated_count": len(seen),
         "probe_evaluated_count": probe_evaluated_count,
+        "post_selection_probe_count": post_selection_probe_count,
+        "max_evals_after_selected": max_evals_after_selected,
         "duplicate_policy_count": duplicate_policy_count,
         "duplicate_effective_path_count": duplicate_effective_count,
         "duplicate_path_source_count": duplicate_path_source_count,

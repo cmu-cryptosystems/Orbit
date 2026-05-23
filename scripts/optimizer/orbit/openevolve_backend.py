@@ -12847,6 +12847,24 @@ def _promotion_probe_default_boundary_policies(
     return policies
 
 
+def _promotion_probe_seed_bridge_defaults(policy: dict[str, Any]) -> dict[str, Any]:
+    """Make scoped promotion probes cheap unless a splice mode was explicit."""
+
+    result = dict(policy)
+    result.setdefault("dp_allow_seed_bridge_candidate", True)
+    mode = str(result.get("dp_probe_mode", "")).strip().lower()
+    if not mode:
+        result["dp_probe_mode"] = "seed_bridge_candidate"
+        mode = "seed_bridge_candidate"
+    if mode in {"seed_bridge_candidate", "seed-bridge-candidate", "seed_exact", "seed-exact"}:
+        result["dp_seed_exact_only"] = True
+        result.setdefault("dp_max_combos_per_node", 1)
+        result.setdefault("dp_max_incoming_options_per_combo", 1)
+        result.setdefault("dp_max_level_candidates", 1)
+        result.setdefault("dp_max_output_states_per_input", 1)
+    return result
+
+
 def _boundary_group_selector_matches_task(selector: Any, task: dict[str, Any] | None) -> bool:
     if not isinstance(selector, dict):
         return False
@@ -12900,7 +12918,9 @@ def _promotion_probe_hints(
         updated = dict(item)
         policy = updated.get("policy")
         if isinstance(policy, dict):
-            updated["policy"] = _clamp_promotion_probe_patch(policy)
+            updated["policy"] = _promotion_probe_seed_bridge_defaults(
+                _clamp_promotion_probe_patch(policy)
+            )
         policies.append(updated)
         if len(policies) >= max_boundary_policies:
             break

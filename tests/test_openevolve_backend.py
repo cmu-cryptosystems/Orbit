@@ -4055,6 +4055,8 @@ def test_promotion_probe_hints_are_lightweight_and_targeted(toy_cost_json: str):
     assert len(probe["boundary_group_policies"]) == 1
     assert probe["boundary_group_policies"][0]["selector"]["in_lvl"] == -1
     assert probe["boundary_group_policies"][0]["policy"]["max_scale_candidates"] <= 48
+    assert probe["boundary_group_policies"][0]["policy"]["dp_probe_mode"] == "seed_bridge_candidate"
+    assert probe["boundary_group_policies"][0]["policy"]["dp_seed_exact_only"] is True
     assert probe["unit_policies"] == []
 
 
@@ -4117,6 +4119,10 @@ def test_promotion_probe_hints_preserve_multiple_sampled_boundary_policies():
     assert [item["selector"]["task_index"] for item in probe["boundary_group_policies"]] == [0, 1, 2]
     assert all(
         item["policy"]["max_scale_candidates"] <= 48
+        for item in probe["boundary_group_policies"]
+    )
+    assert all(
+        item["policy"]["dp_probe_mode"] == "output_splice"
         for item in probe["boundary_group_policies"]
     )
 

@@ -12847,6 +12847,22 @@ def _promotion_probe_default_boundary_policies(
     return policies
 
 
+def _promotion_probe_boundary_policy_limit(
+    selected_probe_tasks: list[dict[str, Any]],
+) -> int:
+    group_count = 0
+    for task in selected_probe_tasks or []:
+        if isinstance(task, dict):
+            group_count += len(_sampled_task_group_key_dicts(task))
+    default = min(8, max(1, group_count or len(selected_probe_tasks) or 1))
+    raw = os.environ.get("ORBIT_OPENEVOLVE_PROMOTION_BOUNDARY_POLICIES", "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, min(64, value))
+
+
 def _promotion_probe_seed_bridge_defaults(policy: dict[str, Any]) -> dict[str, Any]:
     """Make scoped promotion probes cheap unless a splice mode was explicit."""
 
@@ -12908,7 +12924,7 @@ def _promotion_probe_hints(
     )
     probe = _clamp_promotion_probe_patch(probe)
     policies = []
-    max_boundary_policies = max(1, min(4, len(selected_probe_tasks) or 1))
+    max_boundary_policies = _promotion_probe_boundary_policy_limit(selected_probe_tasks)
     for item in probe.get("boundary_group_policies", []) or []:
         if not isinstance(item, dict):
             continue
@@ -12942,17 +12958,23 @@ def _promotion_probe_hints(
                 break
             if _scoped_boundary_policy_selectors({"boundary_group_policies": policies}):
                 break
-    remaining_boundary_policies = max_boundary_policies - len(policies)
-    if (
-        remaining_boundary_policies > 0
-        and not _scoped_boundary_policy_selectors({"boundary_group_policies": policies})
+    seen_selectors = {
+        _hint_digest(item.get("selector", {}))
+        for item in policies
+        if isinstance(item, dict) and isinstance(item.get("selector"), dict)
+    }
+    for item in _promotion_probe_default_boundary_policies(
+        selected_probe_tasks,
+        limit=max_boundary_policies,
     ):
-        policies.extend(
-            _promotion_probe_default_boundary_policies(
-                selected_probe_tasks,
-                limit=remaining_boundary_policies,
-            )
-        )
+        if len(policies) >= max_boundary_policies:
+            break
+        selector = item.get("selector", {}) if isinstance(item, dict) else {}
+        selector_digest = _hint_digest(selector)
+        if selector_digest in seen_selectors:
+            continue
+        seen_selectors.add(selector_digest)
+        policies.append(item)
     probe["boundary_group_policies"] = policies
     probe["unit_policies"] = []
     return probe

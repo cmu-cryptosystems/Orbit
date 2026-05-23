@@ -4157,6 +4157,83 @@ def test_promotion_probe_hints_add_scoped_seed_bridge_policy_when_global_only():
     assert policy["policy"]["dp_probe_mode"] == "seed_bridge_candidate"
 
 
+def test_promotion_probe_hints_backfills_missing_probe_boundary_policies():
+    hints = {
+        "strategy": "bootstrap_mcts",
+        "boundary_group_policies": [
+            {
+                "selector": {
+                    "task_index": 2,
+                    "in_lvl": 14,
+                    "in_scl": 42,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                },
+                "policy": {"dp_probe_mode": "output_splice", "max_scale_candidates": 64},
+            }
+        ],
+    }
+    tasks = [
+        {
+            "index": idx,
+            "group_keys": [
+                {
+                    "in_lvl": 16 - idx,
+                    "in_scl": 40 + idx,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": 16 - idx, "in_scl": 40 + idx}]},
+        }
+        for idx in range(6)
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    policies = probe["boundary_group_policies"]
+    assert len(policies) == 6
+    selectors = {(item["selector"]["task_index"], item["selector"]["in_lvl"]) for item in policies}
+    assert selectors == {(idx, 16 - idx) for idx in range(6)}
+    preserved = [
+        item
+        for item in policies
+        if item["selector"]["task_index"] == 2 and item["selector"]["in_lvl"] == 14
+    ][0]
+    assert preserved["policy"]["dp_probe_mode"] == "output_splice"
+    assert preserved["policy"]["max_scale_candidates"] <= 48
+    backfilled = [item for item in policies if item is not preserved]
+    assert all(
+        item["policy"]["dp_probe_mode"] == "seed_bridge_candidate"
+        for item in backfilled
+    )
+
+
+def test_promotion_probe_hints_boundary_policy_limit_env(monkeypatch):
+    monkeypatch.setenv("ORBIT_OPENEVOLVE_PROMOTION_BOUNDARY_POLICIES", "3")
+    hints = {"strategy": "bootstrap_mcts"}
+    tasks = [
+        {
+            "index": idx,
+            "group_keys": [
+                {
+                    "in_lvl": idx,
+                    "in_scl": 40,
+                    "maino_v": "",
+                    "main_dag_size": 0,
+                }
+            ],
+            "context": {"io_budgets": [{"in_lvl": idx, "in_scl": 40}]},
+        }
+        for idx in range(6)
+    ]
+
+    probe = oe_backend._promotion_probe_hints(hints, tasks)
+
+    assert len(probe["boundary_group_policies"]) == 3
+    assert [item["selector"]["task_index"] for item in probe["boundary_group_policies"]] == [0, 1, 2]
+
+
 def test_experience_surrogate_prefers_bounded_top_group_policy(toy_cost_json: str):
     params = _params(toy_cost_json, openevolve_eval_suite="polybert-sampled")
     context = build_compile_context(_mul_chain_pdag(params, length=3), params)

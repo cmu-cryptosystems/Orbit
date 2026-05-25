@@ -21,12 +21,12 @@ def _parse_instruction(line: str) -> dict | None:
         line, metadata = line.rsplit(' # ', 1)
 
     # Accept both v1 (True/False) and v2 (ci/pl) secrecy tokens
-    match = re.match(r'^(\d+)\s+(True|False|ci|pl):\s+(.+)$', line)
+    match = re.match(r'^(\d+)\s+(True|False|true|false|ci|pl):\s+(.+)$', line)
     if not match:
         return None
 
     token = match.group(2)
-    secret = token in ('True', 'ci')
+    secret = token in ('True', 'true', 'ci')
 
     return {
         'index': int(match.group(1)),
@@ -95,6 +95,9 @@ def _classify_operation(operation: str) -> tuple[str, dict]:
     if operation.strip() == 'zero mask':
         return 'zero_mask', {}
 
+    if operation.strip() == 'const':
+        return 'const', {}
+
     # MASK
     m = re.match(r'^mask\s+(.+)$', operation)
     if m:
@@ -132,6 +135,8 @@ def _map_op_to_tdag(op_type: str, secret: bool) -> str:
         return 'input' if secret else 'constant'
     if op_type == 'cs_ref':
         return 'input' if secret else 'constant'
+    if op_type == 'const':
+        return 'constant'
     mapping = {
         'add':       'add',
         'sub':       'add',
@@ -171,7 +176,7 @@ def _build_op_descr(op_type: str, op_info: dict,
     if op_type in ['pack', 'cs_ref']:
         return {}
 
-    if op_type in ['mask', 'zero_mask']:
+    if op_type in ['const', 'mask', 'zero_mask']:
         return {'value': 0, 'rms_var': 0.0}
 
     if op_type == 'poly':
@@ -179,6 +184,82 @@ def _build_op_descr(op_type: str, op_info: dict,
         return {'single': 1, 'double': 0}
 
     return {}
+
+
+def populate_tdag_from_all_instr(tdag: Tdag, all_instr: dict, params: Params) -> None:
+    """Populate ``tdag`` from parsed Rotom instructions."""
+    for idx in sorted(all_instr.keys()):
+        instr = all_instr[idx]
+        op_type = instr['op_type']
+        op_info = instr['op_info']
+        label = str(idx)
+
+        operand_indices = op_info.get('operands', [])
+        operand_secrets = [
+            all_instr[oi]['secret'] if oi in all_instr else False
+            for oi in operand_indices
+        ]
+
+        secret = instr['secret']
+        tdag_op = _map_op_to_tdag(op_type, secret)
+        op_descr = _build_op_descr(op_type, op_info, operand_secrets, params)
+
+        if tdag_op == 'constant' and 'value' not in op_descr:
+            op_descr = {'value': 0, 'rms_var': 0.0}
+
+        tdag.add_node(
+            label,
+            op=tdag_op,
+            level=None,
+            scale=None,
+            weight=1,
+            op_descr=op_descr,
+            comment=instr.get('metadata', ''),
+        )
+
+        if tdag_op == 'input':
+            tdag.inputs.add(label)
+
+        if op_type == 'cs_ref':
+            ref_label = str(op_info['ref_index'])
+            if ref_label in tdag.nodes:
+                tdag.add_edge(ref_label, label, weight=1)
+
+        for oi in operand_indices:
+            src_label = str(oi)
+            if src_label not in tdag.nodes:
+                tdag.add_node(
+                    src_label,
+                    op='input',
+                    level=None,
+                    scale=None,
+                    weight=1,
+                    op_descr={},
+                    comment='(placeholder) missing operand definition',
+                )
+                tdag.inputs.add(src_label)
+            tdag.add_edge(src_label, label, weight=1)
+
+
+def mark_tdag_outputs_from_manifest(tdag: Tdag, manifest: dict) -> None:
+    """Mark terminal Rotom kernel outputs on ``tdag``."""
+    consumed_layouts = set()
+    for kernel_info in manifest['kernels']:
+        for dep in kernel_info.get('dependencies', []):
+            consumed_layouts.add(dep)
+
+    for kernel_info in manifest['kernels']:
+        layout = kernel_info.get('layout', '')
+        if layout not in consumed_layouts:
+            for out_idx in kernel_info.get('outputs', []):
+                label = str(out_idx)
+                if label in tdag.nodes:
+                    tdag.outputs.add(label)
+
+    if not tdag.outputs:
+        for v in tdag.nodes:
+            if tdag.out_degree(v) == 0:
+                tdag.outputs.add(v)
 
 
 def build_from_rotom(manifest_path: str, params: Params) -> Tdag:
@@ -220,72 +301,7 @@ def build_from_rotom(manifest_path: str, params: Params) -> Tdag:
                 'kernel_idx': kernel_idx,
             }
 
-    # ---- pass 2: build nodes in index order (topological) ----
-    for idx in sorted(all_instr.keys()):
-        instr = all_instr[idx]
-        op_type  = instr['op_type']
-        op_info  = instr['op_info']
-        label    = str(idx)
-
-        operand_indices = op_info.get('operands', [])
-        operand_secrets = [
-            all_instr[oi]['secret'] if oi in all_instr else False
-            for oi in operand_indices
-        ]
-
-        secret   = instr['secret']
-        tdag_op  = _map_op_to_tdag(op_type, secret)
-        op_descr = _build_op_descr(op_type, op_info, operand_secrets, params)
-
-        # Plaintext packs become constants; they need value/rms_var metadata.
-        if tdag_op == 'constant' and 'value' not in op_descr:
-            op_descr = {'value': 0, 'rms_var': 0.0}
-
-        # In compile mode Orbit sets level/scale to None and solves for them.
-        level = None
-        scale = None
-
-        tdag.add_node(label, op=tdag_op, level=level, scale=scale,
-                      weight=1, op_descr=op_descr,
-                      comment=instr.get('metadata', ''))
-
-        # Only ciphertext leaf nodes are circuit inputs;
-        # plaintext packs / masks are constants (not in tdag.inputs).
-        if tdag_op == 'input':
-            tdag.inputs.add(label)
-
-        # cs_ref nodes depend on the instruction they reference
-        if op_type == 'cs_ref':
-            ref_label = str(op_info['ref_index'])
-            if ref_label in tdag.nodes:
-                tdag.add_edge(ref_label, label, weight=1)
-
-        for oi in operand_indices:
-            src_label = str(oi)
-            assert src_label in tdag.nodes, \
-                f"Operand {oi} referenced before definition (instruction {idx})."
-            tdag.add_edge(src_label, label, weight=1)
-
-    # ---- pass 3: determine output nodes ----
-    # Only terminal kernels (whose layouts are not consumed by any other
-    # kernel) produce real circuit outputs.  Intermediate kernel outputs
-    # are just internal data-flow edges already captured by the graph.
-    consumed_layouts = set()
-    for kernel_info in manifest['kernels']:
-        for dep in kernel_info.get('dependencies', []):
-            consumed_layouts.add(dep)
-
-    for kernel_info in manifest['kernels']:
-        layout = kernel_info.get('layout', '')
-        is_terminal = layout not in consumed_layouts
-        if is_terminal:
-            for out_idx in kernel_info.get('outputs', []):
-                tdag.outputs.add(str(out_idx))
-
-    # Fallback: if no terminal outputs found, use all sink nodes
-    if not tdag.outputs:
-        for v in tdag.nodes:
-            if tdag.out_degree(v) == 0:
-                tdag.outputs.add(v)
+    populate_tdag_from_all_instr(tdag, all_instr, params)
+    mark_tdag_outputs_from_manifest(tdag, manifest)
 
     return tdag

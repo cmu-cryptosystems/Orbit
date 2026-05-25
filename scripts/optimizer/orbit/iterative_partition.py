@@ -20,7 +20,7 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
     # print(f"Enter solve_partition, PDAG #{dag.name}, prev_cost: {prev_cost}")
     
     is_whole_circ = (len(prev_cost) == 1 and -1 in prev_cost)
-    pdags = rdag_siso_partition(dag, 100)
+    pdags = rdag_siso_partition(dag, getattr(params, "part_delta", 100))
     
     if len(pdags) == 1:
         start_time = time.time()
@@ -30,7 +30,9 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
             qbp_manager.add_qbp(dag, prev_cost)
         else:
             # bypass handling
-            main_pdag_parts = rdag_siso_partition(main_pdag, 100)
+            main_pdag_parts = rdag_siso_partition(
+                main_pdag, getattr(params, "part_delta", 100)
+            )
             if len(main_pdag_parts) == 1 and len(bypass_pdag.nodes) == 3:
                 print(f"PDAG #{dag.name} Basic, DAG size: {len(dag.nodes)} nodes")
                 qbp_manager.add_qbp(dag, prev_cost)
@@ -39,7 +41,7 @@ def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: Lat
                 solve_partition(main_pdag, qbp_manager, prev_cost, le, params)
                 qbp_manager.add_qbp_bypass(dag, main_pdag, bypass_pdag, prev_cost)
         print(f"Partition solving time for PDAG #{dag.name}: {time.time() - start_time:.2f} seconds")
-        return
+        return qbp_manager.get_qbp_assign(dag), qbp_manager.get_qbp_cost(dag.name)
     
     # for i in range(len(pdags)):
     #     visualize(pdags[i], f"visualize/debug_ilp_pdag_{pdags[i].name}.svg")

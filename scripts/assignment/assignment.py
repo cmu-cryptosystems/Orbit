@@ -59,6 +59,8 @@ class Assign:
                 raise ValueError(f"Node {v} with operation mul must have 1 or 2 predecessors.")
             if len(p_v_is) == 2:
                 v_deduced_is = p_v_is[0] + p_v_is[1]
+            elif self.tdag.nodes[v]['op_descr'].get('single', 0) > 0 and self.tdag.nodes[v]['op_descr'].get('double', 0) == 0:
+                v_deduced_is = p_v_is[0] + self.params.Csw
             else:
                 v_deduced_is = p_v_is[0] * 2
         else:

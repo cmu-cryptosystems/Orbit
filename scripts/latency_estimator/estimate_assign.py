@@ -25,7 +25,13 @@ def estimate_assign(assign: Assign, le: LatencyEstimator) -> float:
                 total_cost += le.op_lmaps[f"{op}_double"][v_lin] * double_cnt
         
         # vertex cost
-        total_cost += tdag.nodes[v]['weight'] * le.resbts_cost(v_lin, v_sin, v_lout, v_sout)
+        try:
+            total_cost += tdag.nodes[v]['weight'] * le.resbts_cost(v_lin, v_sin, v_lout, v_sout)
+        except Exception as exc:
+            raise Exception(
+                f"Invalid node transition for {v} ({op}): "
+                f"in=({v_lin}, {v_sin}) out=({v_lout}, {v_sout})"
+            ) from exc
         
         # edge cost
         for u in tdag.predecessors(v):
@@ -35,7 +41,13 @@ def estimate_assign(assign: Assign, le: LatencyEstimator) -> float:
             e_sout = assign.e_scl_out.get((u, v), None)
             u_lin = assign.v_lvl_out.get(u, None)
             u_sin = assign.v_scl_out.get(u, None)
-            total_cost += tdag.edges[u, v]['weight'] * le.resbts_cost(u_lin, u_sin, e_lout, e_sout)
+            try:
+                total_cost += tdag.edges[u, v]['weight'] * le.resbts_cost(u_lin, u_sin, e_lout, e_sout)
+            except Exception as exc:
+                raise Exception(
+                    f"Invalid edge transition for ({u}, {v}): "
+                    f"in=({u_lin}, {u_sin}) out=({e_lout}, {e_sout})"
+                ) from exc
 
     return total_cost
 

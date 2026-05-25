@@ -22,10 +22,17 @@ class ILP_Worker:
         while not task_queue.empty():
             try:
                 io_budget = task_queue.get(timeout=3)
-                io_budget_name = f"in_lvl={io_budget.get('in_lvl', -1)}_in_scl={io_budget.get('in_scl', -1)}_out_lvl={io_budget.get('out_lvl', -1)}"
+                io_budget_name = (
+                    f"in_lvl={io_budget.get('in_lvl', -1)}"
+                    f"_in_scl={io_budget.get('in_scl', -1)}"
+                    f"_out_lvl={io_budget.get('out_lvl', -1)}"
+                )
                 if 'maino_v' in io_budget:
-                    io_budget_name += f"_main_qbp_keys={io_budget['main_qbp_cost'].keys()}"
-                task_name = f"Task (Partition-{pdag.name} {io_budget_name})"
+                    mq = io_budget["main_qbp_cost"]
+                    key_part = "_".join(f"{a}_{b}" for a, b in sorted(mq.keys()))
+                    io_budget_name += f"_main_qbp_{key_part}"
+                # No spaces: PuLP/CBC rejects spaces in problem names.
+                task_name = f"Partition_{pdag.name}_{io_budget_name}"
                 pasn, pasn_cost = solve_ilp(pdag, io_budget, self.le, task_name, ilp_threads, self.params)
                 if pasn is not None:
                     real_in_lvl = pasn.v_lvl_in[pdag_vin]

@@ -31,7 +31,6 @@ class ILP_Worker:
                     mq = io_budget["main_qbp_cost"]
                     key_part = "_".join(f"{a}_{b}" for a, b in sorted(mq.keys()))
                     io_budget_name += f"_main_qbp_{key_part}"
-                # No spaces: PuLP/CBC rejects spaces in problem names.
                 task_name = f"Partition_{pdag.name}_{io_budget_name}"
                 pasn, pasn_cost = solve_ilp(pdag, io_budget, self.le, task_name, ilp_threads, self.params)
                 if pasn is not None:

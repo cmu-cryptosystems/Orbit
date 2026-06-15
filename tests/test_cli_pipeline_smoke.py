@@ -151,8 +151,6 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
             "--enable-reqbp",
             "--threads",
             "2",
-            "--ilp-solver",
-            "pulp",
         ],
     )
 
@@ -169,7 +167,7 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["part"] is False
     assert init["reqbp"] is True
     assert init["netname"] == "motivation"
-    assert init["ilp_solver"] == "pulp"
+    assert "ilp_solver" not in init
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

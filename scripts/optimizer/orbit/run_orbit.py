@@ -15,7 +15,8 @@ if __name__ == "__main__":
     parser.add_argument('--nocomp', action='store_true', help='Disable Compression')
     parser.add_argument('--nopart', action='store_true', help='Disable Partitioning')
     parser.add_argument('--sim-vari', action='store_true', help='Use simulated variadic bootstrapping cost model')
-    
+    parser.add_argument('--threads', type=int, default=None, help='Number of solver threads passed to optimizer.py')
+
     args = parser.parse_args()
     benchmark = args.model+args.act+str(args.n)+"k"
     this_n = args.Lm if args.Lm != 16 else args.n
@@ -50,7 +51,9 @@ if __name__ == "__main__":
         cmds.append("--no-partition")
     if args.qbp:
         cmds.append("--enable-reqbp")
-        
+    if args.threads is not None:
+        cmds += ["--threads", str(args.threads)]
+
     with open(f"{result_dir}{outname}.txt", "w", buffering=1) as stdout_file, \
         open(f"{result_dir}{outname}.err", "w", buffering=1) as stderr_file:
         process = subprocess.Popen(
@@ -63,3 +66,4 @@ if __name__ == "__main__":
             with open(f"{result_dir}{outname}.err", "r") as err_file:
                 error_msg = err_file.read()
             print(f"Subprocess exited with code {exit_code}.\n    Error message:\n{error_msg}")
+            raise SystemExit(exit_code)

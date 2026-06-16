@@ -2,7 +2,7 @@ import json
 import numpy as np
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None, ilp_solver=None):
+    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -35,10 +35,7 @@ class Params:
         self.part = part if part is not None else True
         self.reqbp = reqbp if reqbp is not None else False
         self.netname = netname if netname is not None else ""
-        self.ilp_solver = ilp_solver if ilp_solver is not None else json_parsed.get("ilp_solver", "gurobi")
-        if self.ilp_solver not in ("gurobi", "pulp"):
-            raise ValueError(f"ilp_solver must be 'gurobi' or 'pulp', got {self.ilp_solver!r}")
-        
+
         self.trunc_val = 1 # truncation value for latency estimation
         self.dacapo_mlir_in = True  # need to revert the input MLIR level
         self.dacapo_mlir_out = True # need to revert the output MLIR level

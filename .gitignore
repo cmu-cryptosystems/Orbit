@@ -10,3 +10,5 @@ frontend/dacapo/
 frontend/log/
 backend/lattigo/
 .venv/
+.deps/
+repro_results/

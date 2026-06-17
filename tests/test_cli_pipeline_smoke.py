@@ -46,6 +46,8 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
             "--nocomp",
             "--nopart",
             "--sim-vari",
+            "--threads",
+            "2",
         ],
     )
 
@@ -62,6 +64,9 @@ def test_run_orbit_builds_expected_subprocess_command(monkeypatch: pytest.Monkey
     assert "--enable-reqbp" in cmd
     assert "--no-compress" in cmd
     assert "--no-partition" in cmd
+    assert "--threads" in cmd
+    assert "2" in cmd
+    assert "--ilp-solver" not in cmd
     assert str(captured["stdout_name"]).endswith(".txt")
     assert str(captured["stderr_name"]).endswith(".err")
 
@@ -151,8 +156,6 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
             "--enable-reqbp",
             "--threads",
             "2",
-            "--ilp-solver",
-            "pulp",
         ],
     )
 
@@ -169,7 +172,7 @@ def test_optimizer_main_wires_cli_flags_to_params(monkeypatch: pytest.MonkeyPatc
     assert init["part"] is False
     assert init["reqbp"] is True
     assert init["netname"] == "motivation"
-    assert init["ilp_solver"] == "pulp"
+    assert "ilp_solver" not in init
 
     run_call = captured["run"]
     assert run_call["input_file"] == "mlirs_input/motivation.mlir"

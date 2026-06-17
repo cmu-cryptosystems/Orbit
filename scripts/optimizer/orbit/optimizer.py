@@ -109,8 +109,6 @@ def main():
     parser.add_argument('--enable-reqbp', action='store_true', help='Enable QBP cross-bench reusing')
     parser.add_argument('--bypass-dep', type=int, default=15, help='Bypass dependency level (default: 15)')
     parser.add_argument('--threads', type=int, default=16, help='Number of threads (default: 16)')
-    parser.add_argument('--ilp-solver', type=str, default=None, choices=['gurobi', 'pulp'],
-                        help='MILP backend: gurobipy (default) or PuLP with CBC (no Gurobi license required)')
     parser.add_argument('--netname', type=str, default="", help='Network name for qbp reusing purposes (default: mlirs_input/<netname>.mlir)')
     
     args = parser.parse_args()
@@ -125,8 +123,8 @@ def main():
         netname = os.path.splitext(os.path.basename(args.inputfile))[0]
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
-                    comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname, ilp_solver=args.ilp_solver)
+                    comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp,
+                    netname=netname)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:

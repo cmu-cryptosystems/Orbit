@@ -8,6 +8,13 @@ MODE="${1:-python}"
 BUILD_JOBS="${ORBIT_BUILD_JOBS:-$(nproc)}"
 DEPS_DIR="${ORBIT_DEPS_DIR:-$ROOT/.deps}"
 
+# Pinned external dependency versions (for reproducible builds).
+# LLVM and SEAL are pinned to immutable release tags below (llvmorg-18.1.2, 4.0.0).
+# Lattigo and Dacapo track moving branches upstream, so pin them to the exact
+# commits validated by Orbit's end-to-end run.
+LATTIGO_COMMIT="${ORBIT_LATTIGO_COMMIT:-5dbffbdea05394de2ca3a432ed5318aa832e3f40}"
+DACAPO_COMMIT="${ORBIT_DACAPO_COMMIT:-4616402710f39df3e5f5bd7930a6c036025aaac3}"
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -52,6 +59,7 @@ setup_backend() {
     mkdir -p backend
     if [[ ! -d backend/lattigo/.git ]]; then
         git clone https://github.com/tuneinsight/lattigo.git backend/lattigo
+        git -C backend/lattigo checkout "$LATTIGO_COMMIT"
     fi
 
     (
@@ -108,6 +116,7 @@ setup_frontend() {
 
     if [[ ! -d frontend/dacapo/.git ]]; then
         git clone https://github.com/corelab-src/dacapo.git frontend/dacapo
+        git -C frontend/dacapo checkout "$DACAPO_COMMIT"
     fi
 
     (

@@ -8,22 +8,35 @@ def check_tdag(tdag: Tdag):
         raise ValueError("Graph has cycles or is not fully connected.")
     
     # Check level and scale ranges
+    scale_quantum = int(getattr(tdag.params, 'scale_quantum', 1) or 1)
+    bts_input_level = int(getattr(tdag.params, 'bts_input_level', tdag.params.bts_lb))
+    bts_input_scale = int(getattr(tdag.params, 'bts_input_scale', tdag.params.Sf))
+    bts_output_scale = int(getattr(tdag.params, 'bts_output_scale', tdag.params.Sf))
+    if scale_quantum <= 0:
+        raise ValueError(f"scale_quantum must be positive, got {scale_quantum}.")
     for v in tdag.nodes:
         lvl = tdag.nodes[v].get('level', None)
         scale = tdag.nodes[v].get('scale', None)
+        op = tdag.nodes[v].get('op', None)
         if lvl is None or scale is None:
             raise ValueError(f"Node {v} missing level or scale attribute.")
+        if op is None:
+            raise ValueError(f"Node {v} missing operation attribute.")
+        if scale_quantum != 1 and scale % scale_quantum != 0:
+            raise ValueError(
+                f"Node {v} has scale {scale} not divisible by scale_quantum={scale_quantum}."
+            )
         # Check scale bounds
         if not tdag.params.Sw <= scale <= tdag.params.Sf + 2 * tdag.params.Sw:
             if tdag.nodes[v]['op'] == 'constant' and tdag.params.Csw <= scale < tdag.params.Sw:
                 continue
             raise ValueError(f"Node {v} has scale {scale} out of bounds [{tdag.params.Sw}, {tdag.params.Sf + 2 * tdag.params.Sw}].")
         # Check level bounds
-        if not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:
+        if op == 'bootstrap':
+            if not (tdag.params.bts_lb < lvl <= tdag.params.bts_ub):
+                raise ValueError(f"Node {v} has bootstrap level {lvl} out of bounds [{tdag.params.bts_lb + 1}, {tdag.params.bts_ub}].")
+        elif not tdag.params.lvl_lb <= lvl <= tdag.params.lvl_ub:
             raise ValueError(f"Node {v} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub}].")
-        op = tdag.nodes[v].get('op', None)
-        if op is None:
-            raise ValueError(f"Node {v} missing operation attribute.")
         if op in ['modswitch_single', 'rescale_single'] and lvl >= tdag.params.lvl_ub:
             raise ValueError(f"Node {v} with operation {op} has level {lvl} out of bounds [{tdag.params.lvl_lb}, {tdag.params.lvl_ub-1}].")
         if op == 'bootstrap_single' and not (tdag.params.bts_lb < lvl <= tdag.params.bts_ub):
@@ -51,14 +64,25 @@ def check_tdag(tdag: Tdag):
                 raise ValueError(f"Node {v} with operation {op} must have 1 or 2 predecessors.")
             # level: p1.lvl == p2.lvl == v.lvl
             # scale: p1.scale + p2.scale == v.scale
-            if len(preds) == 2:
-                p1, p2 = preds[0], preds[1]
+            if len(preds) == 1:
+                p1 = preds[0]
+                if tdag.nodes[p1]['level'] != lvl:
+                    raise ValueError(f"Node {v} with operation {op} has predecessor {p1} with mismatched level {tdag.nodes[p1]['level']} (expected {lvl}).")
+                if (
+                    tdag.nodes[v].get('op_descr', {}).get('single', 0) > 0
+                    and tdag.nodes[v].get('op_descr', {}).get('double', 0) == 0
+                ):
+                    expected_scale = tdag.nodes[p1]['scale'] + tdag.params.Csw
+                    if expected_scale != scale:
+                        raise ValueError(f"Node {v} with operation {op} has unary plaintext predecessor {p1} with scale {tdag.nodes[p1]['scale']} plus plaintext scale {tdag.params.Csw}, not summing to {scale}.")
+                elif tdag.nodes[p1]['scale'] * 2 != scale:
+                    raise ValueError(f"Node {v} with operation {op} has duplicated predecessor {p1} with scale {tdag.nodes[p1]['scale']} not doubling to {scale}.")
             else:
-                p1, p2 = preds[0], preds[0]
-            if tdag.nodes[p1]['level'] != lvl or tdag.nodes[p2]['level'] != lvl:
-                raise ValueError(f"Node {v} with operation {op} has predecessors {p1}, {p2} with mismatched levels {tdag.nodes[p1]['level']}, {tdag.nodes[p2]['level']} (expected {lvl}).")
-            if tdag.nodes[p1]['scale'] + tdag.nodes[p2]['scale'] != scale:
-                raise ValueError(f"Node {v} with operation {op} has predecessors {p1}, {p2} with scales {tdag.nodes[p1]['scale']}, {tdag.nodes[p2]['scale']} not summing to {scale}.")
+                p1, p2 = preds[0], preds[1]
+                if tdag.nodes[p1]['level'] != lvl or tdag.nodes[p2]['level'] != lvl:
+                    raise ValueError(f"Node {v} with operation {op} has predecessors {p1}, {p2} with mismatched levels {tdag.nodes[p1]['level']}, {tdag.nodes[p2]['level']} (expected {lvl}).")
+                if tdag.nodes[p1]['scale'] + tdag.nodes[p2]['scale'] != scale:
+                    raise ValueError(f"Node {v} with operation {op} has predecessors {p1}, {p2} with scales {tdag.nodes[p1]['scale']}, {tdag.nodes[p2]['scale']} not summing to {scale}.")
         elif op == 'rescale':
             if len(preds) != 1:
                 raise ValueError(f"Node {v} with operation {op} must have exactly 1 predecessor.")
@@ -96,15 +120,14 @@ def check_tdag(tdag: Tdag):
             targetLevel = tdag.nodes[v]['op_descr'].get('targetLevel', None)
             if targetLevel is None:
                 raise ValueError(f"Node {v} with operation {op} missing targetLevel in op_descr.")
-            if tdag.nodes[p]['level'] != tdag.params.bts_lb:
-                raise ValueError(f"Node {v} with operation {op} has predecessor {p} with level {tdag.nodes[p]['level']} (expected {tdag.params.bts_lb}).")
-            if tdag.nodes[p]['scale'] != tdag.params.Sf:
-                raise ValueError(f"Node {v} with operation {op} has predecessor {p} with mismatched scale {tdag.nodes[p]['scale']} (expected {tdag.params.Sf}).")
+            if tdag.nodes[p]['level'] != bts_input_level:
+                raise ValueError(f"Node {v} with operation {op} has predecessor {p} with level {tdag.nodes[p]['level']} (expected {bts_input_level}).")
+            if tdag.nodes[p]['scale'] != bts_input_scale:
+                raise ValueError(f"Node {v} with operation {op} has predecessor {p} with mismatched scale {tdag.nodes[p]['scale']} (expected {bts_input_scale}).")
             if lvl != targetLevel:
                 raise ValueError(f"Node {v} with operation {op} has targetLevel {targetLevel} not matching its level {lvl}.")
-            if scale != tdag.params.Sf:
-                raise ValueError(f"Node {v} with operation {op} has scale {scale} not matching expected {tdag.params.Sf}.")
+            if scale != bts_output_scale:
+                raise ValueError(f"Node {v} with operation {op} has scale {scale} not matching expected {bts_output_scale}.")
         else:
             raise ValueError(f"Node {v} has unknown operation {op}.")
     return True
-

@@ -155,7 +155,7 @@ class Tdag(nx.DiGraph):
             elif name == 'bootstrap':
                 self.add_node(v_op, op=name, weight=1,
                                 level=factor,
-                                scale=self.params.Sf,
+                                scale=getattr(self.params, 'bts_output_scale', self.params.Sf),
                                 op_descr={'targetLevel': factor},
                                 comment=self.nodes[v_p]['comment']
                               )

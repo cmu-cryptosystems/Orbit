@@ -1,6 +1,7 @@
 """Gurobi-based ILP building blocks (optional; requires gurobipy)."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import gurobipy as gp
@@ -10,11 +11,42 @@ from ...tdag import Tdag
 from ...params.params import Params
 
 
+def _scale_quantum(params: Params) -> int:
+    quantum = int(getattr(params, "scale_quantum", 1) or 1)
+    if quantum <= 0:
+        raise ValueError(f"scale_quantum must be positive, got {quantum}")
+    return quantum
+
+
+def _validate_scale_quantum(params: Params) -> int:
+    quantum = _scale_quantum(params)
+    if quantum == 1:
+        return quantum
+    for name in ("Sw", "Csw", "Sf", "bts_input_scale", "bts_output_scale"):
+        value = int(getattr(params, name))
+        if value % quantum != 0:
+            raise ValueError(
+                f"{name}={value} must be divisible by scale_quantum={quantum}"
+            )
+    return quantum
+
+
+def _quantized_scale_bounds(low: int, up: int, quantum: int) -> tuple[int, int]:
+    q_low = math.ceil(low / quantum)
+    q_up = math.floor(up / quantum)
+    if q_low > q_up:
+        raise ValueError(
+            f"no scale values in [{low}, {up}] are divisible by scale_quantum={quantum}"
+        )
+    return q_low, q_up
+
+
 class VarPool:
     def __init__(self, tdag: Tdag, params: Params, model: gp.Model):
         self.params = params
         self.Smax = params.Sf + 2 * params.Sw
         self.model = model
+        self.scale_quantum = _validate_scale_quantum(params)
 
         self.vars = dict()
         self.total_cost = []
@@ -24,9 +56,9 @@ class VarPool:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
             self.vars[f"v_lvl_in_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_in_{v}")
-            self.vars[f"v_scl_in_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_in_{v}")
+            self.vars[f"v_scl_in_{v}"] = self.add_scale_var(f"v_scl_in_{v}", params.Sw, self.Smax)
             self.vars[f"v_lvl_out_{v}"] = model.addVar(lb=1, ub=params.lvl_ub, vtype=GRB.INTEGER, name=f"v_lvl_out_{v}")
-            self.vars[f"v_scl_out_{v}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"v_scl_out_{v}")
+            self.vars[f"v_scl_out_{v}"] = self.add_scale_var(f"v_scl_out_{v}", params.Sw, self.Smax)
             self.vars[f"v_use_r_{v}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"v_use_r_{v}")
             self.vars[f"v_use_b_{v}"] = model.addVar(vtype=GRB.BINARY, name=f"v_use_b_{v}")
 
@@ -41,7 +73,7 @@ class VarPool:
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"e_scl_out_{edge_label}"] = model.addVar(lb=params.Sw, ub=self.Smax, vtype=GRB.INTEGER, name=f"e_scl_out_{edge_label}")
+                self.vars[f"e_scl_out_{edge_label}"] = self.add_scale_var(f"e_scl_out_{edge_label}", params.Sw, self.Smax)
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
             self.vars[f"e_use_r_{edge_label}"] = model.addVar(lb=0, vtype=GRB.INTEGER, name=f"e_use_r_{edge_label}")
@@ -55,13 +87,29 @@ class VarPool:
             # node variables
             self.vars[f"v_lvl_out_{u}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"v_scl_out_{u}"] = model.addVar(lb=params.Csw, ub=params.Csw, vtype=GRB.INTEGER, name=f"v_scl_out_{u}")
+                self.vars[f"v_scl_out_{u}"] = self.add_scale_var(f"v_scl_out_{u}", params.Csw, params.Csw)
             else:
                 self.vars[f"v_scl_out_{u}"] = self.vars[f"v_scl_in_{v}"]
             # edge variables
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
+
+    def add_scale_var(self, name: str, low: int, up: int) -> gp.Var:
+        var = self.model.addVar(lb=low, ub=up, vtype=GRB.INTEGER, name=name)
+        if self.scale_quantum != 1:
+            q_low, q_up = _quantized_scale_bounds(low, up, self.scale_quantum)
+            q_var = self.model.addVar(
+                lb=q_low,
+                ub=q_up,
+                vtype=GRB.INTEGER,
+                name=f"{name}_q",
+            )
+            self.model.addConstr(
+                var == self.scale_quantum * q_var,
+                name=f"scale_quantum_{name}",
+            )
+        return var
 
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
@@ -91,6 +139,9 @@ class VarPool:
 def add_ilp_constraints(tdag: Tdag, vp: VarPool):
     model = vp.model
     params = vp.params
+    bts_input_level = int(getattr(params, 'bts_input_level', params.bts_lb))
+    bts_input_scale = int(getattr(params, 'bts_input_scale', params.Sf))
+    bts_output_scale = int(getattr(params, 'bts_output_scale', params.Sf))
     # add mul scale constraints
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] != 'mul':
@@ -129,6 +180,14 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
             vp.var_scl(v, 'out') <= params.Sf * (vp.var_lvl(v, 'out') - params.lvl_lb + 2) - 7,
             name=f"decryptable_{v}_out",
         )
+        rot_scale_floor = getattr(params, 'rot_scale_floor', None)
+        if rot_scale_floor and tdag.nodes[v]['op'] == 'rotate':
+            # GPU backends (Butterscotch) require >= rot_scale_floor scale bits
+            # on rotation inputs for a correct keyswitch.
+            model.addConstr(
+                vp.var_scl(v, 'in') >= int(rot_scale_floor),
+                name=f"rotate_scale_floor_{v}",
+            )
         model.addConstr(
             vp.var_scl(v, 'in') <= params.Sf * (vp.var_lvl(v, 'in') - params.bts_lb + 1),
             name=f"bootstrap_feasible_{v}_in",
@@ -144,8 +203,17 @@ def add_ilp_constraints(tdag: Tdag, vp: VarPool):
                                     vp.var_lvl(v, 'out') >= params.bts_lb + 1,
                                     name=f"bts_{v}_output_lvl")
         model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
-                                    vp.var_scl(v, 'out') >= params.Sf,
-                                    name=f"bts_{v}_output_scl")
+                                    vp.var_lvl(v, 'out') <= params.bts_ub,
+                                    name=f"bts_{v}_output_lvl_upper")
+        model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
+                                    vp.var_lvl(v, 'in') == bts_input_level,
+                                    name=f"bts_{v}_input_lvl_eq")
+        model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
+                                    vp.var_scl(v, 'in') == bts_input_scale,
+                                    name=f"bts_{v}_input_scl_eq")
+        model.addGenConstrIndicator(vp.var_use(v, 'b'), True,
+                                    bts_output_scale - vp.var_scl(v, 'out') <= params.Sf * (params.bts_ub - vp.var_lvl(v, 'out')),
+                                    name=f"bts_{v}_output_headroom")
         # add not using bootstrapping constraints
         model.addGenConstrIndicator(vp.var_use(v, 'b'), False,
                                     vp.var_lvl(v, 'out') <= vp.var_lvl(v, 'in') - vp.var_use(v, 'r'),

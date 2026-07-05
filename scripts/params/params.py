@@ -2,7 +2,7 @@ import json
 import numpy as np
 
 class Params:
-    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None, ilp_solver=None):
+    def __init__(self, le_json, sysname, mode, Sw=None, CSw=None, bpsdepth=None, threads=None, comp=None, part=None, reqbp=None, netname=None, ilp_solver=None, scale_quantum=None, bts_input_level=None, bts_input_scale=None, bts_output_scale=None):
         if le_json is None:
             return # should be filled later
         json_parsed = {}
@@ -29,6 +29,10 @@ class Params:
         self.sysname = sysname
         self.Sw = Sw if Sw is not None else self.Sf
         self.Csw = CSw if CSw is not None else self.Sw
+        self.scale_quantum = scale_quantum if scale_quantum is not None else 1
+        self.bts_input_level = bts_input_level if bts_input_level is not None else self.bts_lb
+        self.bts_input_scale = bts_input_scale if bts_input_scale is not None else self.Sf
+        self.bts_output_scale = bts_output_scale if bts_output_scale is not None else self.Sf
         self.bpsdepth = bpsdepth  # possibly None
         self.threads = threads if threads is not None else 16
         self.comp = comp if comp is not None else True
@@ -53,11 +57,15 @@ class Params:
     def check_resbts(self, in_lvl: int, in_scl: int, out_lvl: int, out_scl: int) -> bool:
         if self.check_res(in_lvl, in_scl, out_lvl, out_scl):
             return True
-        if not self.check_res(in_lvl, in_scl, self.bts_lb, self.Sf):
+        bts_input_level = int(getattr(self, 'bts_input_level', self.bts_lb))
+        bts_input_scale = int(getattr(self, 'bts_input_scale', self.Sf))
+        bts_output_scale = int(getattr(self, 'bts_output_scale', self.Sf))
+        if not self.check_res(in_lvl, in_scl, bts_input_level, bts_input_scale):
             return False
-        r = max(0, round(np.ceil((self.Sf - out_scl) / self.Sf)))
-        if not (self.bts_lb < out_lvl + r <= self.bts_ub):
+        r = max(0, round(np.ceil((bts_output_scale - out_scl) / self.Sf)))
+        bts_target_level = out_lvl + r
+        if not (self.bts_lb < bts_target_level <= self.bts_ub):
             return False
-        if not self.check_res(out_lvl+r, self.Sf, out_lvl, out_scl):
+        if not self.check_res(bts_target_level, bts_output_scale, out_lvl, out_scl):
             return False
         return True

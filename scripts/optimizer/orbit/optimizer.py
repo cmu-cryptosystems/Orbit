@@ -103,6 +103,10 @@ def main():
     parser.add_argument('-Sw', '--waterscale', type=int, default=40, help='Waterline scale')
     parser.add_argument('-Csw', '--constantscale', type=int, default=None, help='Constant scale (overrides waterline scale if specified)')
     parser.add_argument('-Sf', '--rescale', type=int, default=None, help='Rescaling factor (overrides costjson if specified)')
+    parser.add_argument('--scale-quantum', type=int, default=None, help='If set, constrain ILP scales to multiples of this value')
+    parser.add_argument('--bts-input-level', type=int, default=None, help='Required input level for bootstrap operations')
+    parser.add_argument('--bts-input-scale', type=int, default=None, help='Required input scale for bootstrap operations')
+    parser.add_argument('--bts-output-scale', type=int, default=None, help='Output scale produced by bootstrap operations')
     parser.add_argument('--nobypass', action='store_true', help='Disable Bypass handling')
     parser.add_argument('--no-compress', action='store_true', help='Disable DAG compression')
     parser.add_argument('--no-partition', action='store_true', help='Disable SISO partitioning')
@@ -126,7 +130,9 @@ def main():
     params = Params(args.costjson, "Orbit", mode="compile", 
                     Sw=args.waterscale, CSw=args.constantscale, bpsdepth=bypass_dep, threads=args.threads, 
                     comp=not args.no_compress, part=not args.no_partition, reqbp=args.enable_reqbp, 
-                    netname=netname, ilp_solver=args.ilp_solver)
+                    netname=netname, ilp_solver=args.ilp_solver, scale_quantum=args.scale_quantum,
+                    bts_input_level=args.bts_input_level, bts_input_scale=args.bts_input_scale,
+                    bts_output_scale=args.bts_output_scale)
     if args.maxlevel is not None:
         params.lvl_ub = args.maxlevel
     if args.btsupperbound is not None:
@@ -135,6 +141,12 @@ def main():
         params.bts_lb = args.btslevel
     if args.rescale is not None:
         params.Sf = args.rescale
+    if args.bts_input_level is None:
+        params.bts_input_level = params.bts_lb
+    if args.bts_input_scale is None:
+        params.bts_input_scale = params.Sf
+    if args.bts_output_scale is None:
+        params.bts_output_scale = params.Sf
     
     # make sure output_file directory exists
     os.makedirs(os.path.dirname(args.outputfile), exist_ok=True)

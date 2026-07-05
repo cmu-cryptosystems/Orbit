@@ -53,3 +53,23 @@ def test_check_resbts_false_when_bootstrap_window_invalid(tmp_path: Path):
     p = _params_with(sf=51, sw=40, bts_lb=3, bts_ub=10, lvl_lb=1, lvl_ub=16, tmp_path=tmp_path)
     # Feasible to bts_lb, but post-bootstrap target level leaves out_lvl+r outside (bts_lb, bts_ub]
     assert p.check_res(6, 51, 20, 51) is False
+    assert p.check_resbts(6, 51, 20, 51) is False
+
+
+def test_check_resbts_uses_explicit_bootstrap_profile_scales(tmp_path: Path):
+    p = _params_with(sf=28, sw=28, bts_lb=1, bts_ub=4, lvl_lb=1, lvl_ub=4, tmp_path=tmp_path)
+    p.bts_input_level = 2
+    p.bts_input_scale = 56
+    p.bts_output_scale = 56
+
+    assert p.check_res(2, 28, 3, 28) is False
+    assert p.check_resbts(2, 28, 3, 28) is True
+
+
+def test_check_resbts_rejects_profile_output_without_headroom(tmp_path: Path):
+    p = _params_with(sf=28, sw=28, bts_lb=1, bts_ub=3, lvl_lb=1, lvl_ub=4, tmp_path=tmp_path)
+    p.bts_input_level = 2
+    p.bts_input_scale = 56
+    p.bts_output_scale = 56
+
+    assert p.check_resbts(2, 28, 3, 28) is False

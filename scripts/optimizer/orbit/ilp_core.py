@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any, Union
 
 from ...tdag import *
@@ -23,6 +24,36 @@ def _pulp_safe_name(s: str, max_len: int = 240) -> str:
     return (t or "orbit_ilp")[:max_len]
 
 
+def _scale_quantum(params: Params) -> int:
+    quantum = int(getattr(params, "scale_quantum", 1) or 1)
+    if quantum <= 0:
+        raise ValueError(f"scale_quantum must be positive, got {quantum}")
+    return quantum
+
+
+def _validate_scale_quantum(params: Params) -> int:
+    quantum = _scale_quantum(params)
+    if quantum == 1:
+        return quantum
+    for name in ("Sw", "Csw", "Sf", "bts_input_scale", "bts_output_scale"):
+        value = int(getattr(params, name))
+        if value % quantum != 0:
+            raise ValueError(
+                f"{name}={value} must be divisible by scale_quantum={quantum}"
+            )
+    return quantum
+
+
+def _quantized_scale_bounds(low: int, up: int, quantum: int) -> tuple[int, int]:
+    q_low = math.ceil(low / quantum)
+    q_up = math.floor(up / quantum)
+    if q_low > q_up:
+        raise ValueError(
+            f"no scale values in [{low}, {up}] are divisible by scale_quantum={quantum}"
+        )
+    return q_low, q_up
+
+
 def _pulp_r_upper(params: Params, smax: int) -> int:
     """Conservative upper bound on rescale-use integer variables (required by CBC)."""
     return max(128, params.lvl_ub * (smax // max(params.Sf, 1) + 4))
@@ -37,6 +68,7 @@ class PulpVarPool:
         self.params = params
         self.Smax = params.Sf + 2 * params.Sw
         self.model = model
+        self.scale_quantum = _validate_scale_quantum(params)
         self.r_ub = _pulp_r_upper(params, self.Smax)
         bts_lb = params.bts_lb
         sf = params.Sf
@@ -55,9 +87,9 @@ class PulpVarPool:
             if tdag.nodes[v]['op'] == 'constant':
                 continue
             self.vars[f"v_lvl_in_{v}"] = pulp.LpVariable(f"v_lvl_in_{v}", lowBound=1, upBound=params.lvl_ub, cat=pulp.LpInteger)
-            self.vars[f"v_scl_in_{v}"] = pulp.LpVariable(f"v_scl_in_{v}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger)
+            self.vars[f"v_scl_in_{v}"] = self.add_scale_var(f"v_scl_in_{v}", params.Sw, self.Smax)
             self.vars[f"v_lvl_out_{v}"] = pulp.LpVariable(f"v_lvl_out_{v}", lowBound=1, upBound=params.lvl_ub, cat=pulp.LpInteger)
-            self.vars[f"v_scl_out_{v}"] = pulp.LpVariable(f"v_scl_out_{v}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger)
+            self.vars[f"v_scl_out_{v}"] = self.add_scale_var(f"v_scl_out_{v}", params.Sw, self.Smax)
             self.vars[f"v_use_r_{v}"] = pulp.LpVariable(f"v_use_r_{v}", lowBound=0, upBound=self.r_ub, cat=pulp.LpInteger)
             self.vars[f"v_use_b_{v}"] = pulp.LpVariable(f"v_use_b_{v}", cat=pulp.LpBinary)
 
@@ -69,8 +101,8 @@ class PulpVarPool:
             self.vars[f"e_scl_in_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"e_scl_out_{edge_label}"] = pulp.LpVariable(
-                    f"e_scl_out_{edge_label}", lowBound=params.Sw, upBound=self.Smax, cat=pulp.LpInteger
+                self.vars[f"e_scl_out_{edge_label}"] = self.add_scale_var(
+                    f"e_scl_out_{edge_label}", params.Sw, self.Smax
                 )
             else:
                 self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_in_{v}"]
@@ -85,14 +117,29 @@ class PulpVarPool:
             v = list(tdag.successors(u))[0]
             self.vars[f"v_lvl_out_{u}"] = self.vars[f"v_lvl_in_{v}"]
             if tdag.nodes[v]['op'] == 'mul':
-                self.vars[f"v_scl_out_{u}"] = pulp.LpVariable(
-                    f"v_scl_out_{u}", lowBound=params.Csw, upBound=params.Csw, cat=pulp.LpInteger
+                self.vars[f"v_scl_out_{u}"] = self.add_scale_var(
+                    f"v_scl_out_{u}", params.Csw, params.Csw
                 )
             else:
                 self.vars[f"v_scl_out_{u}"] = self.vars[f"v_scl_in_{v}"]
             edge_label = self.get_edge_label(u, v)
             self.vars[f"e_lvl_out_{edge_label}"] = self.vars[f"v_lvl_out_{u}"]
             self.vars[f"e_scl_out_{edge_label}"] = self.vars[f"v_scl_out_{u}"]
+
+    def add_scale_var(self, name: str, low: int, up: int) -> Any:
+        var = pulp.LpVariable(name, lowBound=low, upBound=up, cat=pulp.LpInteger)
+        if self.scale_quantum != 1:
+            q_low, q_up = _quantized_scale_bounds(low, up, self.scale_quantum)
+            q_var = pulp.LpVariable(
+                f"{name}_q",
+                lowBound=q_low,
+                upBound=q_up,
+                cat=pulp.LpInteger,
+            )
+            self.model += (
+                var == self.scale_quantum * q_var
+            ), _pulp_safe_name(f"scale_quantum_{name}")
+        return var
 
     def get_edge_label(self, u: str, v: str) -> str:
         return f"({u}_{v})"
@@ -122,6 +169,9 @@ def add_ilp_constraints_pulp(tdag: Tdag, vp: PulpVarPool):
     params = vp.params
     sf = params.Sf
     bts_lb = params.bts_lb
+    bts_input_level = int(getattr(params, 'bts_input_level', bts_lb))
+    bts_input_scale = int(getattr(params, 'bts_input_scale', sf))
+    bts_output_scale = int(getattr(params, 'bts_output_scale', sf))
 
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] != 'mul':
@@ -156,11 +206,25 @@ def add_ilp_constraints_pulp(tdag: Tdag, vp: PulpVarPool):
             prob += r == 0, _pulp_safe_name(f"input_anchor_{v}_rescale")
         prob += s_in <= sf * (l_in - params.lvl_lb + 2) - 7, _pulp_safe_name(f"decryptable_{v}_in")
         prob += s_out <= sf * (l_out - params.lvl_lb + 2) - 7, _pulp_safe_name(f"decryptable_{v}_out")
+        rot_scale_floor = getattr(params, 'rot_scale_floor', None)
+        if rot_scale_floor and tdag.nodes[v]['op'] == 'rotate':
+            # GPU backends (Butterscotch) require >= rot_scale_floor scale bits
+            # on rotation inputs for a correct keyswitch.
+            prob += s_in >= int(rot_scale_floor), _pulp_safe_name(f"rotate_scale_floor_{v}")
+        out_min_level = getattr(params, 'out_min_level', None)
+        if out_min_level and v in tdag.outputs:
+            # Outputs must keep enough limbs to decode their scale.
+            prob += l_out >= int(out_min_level), _pulp_safe_name(f"output_min_level_{v}")
         prob += s_in <= sf * (l_in - bts_lb + 1), _pulp_safe_name(f"bootstrap_feasible_{v}_in")
         prob += s_out <= sf * (l_out - bts_lb + 1), _pulp_safe_name(f"bootstrap_feasible_{v}_out")
         prob += s_in - sf * (l_in - bts_lb + 1) <= vp.M1 * (1 - b), _pulp_safe_name(f"bts_scl_in_{v}")
         prob += (bts_lb + 1) - l_out <= vp.M2 * (1 - b), _pulp_safe_name(f"bts_lvl_{v}")
-        prob += sf - s_out <= vp.M3 * (1 - b), _pulp_safe_name(f"bts_scl_out_{v}")
+        prob += l_out - params.bts_ub <= vp.M2 * (1 - b), _pulp_safe_name(f"bts_output_lvl_upper_{v}")
+        prob += l_in - bts_input_level <= vp.M2 * (1 - b), _pulp_safe_name(f"bts_input_lvl_hi_{v}")
+        prob += bts_input_level - l_in <= vp.M2 * (1 - b), _pulp_safe_name(f"bts_input_lvl_lo_{v}")
+        prob += s_in - bts_input_scale <= vp.M3 * (1 - b), _pulp_safe_name(f"bts_input_scl_hi_{v}")
+        prob += bts_input_scale - s_in <= vp.M3 * (1 - b), _pulp_safe_name(f"bts_input_scl_lo_{v}")
+        prob += bts_output_scale - s_out - sf * (params.bts_ub - l_out) <= vp.M5 * (1 - b), _pulp_safe_name(f"bts_output_headroom_{v}")
         prob += l_out - l_in + r <= vp.M4 * b, _pulp_safe_name(f"nobts_lvl_{v}")
         prob += s_in - sf * r - s_out <= vp.M5 * b, _pulp_safe_name(f"nobts_scl_{v}")
 
@@ -280,14 +344,24 @@ def _var_sol(x: Any, use_pulp: bool) -> float:
 def decode_ilp_sol(tdag: Tdag, vp: Any, *, use_pulp: bool = False) -> Assign:
     assign = Assign(tdag)
     params = vp.params
+    scale_quantum = _scale_quantum(params)
+
+    def check_quantized(value: int, label: str) -> None:
+        if scale_quantum != 1 and value % scale_quantum != 0:
+            raise AssertionError(
+                f"{label} scale {value} is not divisible by scale_quantum={scale_quantum}"
+            )
+
     for v in tdag.nodes:
         if tdag.nodes[v]['op'] == 'input':
             # input nodes, need to store in-level/scale
             assign.v_lvl_in[v] = round(_var_sol(vp.var_lvl(v, 'in'), use_pulp))
             assign.v_scl_in[v] = round(_var_sol(vp.var_scl(v, 'in'), use_pulp))
             assert assign.v_scl_in[v] >= params.Sw, f"Node {v} input scale {assign.v_scl_in[v]} below Sw={params.Sw}"
+            check_quantized(assign.v_scl_in[v], f"Node {v} input")
         assign.v_lvl_out[v] = round(_var_sol(vp.var_lvl(v, 'out'), use_pulp))
         assign.v_scl_out[v] = round(_var_sol(vp.var_scl(v, 'out'), use_pulp))
+        check_quantized(assign.v_scl_out[v], f"Node {v} output")
         if tdag.nodes[v]['op'] != 'constant':
             assert assign.v_scl_out[v] >= params.Sw, f"Node {v} output scale {assign.v_scl_out[v]} below Sw={params.Sw}"
 
@@ -297,6 +371,7 @@ def decode_ilp_sol(tdag: Tdag, vp: Any, *, use_pulp: bool = False) -> Assign:
         assign.e_lvl_out[(u, v)] = round(_var_sol(vp.var_lvl((u, v), 'out'), use_pulp))
         assign.e_scl_out[(u, v)] = round(_var_sol(vp.var_scl((u, v), 'out'), use_pulp))
         assert assign.e_scl_out[(u, v)] >= params.Sw, f"Edge ({u},{v}) output scale {assign.e_scl_out[(u,v)]} below Sw={params.Sw}"
+        check_quantized(assign.e_scl_out[(u, v)], f"Edge ({u},{v}) output")
 
     return assign
 

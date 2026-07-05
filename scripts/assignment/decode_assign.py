@@ -12,6 +12,9 @@ def _decode_edge(fdag: Tdag, u: str, v: str, scl: int|None):
     out_scl = fdag.nodes[v]['scale'] if scl is None else scl
     
     Sf = fdag.params.Sf
+    bts_input_level = int(getattr(fdag.params, 'bts_input_level', fdag.params.bts_lb))
+    bts_input_scale = int(getattr(fdag.params, 'bts_input_scale', Sf))
+    bts_output_scale = int(getattr(fdag.params, 'bts_output_scale', Sf))
     Smax = fdag.params.Sf + 2 * fdag.params.Sw
     
     def _insert_rescale(vc: str, vt: str, c_lvl: int, c_scl: int, t_lvl: int, t_scl: int):
@@ -46,11 +49,16 @@ def _decode_edge(fdag: Tdag, u: str, v: str, scl: int|None):
         vc = _insert_rescale(vc, v, in_lvl, in_scl, out_lvl, out_scl)
     else:
         # need bootstrap
-        vc = _insert_rescale(vc, v, in_lvl, in_scl, fdag.params.bts_lb, Sf)
-        r = max(0, round(np.ceil((Sf - out_scl)/Sf)))
+        vc = _insert_rescale(vc, v, in_lvl, in_scl, bts_input_level, bts_input_scale)
+        r = max(0, round(np.ceil((bts_output_scale - out_scl)/Sf)))
         bts_target = out_lvl + r
+        if not (fdag.params.bts_lb < bts_target <= fdag.params.bts_ub):
+            raise ValueError(
+                f"Bootstrap target level {bts_target} for edge ({u}, {v}) is out "
+                f"of bounds [{fdag.params.bts_lb + 1}, {fdag.params.bts_ub}]."
+            )
         vc = fdag.insert_lsm_op('bootstrap', vc, v, bts_target)
-        vc = _insert_rescale(vc, v, bts_target, Sf, out_lvl, out_scl)
+        vc = _insert_rescale(vc, v, bts_target, bts_output_scale, out_lvl, out_scl)
 
 def decode_assign(assign: Assign, og_dag: Tdag, og_to_comp: dict[str, str]) -> Tdag:
     fdag = Tdag(og_dag.params, og_dag.name)

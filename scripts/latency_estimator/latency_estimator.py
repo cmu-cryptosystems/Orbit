@@ -43,9 +43,10 @@ class LatencyEstimator:
         self._check_op_exist('rotate_single', params.lvl_lb, params.lvl_ub)
         self._check_op_exist('negate_single', params.lvl_lb, params.lvl_ub)
         
-        self._check_op_exist('modswitch_single', params.lvl_lb, params.lvl_ub-1)
-        self._check_op_exist('rescale_single', params.lvl_lb, params.lvl_ub-1)
-        self._check_op_exist('upscale_single', params.lvl_lb, params.lvl_ub)
+        lsm_lvl_ub = max(params.lvl_ub, params.bts_ub)
+        self._check_op_exist('modswitch_single', params.lvl_lb, lsm_lvl_ub-1)
+        self._check_op_exist('rescale_single', params.lvl_lb, lsm_lvl_ub-1)
+        self._check_op_exist('upscale_single', params.lvl_lb, lsm_lvl_ub)
         self._check_op_exist('bootstrap_single', params.bts_lb+1, params.bts_ub)
     
         # specify bts latency model
@@ -64,7 +65,7 @@ class LatencyEstimator:
             for op in ['add_single', 'add_double', 'mul_single', 'mul_double', 'rotate_single', 'negate_single']:
                self.lin_op_lmaps[op] = linear_regression(self.op_lmaps[op], params.lvl_lb, params.lvl_ub, params.trunc_val)
             
-            self.lin_op_lmaps['rescale_single'] = linear_regression_max(self.op_lmaps['rescale_single'], params.lvl_lb, params.lvl_ub-1, params.trunc_val)
+            self.lin_op_lmaps['rescale_single'] = linear_regression_max(self.op_lmaps['rescale_single'], params.lvl_lb, lsm_lvl_ub-1, params.trunc_val)
             if params.backend == 'Lattigo':
                 self.lin_op_lmaps['bootstrap_single'] = linear_regression_max(self.op_lmaps['bootstrap_single'], params.bts_lb+1, params.bts_ub, params.trunc_val)
             else:
@@ -104,8 +105,12 @@ class LatencyEstimator:
         if in_lvl >= out_lvl and self.params.Sf * in_lvl - in_scl >= self.params.Sf * out_lvl - out_scl:
             return self.res_cost(in_lvl, in_scl, out_lvl, out_scl)
         else:
-            cost_before_bts = self.res_cost(in_lvl, in_scl, self.params.bts_lb, self.params.Sf)
-            r = max(0, round(np.ceil((self.params.Sf - out_scl)/self.params.Sf)))
-            cost_bts = self.op_lmaps['bootstrap_single'][out_lvl + r]
-            cost_after_bts = self.res_cost(out_lvl + r, self.params.Sf, out_lvl, out_scl)
+            bts_input_level = int(getattr(self.params, 'bts_input_level', self.params.bts_lb))
+            bts_input_scale = int(getattr(self.params, 'bts_input_scale', self.params.Sf))
+            bts_output_scale = int(getattr(self.params, 'bts_output_scale', self.params.Sf))
+            cost_before_bts = self.res_cost(in_lvl, in_scl, bts_input_level, bts_input_scale)
+            r = max(0, round(np.ceil((bts_output_scale - out_scl)/self.params.Sf)))
+            bts_target_level = out_lvl + r
+            cost_bts = self.op_lmaps['bootstrap_single'][bts_target_level]
+            cost_after_bts = self.res_cost(bts_target_level, bts_output_scale, out_lvl, out_scl)
             return cost_before_bts + cost_bts + cost_after_bts

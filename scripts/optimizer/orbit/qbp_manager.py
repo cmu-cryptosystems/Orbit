@@ -1,3 +1,13 @@
+"""Management, caching, and cross-benchmark reuse of solved partitions (QBPs).
+
+A QBP is the solved I/O-budget -> cost/assignment table for one partition DAG.
+:class:`QBPManager` builds these tables (dispatching the per-I/O-budget ILP
+solves to :class:`ILP_Worker`), caches them keyed by partition, and reuses a
+previously solved partition whenever a new one is graph-isomorphic to it
+(:func:`tdag_equal_biject`) -- including across benchmarks when QBP reuse
+(``--qbp``) is enabled, in which case tables are persisted to and loaded from
+``qbps_cache_*/``.
+"""
 from ...tdag import *
 from ...assignment import *
 from ...latency_estimator import *
@@ -10,6 +20,12 @@ import os
 import sys
 
 class QBPManager:
+    """Cache of solved partition QBPs with isomorphism-based reuse.
+
+    Holds solved QBP tables keyed by partition name, maps each partition to its
+    (possibly shared) representative via graph bijection, and owns the
+    :class:`ILP_Worker` that parallelizes the underlying ILP solves.
+    """
     def __init__(self, params: Params, le: LatencyEstimator):
         self.params = params
         self.le = le

@@ -1,3 +1,12 @@
+"""DAG compression: fold structurally identical subgraphs into shared nodes.
+
+:func:`auto_compress` groups nodes that play the same structural role (same
+operation and, optionally, weight signature) and rebuilds a smaller equivalent
+DAG whose ILP is far cheaper to solve, tracking the original->compressed node map
+so results can be lifted back. :func:`tdag_equal_biject` / :func:`check_tdag_equal`
+test two DAGs for isomorphism, which the QBP manager uses to detect reusable
+partitions.
+"""
 from .tdag import Tdag
 from .addition_squash import addition_squash
 from collections import defaultdict
@@ -65,6 +74,14 @@ def _initial_grouping(tdag: Tdag, is_ignore_weight: bool, reps=100) -> dict[str,
     return prev_grouping
 
 def auto_compress(og_dag: Tdag, is_ignore_weight: bool):
+    """Compress ``og_dag`` into a smaller structurally-equivalent DAG.
+
+    Nodes are grouped by structural role (:func:`_initial_grouping`; weights are
+    ignored when ``is_ignore_weight`` is set) and a compressed DAG is rebuilt with
+    one node per group. Returns ``(comp_dag, og_to_comp)`` -- the compressed DAG
+    and the original->compressed node mapping used to lift assignments back to the
+    full DAG.
+    """
     assert len(og_dag.inputs) == 1, "Current implementation only supports single input DAG"
     assert len(og_dag.outputs) == 1, "Current implementation only supports single output DAG"
     
@@ -232,6 +249,11 @@ def _update_edge_weights(og_dag: Tdag, comp_dag: Tdag, og_to_comp: dict[str, str
         comp_dag.edges[cu, cv]['weight'] += og_dag.edges[og_u, og_v]['weight']
 
 def tdag_equal_biject(dag1: Tdag, dag2: Tdag) -> dict[str, str] | None:
+    """Return a node bijection ``dag1 -> dag2`` if the DAGs are isomorphic, else ``None``.
+
+    Used by the QBP manager to recognize a partition it has already solved (so the
+    cached QBP can be reused) via a structure- and operation-preserving mapping.
+    """
     if len(dag1.nodes) != len(dag2.nodes):
         return None
     if len(dag1.get_depth_traversal()) != len(dag2.get_depth_traversal()):

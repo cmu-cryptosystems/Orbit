@@ -1,3 +1,11 @@
+"""Recursive partition -> solve -> merge driver.
+
+:func:`solve_partition` recursively applies SISO partitioning and bypass handling
+to a DAG, solves each leaf partition through the QBP manager (which caches and
+reuses equivalent partitions), and merges the per-partition results back into the
+DAG's input/output cost tables. This is the top-level orchestration of Orbit's
+DAG-reduction techniques.
+"""
 from ...tdag import *
 from ...assignment import *
 from ...latency_estimator import *
@@ -11,6 +19,14 @@ import sys
 import time
 
 def solve_partition(dag: Tdag, qbp_manager: QBPManager, prev_cost: dict, le: LatencyEstimator, params: Params):
+    """Solve one DAG by recursive partitioning, returning its I/O cost tables.
+
+    If partitioning is disabled (``params.part`` false) the whole DAG is solved as
+    a single QBP. Otherwise it is cut into SISO partitions: an indivisible
+    partition is solved directly (optionally after bypass splitting), while a
+    multi-partition DAG recurses on each part and merges the results. Returns
+    ``(io_to_assign, io_to_cost)`` for ``dag``.
+    """
     if not params.part:
         qbp_manager.add_qbp(dag, prev_cost)
         this_io_to_cost = qbp_manager.get_qbp_cost(dag.name)

@@ -1,3 +1,12 @@
+"""Single-input/single-output (SISO) partitioning and bypass splitting.
+
+:func:`rdag_siso_partition` cuts a DAG at depths where exactly one value is live,
+yielding a sequence of SISO sub-DAGs small enough for the per-partition ILP.
+:func:`handle_bypass` detects the "bypass" pattern (an output combining a deep
+main path with a shallow skip path) and splits it into a main and a bypass DAG so
+each can be solved independently. These are two of Orbit's DAG-reduction steps
+for partitioning and bypass handling.
+"""
 from ...tdag import *
 from ...assignment import *
 from ...latency_estimator import *
@@ -62,6 +71,13 @@ def _filter_list(lst: list[int], depth_to_vs: dict[int, list[str]], delta: int) 
     return result
 
 def rdag_siso_partition(dag: Tdag, delta: int) -> list[Tdag]:
+    """Split ``dag`` into SISO partitions at single-live-value depths.
+
+    Walks the depth traversal tracking the live set; a depth where only one value
+    is live is a valid cut point. ``delta`` filters cut points that are too close
+    together (:func:`_filter_list`) so partitions stay a reasonable size. Returns
+    the ordered list of partition sub-DAGs.
+    """
     depth_to_vs_with_const = dag.get_depth_traversal()
     depth_to_vs = { d: [ v for v in vs if dag.nodes[v]['op'] != 'constant' ] for d, vs in depth_to_vs_with_const.items() }
     v_to_depth = { v: d for d, vs in depth_to_vs.items() for v in vs }
@@ -135,6 +151,13 @@ def _do_bypass_split(dag: Tdag, fork_inp: str, main_oup: str, bypass_oup: str, m
         
 
 def handle_bypass(dag: Tdag, dep_thres: int|None) -> tuple[Tdag, Tdag|None]:
+    """Detect and split a bypass structure at the DAG's output.
+
+    A bypass exists when the single output combines two non-constant inputs whose
+    multiplicative-depth difference exceeds ``dep_thres``. When found, the DAG is
+    split into ``(main, bypass)`` sub-DAGs; otherwise ``(dag, None)`` is returned.
+    ``dep_thres=None`` disables bypass handling.
+    """
     # bypass not enabled
     if dep_thres is None:
         return dag, None

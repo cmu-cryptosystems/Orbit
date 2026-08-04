@@ -19,13 +19,59 @@ Run the following commands to install them:
 pip install -r requirements.txt
 ```
 
-Orbit uses Gurobi (`gurobipy`) to solve its ILPs. The `gurobipy` wheel ships a bundled size-limited license that is sufficient for every partitioned benchmark, so most runs need no extra setup. Only the `--nopart` configurations build a single large ILP that exceeds the size-limited cap; for those, apply for a free unlimited-use Gurobi Optimizer license for academic use and point `GRB_LICENSE_FILE` at it.
+Orbit uses Gurobi (`gurobipy`) to solve its ILPs. The `gurobipy` wheel ships a bundled size-limited license that is sufficient for every partitioned benchmark, so most runs need no extra setup. Only the `--nopart` (no partitioning) and `--nocomp` (no compression) configurations build ILPs that exceed the size-limited cap; for those, apply for a free unlimited-use Gurobi Optimizer license for academic use and point `GRB_LICENSE_FILE` at it.
+
+### Hardware requirements
+
+Orbit needs only a commodity CPU and under 5 GB of RAM to **compile**. To
+reproduce the paper we recommend a high core count (QBP solving is parallelized —
+set `ORBIT_THREADS` accordingly) and, for **executing** the larger benchmarks, up
+to 256 GB of RAM. The paper compiled on an AWS `m8i.8xlarge` (32 cores) and
+executed on an `m7g.16xlarge` (64 cores, 256 GB). Allow about 20 GB of disk for
+compilation plus one benchmark's execution data; generating the plaintext
+constants for *all* benchmarks totals tens of GB (order 50 GB). Compilation and
+estimation run on any commodity multi-core machine; only encrypted execution of
+the 64k benchmarks needs the large-memory host.
 
 ### Frontend and Backend
 
 Orbit uses Dacapo's frontend interface and Lattigo as backend. To evaluate the compiled MLIR files, it is necessary to install the *backend*. As the plaintext files for evaluation are too large (in GBs), it is necessary to install the *frontend* to generate such files. **If you are satisfied with estimated evaluation results, it is NOT necessary to install the frontend and backend.**
 
 Check `frontend/README.md` and `backend/README.md` for installation instructions.
+
+### Native setup (without Docker)
+
+The Docker image below is the easiest path, but every experiment also runs
+natively on the host — `scripts/reproduce.sh` and the `auto_scripts/` are
+identical in both cases. To set up natively:
+
+```bash
+# 1. Python runtime (gurobipy + deps; uses the bundled size-limited Gurobi license).
+./scripts/setup_dependencies.sh python      # or: pip install -r requirements-dev.txt
+
+# 2. (Execution only) build the Lattigo backend and DaCapo frontend + input data.
+#    Skip both if you only need estimated results.
+./scripts/setup_dependencies.sh backend
+./scripts/setup_dependencies.sh frontend
+```
+
+Then run any `reproduce.sh` mode directly, without the `docker run` wrapper — the
+mode names are identical to the table in the Docker section below:
+
+```bash
+./scripts/reproduce.sh compile-base   # compilation suites (ORBIT_THREADS defaults to 32)
+./scripts/reproduce.sh compile-micro-bypass            # DAG-reduction ablations
+# Execution, after the backend and frontend are built:
+./scripts/reproduce.sh execute \
+  --model ResNet --act SiLU --n 16 --Lm 16 --Sw 40 --run 0
+```
+
+For the `--nopart`/`--nocomp` ablations, point `GRB_LICENSE_FILE` at a
+full/academic Gurobi license:
+
+```bash
+GRB_LICENSE_FILE="$HOME/gurobi.lic" ./scripts/reproduce.sh compile-micro-comppart
+```
 
 ### Docker and reproducibility scripts
 
@@ -93,7 +139,7 @@ compile-micro-reqbp     cross-benchmark QBP-reuse micro suite
 compile-all             every suite above
 ```
 
-Set `ORBIT_THREADS` to control the solver thread count (default 2), e.g.
+Set `ORBIT_THREADS` to control the solver thread count (default 32), e.g.
 `docker run ... orbit:dev env ORBIT_THREADS=8 ./scripts/reproduce.sh compile-base`.
 
 #### Gurobi license
@@ -101,15 +147,15 @@ Set `ORBIT_THREADS` to control the solver thread count (default 2), e.g.
 Orbit solves its ILPs with Gurobi (`gurobipy`). Because Orbit partitions each
 problem into small per-partition ILPs, every partitioned benchmark fits within
 Gurobi's bundled **size-limited license** and runs without an academic license.
-Only the `--nopart` configurations (partitioning disabled) build a single large
-ILP that exceeds the size-limited cap and therefore require a full/academic
-Gurobi license. To use an academic license, mount your `gurobi.lic` into the
-container and point `GRB_LICENSE_FILE` at it:
+The `--nopart` (partitioning disabled) and `--nocomp` (compression disabled)
+configurations build ILPs that exceed the size-limited cap and therefore require
+a full/academic Gurobi license. To use an academic license, mount your
+`gurobi.lic` into the container and point `GRB_LICENSE_FILE` at it:
 
 ```bash
 docker run --rm \
-  -v "$HOME/gurobi.lic:/opt/orbit/gurobi.lic:ro" \
-  -e GRB_LICENSE_FILE=/opt/orbit/gurobi.lic \
+  -v "$HOME/gurobi.lic:/opt/gurobi/gurobi.lic:ro" \
+  -e GRB_LICENSE_FILE=/opt/gurobi/gurobi.lic \
   -v "$PWD/repro_results:/opt/orbit/repro_results" \
   -v "$PWD/mlirs_output:/opt/orbit/mlirs_output" \
   orbit:dev ./scripts/reproduce.sh compile-micro-comppart
@@ -139,7 +185,7 @@ docker run --rm -v "$PWD:/opt/orbit" -e HOME=/tmp \
 docker run --rm -v "$PWD:/opt/orbit" -e HOME=/tmp \
   orbit:dev ./scripts/setup_dependencies.sh frontend
 docker run --rm -v "$PWD:/opt/orbit" -e HOME=/tmp -w /opt/orbit/frontend/dacapo \
-  orbit:dev bash -c '../dacapo_patch/gen_all_mlirs.sh && python3 examples/tests/gen_input_data.py 10'
+  orbit:dev bash -c 'source .venv/bin/activate && ../dacapo_patch/gen_all_mlirs.sh && python3 examples/tests/gen_input_data.py 10'
 
 # 3. Evaluate a compiled benchmark through the backend. The MLIR is compiled on
 #    demand for the default configuration if it does not already exist.
@@ -155,6 +201,14 @@ It fails fast with the exact missing paths if the backend or the
 `input_data/`/`input_constants/` files are absent. Results are written under
 `mlirs_execute/orbit/<n>/<model>/<act>/`. See `frontend/README.md` and
 `backend/README.md` for full details.
+
+> **Known limitation (VGG16-SiLU at 16k).** In *plaintext* mode, VGG16-SiLU at
+> `--n 16` produces `NaN` outputs. This is a known DaCapo frontend bug at 16k:
+> when an operator's inputs span multiple ciphertexts, the generated MLIR is
+> incorrect, producing unbalanced upscale/rescale operations that overflow
+> float64 in plaintext. At 64k (`--n 64`) the MLIR is correct and both plaintext
+> and encrypted execution match PyTorch exactly, so use 64k for VGG16-SiLU
+> accuracy checks.
 
 If you only need the backend toolchain (e.g. data is already present):
 

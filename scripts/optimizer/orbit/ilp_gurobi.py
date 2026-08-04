@@ -155,6 +155,12 @@ def add_ilp_io_budgets(tdag: Tdag, vp: VarPool, io_budgets):
 
 
 def solve_ilp_core(vp: VarPool, num_threads: int):
+    """Solve the standard (non-bypass) partition ILP.
+
+    Sets Orbit's fixed Gurobi parameters (deterministic ``Seed=42``, barrier
+    ``Method=2``, ``MIPGap=0.01``, ``Threads=num_threads``) and minimizes the
+    accumulated rescale/bootstrap objective.
+    """
     model = vp.model
     model.setParam('OutputFlag', 0)
     model.setParam("Seed", 42)
@@ -168,6 +174,14 @@ def solve_ilp_core(vp: VarPool, num_threads: int):
 
 
 def solve_ilp_core_bypass(tdag: Tdag, vp: VarPool, io_budgets, num_threads: int):
+    """Solve the bypass-aware partition ILP.
+
+    For each candidate main-output (level, scale) in
+    ``io_budgets['main_qbp_cost']`` the model is re-optimized with that pair
+    pinned; the choice minimizing the combined main + bypass + fresh-tensor cost
+    is kept and re-solved as the final assignment. Returns early (leaving the
+    model unsolved) if no pinned configuration is feasible.
+    """
     model = vp.model
     model.setParam('OutputFlag', 0)
     model.setParam("Seed", 42)

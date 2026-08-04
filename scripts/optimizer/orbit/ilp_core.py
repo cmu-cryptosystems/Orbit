@@ -1,3 +1,13 @@
+"""Backend-agnostic ILP driver for a single Orbit partition.
+
+Given one partition DAG and an I/O level/scale budget, :func:`solve_ilp` builds
+the level-scale-aware ILP (variables and constraints from ``ilp_gurobi``, the
+linear rescale/bootstrap objective from :func:`add_ilp_linear_cost`), solves it
+with Gurobi, and decodes the optimal rescale/bootstrap placement back into an
+:class:`Assign` via :func:`decode_ilp_sol`. The Gurobi-specific pieces live in
+``ilp_gurobi`` and are imported lazily so the rest of Orbit is usable without
+gurobipy installed.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -10,6 +20,12 @@ from ...params.params import Params
 
 
 def add_ilp_linear_cost(tdag: Tdag, vp: Any, le: LatencyEstimator):
+    """Accumulate the linear rescale/bootstrap cost terms into ``vp.total_cost``.
+
+    Adds per-node bootstrap/rescale costs, per-edge rescale costs, and the
+    level-dependent cost of each operation, each weighted by the node/edge
+    multiplicity, so the ILP objective minimizes estimated FHE latency.
+    """
     cost_rescale_s = le.lin_op_lmaps['rescale_single']
     cost_bts_s = le.lin_op_lmaps['bootstrap_single']
     vp.rescale_cost = cost_rescale_s[1]
@@ -40,6 +56,12 @@ def _var_sol(x: Any) -> float:
 
 
 def decode_ilp_sol(tdag: Tdag, vp: Any) -> Assign:
+    """Read the solved Gurobi variables back into an :class:`Assign`.
+
+    Rounds each node/edge level and scale variable to integers and asserts the
+    scale-waterline (``Sw``) invariants, producing the concrete rescale/bootstrap
+    placement the ILP chose.
+    """
     assign = Assign(tdag)
     params = vp.params
     for v in tdag.nodes:
@@ -71,6 +93,14 @@ def solve_ilp(
     num_threads: int,
     params: Params,
 ) -> tuple[Assign | None, float | None]:
+    """Build and solve the ILP for one partition under a fixed I/O budget.
+
+    ``io_budgets`` fixes (some of) the partition's input/output level and scale;
+    when it carries the ``maino_v`` key the bypass-aware solver is used, which
+    additionally sweeps the main-output (level, scale) choices. Returns the
+    optimal ``(Assign, cost)`` for the partition, or ``(None, None)`` if the ILP
+    is infeasible under the given budget.
+    """
     try:
         import gurobipy as gp
         from .ilp_gurobi import (

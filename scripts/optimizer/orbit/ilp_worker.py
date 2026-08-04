@@ -4,7 +4,7 @@ from ...latency_estimator import *
 from ...visualize import *
 from ...params.params import Params
 
-from queue import Queue
+from queue import Queue, Empty
 import threading
 import time
 import traceback
@@ -20,8 +20,17 @@ class ILP_Worker:
         pdag_vin = list(pdag.inputs)[0]
         pdag_vout = list(pdag.outputs)[0]
         while not task_queue.empty():
+            # Separate the get() from processing: under high thread contention
+            # another worker can drain the queue between the empty() check above
+            # and this get(), raising queue.Empty. Handling it here (instead of
+            # in the processing except/finally) keeps task_done() balanced with
+            # get() and avoids referencing an unassigned task_name.
             try:
                 io_budget = task_queue.get(timeout=3)
+            except Empty:
+                break
+            try:
+                task_name = f"Partition_{pdag.name}"
                 io_budget_name = (
                     f"in_lvl={io_budget.get('in_lvl', -1)}"
                     f"_in_scl={io_budget.get('in_scl', -1)}"

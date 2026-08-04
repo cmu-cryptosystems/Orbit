@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MODE="${1:-quick}"
-THREADS="${ORBIT_THREADS:-2}"
+THREADS="${ORBIT_THREADS:-32}"
 RESULT_ROOT="${ORBIT_RESULTS_DIR:-repro_results}"
 RUN_ID="${ORBIT_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="$RESULT_ROOT/$RUN_ID"
@@ -47,7 +47,7 @@ size-limited license, which is enough for every partitioned benchmark; only the
 --nopart configurations need a full/academic Gurobi license.
 
 Environment:
-  ORBIT_THREADS          Solver threads. Default: 2.
+  ORBIT_THREADS          Solver threads. Default: 32.
   ORBIT_RESULTS_DIR      Result log root. Default: repro_results.
   ORBIT_RUN_ID           Result subdirectory name. Default: UTC timestamp.
 EOF

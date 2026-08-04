@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import subprocess
 import shutil
@@ -39,6 +40,12 @@ def get_inf_norm(vec1, vec2):
     # max_diff_val = None
     for i in range(len(vec1)):
         diff = abs(vec1[i] - vec2[i])
+        # A NaN diff (e.g. a NaN plaintext value from the known DaCapo 16k
+        # multi-ciphertext bug) must not be silently dropped: `NaN > max_diff`
+        # is always False, which would leave max_diff at 0.0 and falsely report
+        # a perfect ct-pl match. Surface it as NaN so the caller sees the failure.
+        if math.isnan(diff):
+            return float('nan')
         if diff > max_diff:
             max_diff = diff
             # max_diff_val = (i, vec1[i], vec2[i])

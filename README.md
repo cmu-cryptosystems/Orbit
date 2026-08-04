@@ -42,8 +42,8 @@ Check `frontend/README.md` and `backend/README.md` for installation instructions
 ### Native setup (without Docker)
 
 The Docker image below is the easiest path, but every experiment also runs
-natively on the host — `scripts/reproduce.sh` and the `auto_scripts/` are
-identical in both cases. To set up natively:
+natively on the host — `scripts/reproduce.sh` and the `auto_scripts/` behave
+identically, and both honor `ORBIT_THREADS` (default 32). To set up natively:
 
 ```bash
 # 1. Python runtime (gurobipy + deps; uses the bundled size-limited Gurobi license).
@@ -59,8 +59,9 @@ Then run any `reproduce.sh` mode directly, without the `docker run` wrapper — 
 mode names are identical to the table in the Docker section below:
 
 ```bash
-./scripts/reproduce.sh compile-base   # compilation suites (ORBIT_THREADS defaults to 32)
-./scripts/reproduce.sh compile-micro-bypass            # DAG-reduction ablations
+./scripts/reproduce.sh compile-base          # compilation suites
+./scripts/reproduce.sh compile-micro-bypass  # DAG-reduction ablations
+ORBIT_THREADS=64 ./scripts/reproduce.sh compile-base   # override the thread count
 # Execution, after the backend and frontend are built:
 ./scripts/reproduce.sh execute \
   --model ResNet --act SiLU --n 16 --Lm 16 --Sw 40 --run 0
